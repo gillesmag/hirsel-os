@@ -745,30 +745,35 @@ index 00000000000..3452c0a43aa
 +}
 diff --git a/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
 new file mode 100644
-index 00000000000..b1f20de1a87
+index 00000000000..278bced84c6
 --- /dev/null
 +++ b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,1200 @@
 +// Copyright 2026 The Hirsel-OS Authors
 +//
 +// Use of this source code is governed by a MIT-style
 +// license that can be found in the LICENSE file or at
 +// https://opensource.org/licenses/MIT
 +
-+//! AMD SVM VM-exit handling and interrupt/guard helpers.
++//! AMD SVM VM-exit handling, x2APIC timer/MSR virtualization, KVM pvclock, and guard helpers.
 +
 +use core::arch::asm;
++use core::ffi::c_void;
 +use core::mem::size_of;
++use core::pin::Pin;
 +use core::sync::atomic::Ordering;
 +use debug::dprintf;
 +use zx_status::Status;
 +use zx_types::{
 +    ZX_GUEST_TRAP_BELL, ZX_GUEST_TRAP_IO, ZX_GUEST_TRAP_MEM, ZX_TIME_INFINITE, zx_gpaddr_t,
 +    zx_packet_guest_bell_t, zx_packet_guest_io_t, zx_packet_guest_mem_t, zx_packet_type_t,
-+    zx_port_packet_t, zx_vaddr_t,
++    zx_paddr_t, zx_port_packet_t, zx_vaddr_t,
 +};
 +
-+use super::pv::PvClockState;
++use super::pv::{
++    PvClockState, pv_clock_populate_offset, pv_clock_reset_clock, pv_clock_stop_clock,
++    pv_clock_update_boot_time,
++};
 +use super::vcpu::LocalApicState;
 +use super::vmcb::{
 +    EVENT_INJ_EV, EVENT_INJ_TYPE_EXCEPTION, EVENT_INJ_TYPE_INTR, EVENT_INJ_TYPE_NMI,
@@ -778,17 +783,47 @@ index 00000000000..b1f20de1a87
 +};
 +use super::vmx_state::GuestState;
 +use crate::arch_rs::x86::feature::{
-+    CpuidLeaf, MAX_SUPPORTED_CPUID, MAX_SUPPORTED_CPUID_EXT, X86_FEATURE_HYPERVISOR,
-+    X86_FEATURE_SVM, X86_FEATURE_VMX, X86CpuidBit, X86CpuidLeafNum, get_cpuid_subleaf,
++    CpuidLeaf, MAX_SUPPORTED_CPUID, MAX_SUPPORTED_CPUID_EXT, X86_FEATURE_ACPI,
++    X86_FEATURE_ARCH_CAPABILITIES, X86_FEATURE_AVX512BITALG, X86_FEATURE_AVX512BW,
++    X86_FEATURE_AVX512CD, X86_FEATURE_AVX512DQ, X86_FEATURE_AVX512ER, X86_FEATURE_AVX512F,
++    X86_FEATURE_AVX512IFMA, X86_FEATURE_AVX512PF, X86_FEATURE_AVX512QFMA, X86_FEATURE_AVX512QVNNIW,
++    X86_FEATURE_AVX512VBMI, X86_FEATURE_AVX512VBMI2, X86_FEATURE_AVX512VL, X86_FEATURE_AVX512VNNI,
++    X86_FEATURE_AVX512VPDQ, X86_FEATURE_DTS, X86_FEATURE_HW_FEEDBACK, X86_FEATURE_HWP,
++    X86_FEATURE_HWP_ACT, X86_FEATURE_HWP_NOT, X86_FEATURE_HWP_PREF, X86_FEATURE_HYPERVISOR,
++    X86_FEATURE_IBRS_IBPB, X86_FEATURE_L1D_FLUSH, X86_FEATURE_LA57, X86_FEATURE_MON,
++    X86_FEATURE_PDCM, X86_FEATURE_PERF_BIAS, X86_FEATURE_PLN, X86_FEATURE_PT, X86_FEATURE_PTM,
++    X86_FEATURE_SEP, X86_FEATURE_SSBD, X86_FEATURE_STIBP, X86_FEATURE_SVM, X86_FEATURE_TM,
++    X86_FEATURE_TM2, X86_FEATURE_TOPOLOGY_LOGICAL_PROCESSOR, X86_FEATURE_TOPOLOGY_SINGLE_PROCESSOR,
++    X86_FEATURE_TSC_ADJUST, X86_FEATURE_TSC_DEADLINE, X86_FEATURE_TURBO, X86_FEATURE_TURBO_MAX,
++    X86_FEATURE_VMX, X86_FEATURE_X2APIC, X86CpuidBit, X86CpuidLeafNum, get_cpuid_subleaf,
 +};
 +use crate::arch_rs::x86::interrupts::{
 +    X86_INT_ALIGNMENT_CHECK, X86_INT_DOUBLE_FAULT, X86_INT_GP_FAULT, X86_INT_INVALID_TSS,
 +    X86_INT_NMI, X86_INT_PAGE_FAULT, X86_INT_PLATFORM_BASE, X86_INT_SEGMENT_NOT_PRESENT,
 +    X86_INT_STACK_FAULT, X86_INT_VIRT, X86InterruptVector,
 +};
++use crate::arch_rs::x86::lapic::{
++    APIC_PHYS_BASE, IA32_APIC_BASE_BSP, IA32_APIC_BASE_X2APIC_ENABLE, IA32_APIC_BASE_XAPIC_ENABLE,
++    LVT_MASKED, LVT_TIMER_MODE_MASK, LVT_TIMER_MODE_ONESHOT, LVT_TIMER_MODE_PERIODIC,
++    LVT_TIMER_MODE_RESERVED, LVT_TIMER_MODE_TSC_DEADLINE, LVT_TIMER_VECTOR_MASK,
++};
++use crate::arch_rs::x86::pv::{
++    KVM_BOOT_TIME, KVM_BOOT_TIME_OLD, KVM_FEATURE_CLOCK_SOURCE, KVM_FEATURE_CLOCK_SOURCE_OLD,
++    KVM_SYSTEM_TIME_MSR, KVM_SYSTEM_TIME_MSR_OLD,
++};
 +use crate::arch_rs::x86::registers::{
-+    X86_CR0_PG, X86_EFER_LMA, X86_FLAGS_IF, X86_MSR_IA32_APIC_BASE, X86_MSR_IA32_MISC_ENABLE,
-+    X86_XSAVE_STATE_BIT_AVX, X86_XSAVE_STATE_BIT_SSE, X86_XSAVE_STATE_BIT_X87,
++    X86_CR0_PG, X86_EFER_LMA, X86_FLAGS_IF, X86_MSR_DRAM_ENERGY_STATUS, X86_MSR_DRAM_POWER_LIMIT,
++    X86_MSR_IA32_APIC_BASE, X86_MSR_IA32_BIOS_SIGN_ID, X86_MSR_IA32_CSTAR, X86_MSR_IA32_MCG_CAP,
++    X86_MSR_IA32_MCG_STATUS, X86_MSR_IA32_MISC_ENABLE, X86_MSR_IA32_MTRR_DEF_TYPE,
++    X86_MSR_IA32_MTRR_FIX4K_C0000, X86_MSR_IA32_MTRR_FIX4K_F8000, X86_MSR_IA32_MTRR_FIX16K_80000,
++    X86_MSR_IA32_MTRR_FIX16K_A0000, X86_MSR_IA32_MTRR_FIX64K_00000, X86_MSR_IA32_MTRR_PHYSBASE0,
++    X86_MSR_IA32_MTRR_PHYSMASK9, X86_MSR_IA32_MTRRCAP, X86_MSR_IA32_PLATFORM_ID,
++    X86_MSR_IA32_PRED_CMD, X86_MSR_IA32_SPEC_CTRL, X86_MSR_IA32_TEMPERATURE_TARGET,
++    X86_MSR_IA32_TSC_AUX, X86_MSR_IA32_TSC_DEADLINE, X86_MSR_PKG_ENERGY_STATUS,
++    X86_MSR_PLATFORM_ENERGY_COUNTER, X86_MSR_PLATFORM_POWER_LIMIT, X86_MSR_PP0_ENERGY_STATUS,
++    X86_MSR_PP0_POWER_LIMIT, X86_MSR_PP1_ENERGY_STATUS, X86_MSR_PP1_POWER_LIMIT, X86_MSR_PPERF,
++    X86_MSR_RAPL_POWER_UNIT, X86_MSR_SMI_COUNT, X86_XSAVE_STATE_BIT_AVX, X86_XSAVE_STATE_BIT_SSE,
++    X86_XSAVE_STATE_BIT_X87,
 +};
 +use crate::arch_rs::{
 +    InterruptSavedState, arch_interrupt_restore, arch_interrupt_save, ints_disabled,
@@ -797,7 +832,42 @@ index 00000000000..b1f20de1a87
 +use crate::hypervisor::aspace::GuestPhysicalAspace;
 +use crate::hypervisor::trap_map::TrapMap;
 +use crate::kernel::auto_preempt_disabler::AutoPreemptDisabler;
++use crate::kernel::bits::{bit_shift, bits_shift};
 +use crate::kernel::percpu::PerCpu;
++use crate::kernel::timer::Timer;
++use crate::platform_pc::timer::{
++    convert_raw_tsc_duration_to_nanoseconds, convert_raw_tsc_timestamp_to_clock_monotonic,
++};
++use crate::platform_rs::timer::{InstantMono, current_mono_time};
++
++const LOCAL_APIC_PHYS_BASE: u64 =
++    APIC_PHYS_BASE as u64 | IA32_APIC_BASE_XAPIC_ENABLE | IA32_APIC_BASE_X2APIC_ENABLE;
++const X2APIC_MSR_BASE: u32 = 0x800;
++const X2APIC_MSR_MAX: u32 = 0x83f;
++const KVM_FEATURE_NO_IO_DELAY: u32 = 1 << 1;
++const MISC_ENABLE_FAST_STRINGS: u64 = 1 << 0;
++
++const X2APIC_ID: u32 = 0x802;
++const X2APIC_VERSION: u32 = 0x803;
++const X2APIC_TPR: u32 = 0x808;
++const X2APIC_EOI: u32 = 0x80b;
++const X2APIC_LDR: u32 = 0x80d;
++const X2APIC_SVR: u32 = 0x80f;
++const X2APIC_ISR_START: u32 = 0x810;
++const X2APIC_IRR_END: u32 = 0x827;
++const X2APIC_ESR: u32 = 0x828;
++const X2APIC_LVT_CMCI: u32 = 0x82f;
++const X2APIC_ICR: u32 = 0x830;
++const X2APIC_LVT_TIMER: u32 = 0x832;
++const X2APIC_LVT_THERMAL: u32 = 0x833;
++const X2APIC_LVT_MONITOR: u32 = 0x834;
++const X2APIC_LVT_LINT0: u32 = 0x835;
++const X2APIC_LVT_LINT1: u32 = 0x836;
++const X2APIC_LVT_ERROR: u32 = 0x837;
++const X2APIC_INITIAL_COUNT: u32 = 0x838;
++const X2APIC_CURRENT_COUNT: u32 = 0x839;
++const X2APIC_DCR: u32 = 0x83e;
++const X2APIC_SELF_IPI: u32 = 0x83f;
 +
 +/// Guard holding preemption and interrupts disabled around one SVM VCPU entry/exit cycle.
 +pub struct AutoSvmGuard {
@@ -831,8 +901,6 @@ index 00000000000..b1f20de1a87
 +    pub fn service_pending_external_interrupt(&self) {
 +        debug_assert!(self.valid);
 +        debug_assert!(ints_disabled());
-+        // Zircon's IDT interrupt entry checks `!blocking_disallowed()` to detect recursive
-+        // interrupt handlers (mirroring `vmexit.rs::handle_external_interrupt`).
 +        set_blocking_disallowed(false);
 +        // SAFETY: Preemption is disabled via `self.preempt`; briefly enabling interrupts
 +        // delivers the pending external interrupt through the kernel IDT and returns with
@@ -944,8 +1012,55 @@ index 00000000000..b1f20de1a87
 +    Ok(())
 +}
 +
++// --- Local x2APIC timer helpers (mirroring vmexit.rs) ---
++
++fn svm_lvt_deadline(local_apic_state: &LocalApicState, lvt_timer: u32) -> InstantMono {
++    if (lvt_timer & LVT_TIMER_MODE_MASK) != LVT_TIMER_MODE_ONESHOT
++        && (lvt_timer & LVT_TIMER_MODE_MASK) != LVT_TIMER_MODE_PERIODIC
++    {
++        return InstantMono(0);
++    }
++    let lvt_divide_config = u64::from(local_apic_state.lvt_divide_config.load(Ordering::Relaxed));
++    let shift =
++        (bits_shift(lvt_divide_config, 1, 0) | (bit_shift(lvt_divide_config, 3) << 2)) as u32;
++    let divisor_shift = (shift + 1) & 7;
++    let duration_tsc_ticks =
++        (local_apic_state.lvt_initial_count.load(Ordering::Relaxed) << divisor_shift) as i64;
++    let duration = convert_raw_tsc_duration_to_nanoseconds(duration_tsc_ticks);
++    current_mono_time() + duration
++}
++
++unsafe extern "C" fn svm_deadline_callback(_timer: *mut Timer, _now: i64, arg: *mut c_void) {
++    let local_apic_state = unsafe { &*arg.cast::<LocalApicState>() };
++    let lvt_timer = local_apic_state.lvt_timer.load(Ordering::Relaxed);
++    if lvt_timer & LVT_MASKED != 0 {
++        return;
++    }
++    if (lvt_timer & LVT_TIMER_MODE_MASK) == LVT_TIMER_MODE_PERIODIC {
++        unsafe { svm_set_timer(local_apic_state, svm_lvt_deadline(local_apic_state, lvt_timer)) };
++    }
++    let vector = (lvt_timer & LVT_TIMER_VECTOR_MASK) as u8;
++    let _ = local_apic_state.interrupt_tracker.interrupt(u32::from(vector));
++}
++
++unsafe fn svm_set_timer(local_apic_state: &LocalApicState, deadline: InstantMono) {
++    if deadline.0 > 0 {
++        unsafe {
++            Pin::new_unchecked(&local_apic_state.timer).set_oneshot(
++                deadline.0,
++                svm_deadline_callback,
++                core::ptr::from_ref(local_apic_state).cast_mut().cast(),
++            );
++        }
++    }
++}
++
++unsafe fn svm_update_timer(local_apic_state: &LocalApicState, deadline: InstantMono) {
++    local_apic_state.timer.cancel();
++    unsafe { svm_set_timer(local_apic_state, deadline) };
++}
++
 +fn default_operand_size(vmcb: &Vmcb) -> u8 {
-+    // 64-bit mode (`EFER.LMA=1` and `CS.L=1`) or 32-bit mode (`CS.D=1`) default to 4-byte operands.
 +    let is_64 = (vmcb.save.efer & X86_EFER_LMA) != 0 && (vmcb.save.cs.attrib & (1 << 9)) != 0;
 +    let is_32 = (vmcb.save.cs.attrib & (1 << 10)) != 0;
 +    if is_64 || is_32 { 4 } else { 2 }
@@ -1058,7 +1173,6 @@ index 00000000000..b1f20de1a87
 +    if raw.is_null() {
 +        return None;
 +    }
-+    // SAFETY: `GuestPtr` pins and maps the 8-byte range in kernel memory until dropped.
 +    Some(unsafe { core::ptr::read_unaligned(raw) })
 +}
 +
@@ -1129,7 +1243,6 @@ index 00000000000..b1f20de1a87
 +            return decoded;
 +        }
 +    }
-+    // Fallback: walk guest page tables and read instruction bytes directly from guest RAM.
 +    guard.invalidate();
 +    let mut buf = [0u8; 15];
 +    let mut count = 0usize;
@@ -1149,7 +1262,6 @@ index 00000000000..b1f20de1a87
 +        if raw.is_null() {
 +            break;
 +        }
-+        // SAFETY: `GuestPtr` pins and maps `chunk` bytes in kernel memory until dropped.
 +        unsafe {
 +            core::ptr::copy_nonoverlapping(raw, buf.as_mut_ptr().add(count), chunk);
 +        }
@@ -1215,7 +1327,6 @@ index 00000000000..b1f20de1a87
 +        };
 +    }
 +
-+    // Ordinary NPT demand page fault: release interrupt/preempt guard before blocking.
 +    guard.invalidate();
 +    if guest_paddr >= gpa.size() {
 +        return Err(Status::OUT_OF_RANGE);
@@ -1234,6 +1345,7 @@ index 00000000000..b1f20de1a87
 +}
 +
 +fn handle_ioio(
++    guard: &mut AutoSvmGuard,
 +    vmcb: &mut Vmcb,
 +    guest_state: &mut GuestState,
 +    traps: &TrapMap,
@@ -1243,7 +1355,14 @@ index 00000000000..b1f20de1a87
 +    let is_in = (info1 & (1 << 0)) != 0;
 +    let is_str = (info1 & (1 << 2)) != 0;
 +    let is_rep = (info1 & (1 << 3)) != 0;
++    let port = ((info1 >> 16) & 0xffff) as u16;
 +    if is_str || is_rep {
++        dprintf!(
++            INFO,
++            "hypervisor(svm): Unsupported string IO port={:#x} rip={:#x}\n",
++            port,
++            vmcb.save.rip
++        );
 +        return Err(Status::NOT_SUPPORTED);
 +    }
 +    let access_size: u8 = if (info1 & (1 << 4)) != 0 {
@@ -1255,12 +1374,25 @@ index 00000000000..b1f20de1a87
 +    } else {
 +        return Err(Status::NOT_SUPPORTED);
 +    };
-+    let port = ((info1 >> 16) & 0xffff) as u16;
++
++    let trap = match traps.find_trap(ZX_GUEST_TRAP_IO, usize::from(port)) {
++        Ok(t) => t,
++        Err(st) => {
++            dprintf!(
++                INFO,
++                "hypervisor(svm): Unhandled IO {} port={:#x} size={} rip={:#x}\n",
++                if is_in { "in" } else { "out" },
++                port,
++                access_size,
++                vmcb.save.rip
++            );
++            return Err(st);
++        }
++    };
 +
 +    // For IOIO exits, AMD hardware stores the sequential next RIP in EXITINFO2.
 +    vmcb.save.rip = vmcb.control.exit_info_2;
 +
-+    let trap = traps.find_trap(ZX_GUEST_TRAP_IO, usize::from(port))?;
 +    *packet = zx_port_packet_t::default();
 +    packet.key = trap.key();
 +    packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_IO;
@@ -1271,20 +1403,43 @@ index 00000000000..b1f20de1a87
 +        input: is_in,
 +        data: [0; 4],
 +    };
-+    if !is_in {
++    if is_in {
++        if access_size == 4 {
++            guest_state.rax = 0;
++        }
++    } else {
 +        let bytes = guest_state.rax.to_ne_bytes();
 +        io.data[..usize::from(access_size)].copy_from_slice(&bytes[..usize::from(access_size)]);
 +    }
 +    set_packet(packet, io);
++    if !is_in && trap.has_port() {
++        guard.invalidate();
++        return trap.queue(packet, None);
++    }
 +    Err(Status::NEXT)
++}
++
++fn compute_xsave_size(guest_xcr0: u64) -> u32 {
++    let mut xsave_size: u32 = 512 + 64;
++    for i in 2..=9u32 {
++        if guest_xcr0 & (1 << i) == 0 {
++            continue;
++        }
++        if let Some(leaf) = get_cpuid_subleaf(X86CpuidLeafNum::XSave, i)
++            && leaf != (CpuidLeaf { a: 0, b: 0, c: 0, d: 0 })
++        {
++            xsave_size = leaf.b.wrapping_add(leaf.a);
++        }
++    }
++    xsave_size
 +}
 +
 +fn handle_cpuid(vmcb: &mut Vmcb, guest_state: &mut GuestState) -> Result<(), Status> {
 +    let leaf = guest_state.eax();
 +    let subleaf = guest_state.ecx();
++    let apic_id = vmcb.control.guest_asid.saturating_sub(1);
 +    advance_rip(vmcb, 2);
 +
-+    // Mask hypervisor/nested-virt features and expose standard hypervisor leaf.
 +    let res = if leaf == 0x4000_0000 {
 +        CpuidLeaf {
 +            a: 0x4000_0001,
@@ -1293,6 +1448,13 @@ index 00000000000..b1f20de1a87
 +            d: u32::from_le_bytes(*b"M\0\0\0"),
 +        }
 +    } else if leaf == 0x4000_0001 {
++        CpuidLeaf {
++            a: KVM_FEATURE_CLOCK_SOURCE_OLD | KVM_FEATURE_CLOCK_SOURCE | KVM_FEATURE_NO_IO_DELAY,
++            b: 0,
++            c: 0,
++            d: 0,
++        }
++    } else if leaf == 0x8000_001e {
 +        CpuidLeaf { a: 0, b: 0, c: 0, d: 0 }
 +    } else if leaf <= MAX_SUPPORTED_CPUID || (0x8000_0000..=MAX_SUPPORTED_CPUID_EXT).contains(&leaf)
 +    {
@@ -1304,20 +1466,101 @@ index 00000000000..b1f20de1a87
 +    };
 +
 +    let mut eax = res.a;
-+    let ebx = res.b;
++    let mut ebx = res.b;
 +    let mut ecx = res.c;
-+    let edx = res.d;
++    let mut edx = res.d;
 +
-+    if leaf == X86CpuidLeafNum::ModelFeatures as u32 {
-+        ecx &= !feature_mask(X86_FEATURE_VMX);
-+        ecx |= feature_mask(X86_FEATURE_HYPERVISOR);
-+    } else if leaf == X86CpuidLeafNum::ExtModelFeatures as u32 {
-+        ecx &= !feature_mask(X86_FEATURE_SVM);
++    if leaf == X86CpuidLeafNum::Base as u32 {
++        eax = eax.min(MAX_SUPPORTED_CPUID);
++    } else if leaf == X86CpuidLeafNum::ModelFeatures as u32 {
++        // Set initial APIC ID and 1 logical processor.
++        ebx = (ebx & 0x0000_ffff) | (1 << 16) | ((apic_id & 0xff) << 24);
++        ecx |= feature_mask(X86_FEATURE_HYPERVISOR)
++            | feature_mask(X86_FEATURE_X2APIC)
++            | feature_mask(X86_FEATURE_TSC_DEADLINE);
++        ecx &= !(feature_mask(X86_FEATURE_VMX)
++            | feature_mask(X86_FEATURE_PDCM)
++            | feature_mask(X86_FEATURE_MON)
++            | feature_mask(X86_FEATURE_TM2));
++        edx |= feature_mask(X86_FEATURE_SEP);
++        edx &= !(feature_mask(X86_FEATURE_TM) | feature_mask(X86_FEATURE_ACPI));
++    } else if leaf == X86CpuidLeafNum::Mon as u32 {
++        eax = 0;
++        ebx = 0;
++        ecx = 0;
++        edx = 0;
++    } else if leaf == X86CpuidLeafNum::ThermalAndPower as u32 {
++        ecx &= !(feature_mask(X86_FEATURE_PERF_BIAS) | feature_mask(X86_FEATURE_HW_FEEDBACK));
++        eax &= !(feature_mask(X86_FEATURE_DTS)
++            | feature_mask(X86_FEATURE_PTM)
++            | feature_mask(X86_FEATURE_PLN)
++            | feature_mask(X86_FEATURE_HWP)
++            | feature_mask(X86_FEATURE_HWP_NOT)
++            | feature_mask(X86_FEATURE_HWP_ACT)
++            | feature_mask(X86_FEATURE_HWP_PREF)
++            | feature_mask(X86_FEATURE_TURBO)
++            | feature_mask(X86_FEATURE_TURBO_MAX));
++    } else if leaf == X86CpuidLeafNum::ExtendedFeatureFlags as u32 {
++        ebx &= !(feature_mask(X86_FEATURE_PT)
++            | feature_mask(X86_FEATURE_TSC_ADJUST)
++            | feature_mask(X86_FEATURE_AVX512F)
++            | feature_mask(X86_FEATURE_AVX512DQ)
++            | feature_mask(X86_FEATURE_AVX512IFMA)
++            | feature_mask(X86_FEATURE_AVX512PF)
++            | feature_mask(X86_FEATURE_AVX512ER)
++            | feature_mask(X86_FEATURE_AVX512CD)
++            | feature_mask(X86_FEATURE_AVX512BW)
++            | feature_mask(X86_FEATURE_AVX512VL));
++        ecx &= !(feature_mask(X86_FEATURE_LA57)
++            | feature_mask(X86_FEATURE_AVX512VBMI)
++            | feature_mask(X86_FEATURE_AVX512VBMI2)
++            | feature_mask(X86_FEATURE_AVX512VNNI)
++            | feature_mask(X86_FEATURE_AVX512BITALG)
++            | feature_mask(X86_FEATURE_AVX512VPDQ));
++        edx &= !(feature_mask(X86_FEATURE_IBRS_IBPB)
++            | feature_mask(X86_FEATURE_STIBP)
++            | feature_mask(X86_FEATURE_SSBD)
++            | feature_mask(X86_FEATURE_ARCH_CAPABILITIES)
++            | feature_mask(X86_FEATURE_L1D_FLUSH)
++            | feature_mask(X86_FEATURE_AVX512QVNNIW)
++            | feature_mask(X86_FEATURE_AVX512QFMA));
++    } else if leaf == X86CpuidLeafNum::PerformanceMonitoring as u32 {
++        eax = 0;
++        ebx = 0b1111111;
++        ecx = 0;
++        edx = 0;
++    } else if leaf == X86CpuidLeafNum::Topology as u32 {
++        if subleaf == 0 {
++            eax = 0;
++            ebx = u32::from(X86_FEATURE_TOPOLOGY_SINGLE_PROCESSOR.bit);
++            ecx = feature_mask(X86_FEATURE_TOPOLOGY_LOGICAL_PROCESSOR);
++            edx = apic_id;
++        } else {
++            eax = 0;
++            ebx = 0;
++            ecx = 0;
++            edx = 0;
++        }
++    } else if leaf == X86CpuidLeafNum::XSave as u32 {
++        if subleaf == 0 {
++            ebx = compute_xsave_size(guest_state.xcr0);
++        } else if subleaf == 1 {
++            // Clear XSAVEC (bit 1) and XSAVES/IA32_XSS (bit 3).
++            eax &= !((1 << 1) | (1 << 3));
++            ebx = 0;
++            ecx = 0;
++            edx = 0;
++        }
 +    } else if leaf == X86CpuidLeafNum::ExtBase as u32 {
 +        eax = eax.min(MAX_SUPPORTED_CPUID_EXT);
++    } else if leaf == X86CpuidLeafNum::ExtModelFeatures as u32 {
++        // Hide SVM, TopologyExt (22), PerfCtrCore (23), MwaitX (29).
++        ecx &= !(feature_mask(X86_FEATURE_SVM) | (1 << 22) | (1 << 23) | (1 << 29));
++    } else if leaf == 0x8000_0008 {
++        // Clear AMD IBPB/IBRS/STIBP/SSBD/PSFD speculation-control bits in EBX.
++        ebx &= !0x1fff_f000;
 +    }
 +
-+    let _ = get_cpuid_subleaf; // keep import clean if extended later
 +    guest_state.rax = u64::from(eax);
 +    guest_state.rbx = u64::from(ebx);
 +    guest_state.rcx = u64::from(ecx);
@@ -1325,31 +1568,251 @@ index 00000000000..b1f20de1a87
 +    Ok(())
 +}
 +
-+fn handle_msr(vmcb: &mut Vmcb, guest_state: &mut GuestState) -> Result<(), Status> {
++fn handle_x2apic_rdmsr(
++    vmcb: &mut Vmcb,
++    guest_state: &mut GuestState,
++    local_apic_state: &LocalApicState,
++) {
++    let msr = guest_state.ecx();
++    let apic_id = vmcb.control.guest_asid.saturating_sub(1);
++    let val = match msr {
++        X2APIC_ID => u64::from(apic_id),
++        X2APIC_VERSION => 0x0006_0015, // modern APIC v0x15, 7 LVT entries
++        X2APIC_SVR => 0x1ff,           // APIC software-enabled + spurious vector 0xff
++        X2APIC_LDR => u64::from(((apic_id & !0xf) << 12) | (1u32 << (apic_id & 0xf))),
++        X2APIC_TPR
++        | X2APIC_ESR
++        | X2APIC_LVT_MONITOR
++        | X2APIC_CURRENT_COUNT
++        | X2APIC_ISR_START..=X2APIC_IRR_END => 0,
++        X2APIC_LVT_LINT0 | X2APIC_LVT_LINT1 | X2APIC_LVT_THERMAL | X2APIC_LVT_CMCI
++        | X2APIC_LVT_ERROR => u64::from(LVT_MASKED),
++        X2APIC_LVT_TIMER => u64::from(local_apic_state.lvt_timer.load(Ordering::Relaxed)),
++        X2APIC_INITIAL_COUNT => {
++            u64::from(local_apic_state.lvt_initial_count.load(Ordering::Relaxed))
++        }
++        X2APIC_DCR => u64::from(local_apic_state.lvt_divide_config.load(Ordering::Relaxed)),
++        _ => {
++            svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++            return;
++        }
++    };
++    advance_rip(vmcb, 2);
++    guest_state.set_edx_eax(val);
++}
++
++fn handle_x2apic_wrmsr(
++    vmcb: &mut Vmcb,
++    guest_state: &GuestState,
++    local_apic_state: &LocalApicState,
++) -> Result<(), Status> {
++    let msr = guest_state.ecx();
++    if guest_state.edx() != 0 && msr != X2APIC_ICR {
++        svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++        return Ok(());
++    }
++    match msr {
++        X2APIC_EOI | X2APIC_ESR => {
++            if guest_state.eax() != 0 {
++                svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++                return Ok(());
++            }
++            advance_rip(vmcb, 2);
++            Ok(())
++        }
++        X2APIC_TPR
++        | X2APIC_SVR
++        | X2APIC_LVT_MONITOR
++        | X2APIC_LVT_ERROR
++        | X2APIC_LVT_LINT0
++        | X2APIC_LVT_LINT1
++        | X2APIC_LVT_THERMAL
++        | X2APIC_LVT_CMCI => {
++            advance_rip(vmcb, 2);
++            Ok(())
++        }
++        X2APIC_LVT_TIMER => {
++            let lvt_timer = guest_state.eax();
++            if (lvt_timer & LVT_TIMER_MODE_MASK) == LVT_TIMER_MODE_RESERVED {
++                return Err(Status::INVALID_ARGS);
++            }
++            advance_rip(vmcb, 2);
++            local_apic_state.lvt_timer.store(lvt_timer, Ordering::Relaxed);
++            // SAFETY: `local_apic_state` is pinned in `Vcpu` and canceled in teardown.
++            unsafe {
++                svm_update_timer(local_apic_state, svm_lvt_deadline(local_apic_state, lvt_timer));
++            }
++            Ok(())
++        }
++        X2APIC_INITIAL_COUNT => {
++            advance_rip(vmcb, 2);
++            local_apic_state.lvt_initial_count.store(guest_state.eax(), Ordering::Relaxed);
++            let lvt_timer = local_apic_state.lvt_timer.load(Ordering::Relaxed);
++            unsafe {
++                svm_update_timer(local_apic_state, svm_lvt_deadline(local_apic_state, lvt_timer));
++            }
++            Ok(())
++        }
++        X2APIC_DCR => {
++            advance_rip(vmcb, 2);
++            local_apic_state.lvt_divide_config.store(guest_state.eax(), Ordering::Relaxed);
++            let lvt_timer = local_apic_state.lvt_timer.load(Ordering::Relaxed);
++            unsafe {
++                svm_update_timer(local_apic_state, svm_lvt_deadline(local_apic_state, lvt_timer));
++            }
++            Ok(())
++        }
++        X2APIC_SELF_IPI => {
++            advance_rip(vmcb, 2);
++            let vector = guest_state.eax() & 0xff;
++            local_apic_state.interrupt_tracker.interrupt(vector)
++        }
++        X2APIC_ICR => {
++            // Single-VCPU: deliver self/fixed IPIs locally and ignore INIT/SIPI.
++            advance_rip(vmcb, 2);
++            let lo = guest_state.eax();
++            let delivery = (lo >> 8) & 0x7;
++            let shorthand = (lo >> 18) & 0x3;
++            let vector = lo & 0xff;
++            if delivery == 0 && (shorthand == 1 || shorthand == 2 || guest_state.edx() == 0) {
++                let _ = local_apic_state.interrupt_tracker.interrupt(vector);
++            }
++            Ok(())
++        }
++        _ => {
++            svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++            Ok(())
++        }
++    }
++}
++
++fn handle_msr(
++    guard: &mut AutoSvmGuard,
++    vmcb: &mut Vmcb,
++    guest_state: &mut GuestState,
++    local_apic_state: &LocalApicState,
++    pv_clock: &mut PvClockState,
++    gpa: &GuestPhysicalAspace,
++) -> Result<(), Status> {
 +    let is_write = vmcb.control.exit_info_1 != 0;
 +    let msr = guest_state.ecx();
-+    advance_rip(vmcb, 2);
 +
 +    if !is_write {
 +        match msr {
 +            X86_MSR_IA32_APIC_BASE => {
-+                // Report xAPIC enabled + BSP at standard 0xFEE0_0000.
-+                guest_state.set_edx_eax(0xfee0_0900);
++                let mut val = LOCAL_APIC_PHYS_BASE;
++                if vmcb.control.guest_asid == 1 {
++                    val |= IA32_APIC_BASE_BSP;
++                }
++                advance_rip(vmcb, 2);
++                guest_state.set_edx_eax(val);
 +                Ok(())
 +            }
 +            X86_MSR_IA32_MISC_ENABLE => {
++                advance_rip(vmcb, 2);
++                guest_state.set_edx_eax(MISC_ENABLE_FAST_STRINGS);
++                Ok(())
++            }
++            X2APIC_MSR_BASE..=X2APIC_MSR_MAX => {
++                handle_x2apic_rdmsr(vmcb, guest_state, local_apic_state);
++                Ok(())
++            }
++            X86_MSR_DRAM_ENERGY_STATUS
++            | X86_MSR_DRAM_POWER_LIMIT
++            | X86_MSR_IA32_MTRRCAP
++            | X86_MSR_IA32_MTRR_DEF_TYPE
++            | X86_MSR_IA32_MTRR_FIX64K_00000
++            | X86_MSR_IA32_MTRR_FIX16K_80000..=X86_MSR_IA32_MTRR_FIX16K_A0000
++            | X86_MSR_IA32_MTRR_FIX4K_C0000..=X86_MSR_IA32_MTRR_FIX4K_F8000
++            | X86_MSR_IA32_MTRR_PHYSBASE0..=X86_MSR_IA32_MTRR_PHYSMASK9
++            | X86_MSR_IA32_PLATFORM_ID
++            | X86_MSR_IA32_BIOS_SIGN_ID
++            | X86_MSR_IA32_MCG_CAP
++            | X86_MSR_IA32_MCG_STATUS
++            | X86_MSR_IA32_TEMPERATURE_TARGET
++            | X86_MSR_PKG_ENERGY_STATUS
++            | X86_MSR_PLATFORM_ENERGY_COUNTER
++            | X86_MSR_PLATFORM_POWER_LIMIT
++            | X86_MSR_PP0_ENERGY_STATUS
++            | X86_MSR_PP0_POWER_LIMIT
++            | X86_MSR_PP1_ENERGY_STATUS
++            | X86_MSR_PP1_POWER_LIMIT
++            | X86_MSR_RAPL_POWER_UNIT
++            | X86_MSR_PPERF
++            | X86_MSR_SMI_COUNT
++            | X86_MSR_IA32_SPEC_CTRL
++            | X86_MSR_IA32_TSC_AUX
++            | X86_MSR_IA32_CSTAR
++            | 0x0000_003a // IA32_FEATURE_CONTROL
++            | 0x0000_010a // IA32_ARCH_CAPABILITIES
++            | 0xc001_0000..=0xc001_103f => {
++                advance_rip(vmcb, 2);
 +                guest_state.set_edx_eax(0);
 +                Ok(())
 +            }
 +            _ => {
++                // Fault: do NOT advance RIP so Linux's `__ex_table` (`rdmsr_safe`) matches!
 +                svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
 +                Ok(())
 +            }
 +        }
 +    } else {
 +        match msr {
-+            X86_MSR_IA32_APIC_BASE | X86_MSR_IA32_MISC_ENABLE => Ok(()),
++            X86_MSR_IA32_APIC_BASE
++            | X86_MSR_IA32_MISC_ENABLE
++            | X86_MSR_IA32_MTRRCAP
++            | X86_MSR_IA32_MTRR_DEF_TYPE
++            | X86_MSR_IA32_MTRR_FIX64K_00000
++            | X86_MSR_IA32_MTRR_FIX16K_80000..=X86_MSR_IA32_MTRR_FIX16K_A0000
++            | X86_MSR_IA32_MTRR_FIX4K_C0000..=X86_MSR_IA32_MTRR_FIX4K_F8000
++            | X86_MSR_IA32_MTRR_PHYSBASE0..=X86_MSR_IA32_MTRR_PHYSMASK9
++            | X86_MSR_IA32_BIOS_SIGN_ID
++            | X86_MSR_DRAM_POWER_LIMIT
++            | X86_MSR_PP0_POWER_LIMIT
++            | X86_MSR_PP1_POWER_LIMIT
++            | X86_MSR_PLATFORM_POWER_LIMIT
++            | X86_MSR_IA32_SPEC_CTRL
++            | X86_MSR_IA32_PRED_CMD
++            | X86_MSR_IA32_CSTAR
++            | X86_MSR_IA32_TSC_AUX
++            | 0xc001_0000..=0xc001_103f => {
++                advance_rip(vmcb, 2);
++                Ok(())
++            }
++            X86_MSR_IA32_TSC_DEADLINE => {
++                advance_rip(vmcb, 2);
++                if (local_apic_state.lvt_timer.load(Ordering::Relaxed) & LVT_TIMER_MODE_MASK)
++                    == LVT_TIMER_MODE_TSC_DEADLINE
++                {
++                    let tsc_deadline = guest_state.edx_eax() as i64;
++                    let mono_deadline =
++                        InstantMono(convert_raw_tsc_timestamp_to_clock_monotonic(tsc_deadline));
++                    unsafe { svm_update_timer(local_apic_state, mono_deadline) };
++                }
++                Ok(())
++            }
++            X2APIC_MSR_BASE..=X2APIC_MSR_MAX => {
++                handle_x2apic_wrmsr(vmcb, guest_state, local_apic_state)
++            }
++            KVM_SYSTEM_TIME_MSR_OLD | KVM_SYSTEM_TIME_MSR => {
++                let guest_paddr = guest_state.edx_eax() as zx_paddr_t;
++                advance_rip(vmcb, 2);
++                guard.invalidate();
++                if (guest_paddr & 1) != 0 {
++                    pv_clock_reset_clock(pv_clock, gpa, guest_paddr & !1)
++                } else {
++                    pv_clock_stop_clock(pv_clock);
++                    Ok(())
++                }
++            }
++            KVM_BOOT_TIME_OLD | KVM_BOOT_TIME => {
++                let guest_paddr = guest_state.edx_eax() as zx_paddr_t;
++                advance_rip(vmcb, 2);
++                guard.invalidate();
++                pv_clock_update_boot_time(gpa, guest_paddr)
++            }
 +            _ => {
++                // Fault: do NOT advance RIP so Linux's `__ex_table` (`wrmsr_safe`) matches!
 +                svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
 +                Ok(())
 +            }
@@ -1370,6 +1833,35 @@ index 00000000000..b1f20de1a87
 +    Ok(())
 +}
 +
++fn handle_vmmcall(
++    guard: &mut AutoSvmGuard,
++    vmcb: &mut Vmcb,
++    guest_state: &mut GuestState,
++    gpa: &GuestPhysicalAspace,
++) -> Result<(), Status> {
++    advance_rip(vmcb, 3);
++    if vmcb.save.cpl != 0 {
++        guest_state.rax = (-1i64) as u64; // -EPERM
++        return Ok(());
++    }
++    // KVM_HC_CLOCK_PAIRING = 9
++    if guest_state.rax == 9 {
++        if guest_state.rcx != 0 {
++            guest_state.rax = (-95i64) as u64; // -EOPNOTSUPP
++            return Ok(());
++        }
++        guard.invalidate();
++        if pv_clock_populate_offset(gpa, guest_state.rbx as zx_vaddr_t).is_ok() {
++            guest_state.rax = 0;
++        } else {
++            guest_state.rax = (-14i64) as u64; // -EFAULT
++        }
++    } else {
++        guest_state.rax = (-1000i64) as u64; // KVM_ENOSYS
++    }
++    Ok(())
++}
++
 +/// Dispatches an AMD SVM VM exit.
 +#[allow(clippy::too_many_arguments)]
 +pub fn svm_vmexit_handler(
@@ -1377,19 +1869,18 @@ index 00000000000..b1f20de1a87
 +    vmcb: &mut Vmcb,
 +    guest_state: &mut GuestState,
 +    local_apic_state: &LocalApicState,
-+    _pv_clock_state: &mut PvClockState,
++    pv_clock_state: &mut PvClockState,
 +    gpa: &GuestPhysicalAspace,
 +    traps: &TrapMap,
 +    packet: &mut zx_port_packet_t,
 +) -> Result<(), Status> {
-+    // Sync guest RAX from VMCB save area into `guest_state`.
++    // Sync guest RAX/CR2 from VMCB save area into `guest_state`.
 +    guest_state.rax = vmcb.save.rax;
 +    guest_state.cr2 = vmcb.save.cr2;
 +
 +    let result = match vmcb.control.exit_code {
 +        VMEXIT_INTR => {
 +            PerCpu::get_current().gstats.arch.interrupts.fetch_add(1, Ordering::Relaxed);
-+            // Service pending host interrupt and EOI while preemption is still disabled.
 +            guard.service_pending_external_interrupt();
 +            Ok(())
 +        }
@@ -1405,7 +1896,7 @@ index 00000000000..b1f20de1a87
 +        }
 +        VMEXIT_IOIO => {
 +            PerCpu::get_current().gstats.arch.io_instructions.fetch_add(1, Ordering::Relaxed);
-+            handle_ioio(vmcb, guest_state, traps, packet)
++            handle_ioio(guard, vmcb, guest_state, traps, packet)
 +        }
 +        VMEXIT_CPUID => {
 +            PerCpu::get_current().gstats.arch.cpuid_instructions.fetch_add(1, Ordering::Relaxed);
@@ -1417,7 +1908,7 @@ index 00000000000..b1f20de1a87
 +            guard.invalidate();
 +            local_apic_state
 +                .interrupt_tracker
-+                .wait(crate::platform_rs::timer::InstantMono(ZX_TIME_INFINITE), None)
++                .wait(InstantMono(ZX_TIME_INFINITE), None)
 +        }
 +        VMEXIT_INVD => {
 +            advance_rip(vmcb, 2);
@@ -1425,14 +1916,10 @@ index 00000000000..b1f20de1a87
 +        }
 +        VMEXIT_MSR => {
 +            PerCpu::get_current().gstats.arch.wrmsr_instructions.fetch_add(1, Ordering::Relaxed);
-+            handle_msr(vmcb, guest_state)
++            handle_msr(guard, vmcb, guest_state, local_apic_state, pv_clock_state, gpa)
 +        }
 +        VMEXIT_XSETBV => handle_xsetbv(vmcb, guest_state),
-+        VMEXIT_VMMCALL => {
-+            advance_rip(vmcb, 3);
-+            guest_state.rax = (-38i64) as u64; // -ENOSYS
-+            Ok(())
-+        }
++        VMEXIT_VMMCALL => handle_vmmcall(guard, vmcb, guest_state, gpa),
 +        VMEXIT_SHUTDOWN => Err(Status::BAD_STATE),
 +        VMEXIT_INVALID => {
 +            dprintf!(
@@ -1458,7 +1945,6 @@ index 00000000000..b1f20de1a87
 +        }
 +    };
 +
-+    // Write potentially updated RAX/CR2 back into VMCB for the next entry.
 +    vmcb.save.rax = guest_state.rax;
 +    vmcb.save.cr2 = guest_state.cr2;
 +    result

@@ -145,8 +145,11 @@ fn usage() {
          \n\
          Run options:\n\
            --tier 1|2                                   Execution tier (default: 1)\n\
-           --ram-mib N                                  Tier 2 MicroVM RAM in MiB (default: 8)\n\
+           --ram-mib N                                  Tier 2 MicroVM RAM in MiB (default: 8, or 128 for Linux kernel)\n\
            --linux-elf                                  Tier 2: boot unmodified Linux x86-64 static ELF in Ring 3\n\
+           --linux-kernel                               Tier 2: boot real upstream Linux vmlinux/bzImage kernel\n\
+           --initrd PATH                                Tier 2: attach cpio initramfs to Linux kernel microVM\n\
+           --cmdline STRING                             Tier 2: kernel command line\n\
            --arg VALUE                                  Tier 1: pass positional arg (repeatable)\n\
            --env KEY=VAL                                Tier 1: pass environment variable (repeatable)\n\
            --timeout-ms MS                              Tier 1: wall-clock kill timeout in ms\n\
@@ -464,8 +467,11 @@ fn main() {
         }
         "run" | "run-bootfs" => {
             let mut tier: u8 = 1;
-            let mut ram_mib: u32 = 8;
+            let mut ram_mib: u32 = 0;
             let mut linux_elf = false;
+            let mut linux_kernel = false;
+            let mut initrd_path: Option<String> = None;
+            let mut cmdline = String::new();
             let mut job_args: Vec<String> = Vec::new();
             let mut job_env: Vec<String> = Vec::new();
             let mut timeout_ms: u64 = 0;
@@ -481,13 +487,26 @@ fn main() {
                         i += 2;
                     }
                     "--ram-mib" if i + 1 < args.len() => {
-                        ram_mib = args[i + 1].parse().unwrap_or(8);
+                        ram_mib = args[i + 1].parse().unwrap_or(0);
                         i += 2;
                     }
                     "--linux-elf" => {
                         linux_elf = true;
                         tier = 2;
                         i += 1;
+                    }
+                    "--linux-kernel" => {
+                        linux_kernel = true;
+                        tier = 2;
+                        i += 1;
+                    }
+                    "--initrd" if i + 1 < args.len() => {
+                        initrd_path = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--cmdline" if i + 1 < args.len() => {
+                        cmdline = args[i + 1].clone();
+                        i += 2;
                     }
                     "--arg" if i + 1 < args.len() => {
                         job_args.push(args[i + 1].clone());
@@ -566,6 +585,31 @@ fn main() {
                 }
             };
 
+            let initrd_target = if let Some(rd_path) = initrd_path {
+                let p = Path::new(&rd_path);
+                let nm = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("initramfs.cpio")
+                    .to_owned();
+                let bytes = match fs::read(p) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: failed to read initrd {}: {e}", p.display());
+                        process::exit(1);
+                    }
+                };
+                match ensure_uploaded(&mut tx, &nm, &bytes) {
+                    Ok(digest) => Some(RunTarget::Digest(digest)),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+
             let req = if tier == 1 {
                 Request::RunTier1 {
                     target,
@@ -577,15 +621,29 @@ fn main() {
                     grant_net,
                 }
             } else {
+                let mode = if linux_kernel {
+                    Tier2Mode::LinuxKernel
+                } else if linux_elf {
+                    Tier2Mode::LinuxUserElf
+                } else {
+                    Tier2Mode::RawElf
+                };
+                let eff_ram = if ram_mib > 0 {
+                    ram_mib
+                } else if linux_kernel {
+                    128
+                } else if linux_elf {
+                    16
+                } else {
+                    8
+                };
                 Request::RunTier2 {
                     target,
-                    ram_mib: if linux_elf { ram_mib.max(16) } else { ram_mib },
-                    max_vm_exits: 200_000,
-                    mode: if linux_elf {
-                        Tier2Mode::LinuxUserElf
-                    } else {
-                        Tier2Mode::RawElf
-                    },
+                    ram_mib: eff_ram,
+                    max_vm_exits: if linux_kernel { 2_000_000 } else { 200_000 },
+                    mode,
+                    cmdline,
+                    initrd: initrd_target,
                 }
             };
             match tx.call(&req) {

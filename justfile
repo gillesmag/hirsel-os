@@ -116,6 +116,62 @@ build-linux-workload:
       -o "{{out_dir}}/hello-linux"
     ls -lh "{{out_dir}}/hello-linux"
 
+# Build minimal static Linux PID 1 (/init) and pack into a cpio initramfs (with /dev/console & /dev/null)
+build-linux-initrd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STAGE="{{out_dir}}/linux/initrd-root"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE/dev" "$STAGE/proc"
+    gcc -static -nostdlib -fno-builtin -no-pie -fno-pie -O2 -Wall -Wextra \
+      -Wl,--build-id=none \
+      "{{root}}/examples/linux-init/init.c" \
+      -o "$STAGE/init"
+    chmod 0755 "$STAGE/init"
+    python3 - "$STAGE/init" "{{out_dir}}/linux/initramfs.cpio" <<'PY'
+    import sys, stat
+    init_bytes = open(sys.argv[1], "rb").read()
+    out = bytearray()
+    ino = 1
+    def entry(name, mode, data=b"", rdev_maj=0, rdev_min=0):
+        global ino
+        ino += 1
+        nb = name.encode() + b"\x00"
+        hdr = (
+            f"070701{ino:08x}{mode:08x}{0:08x}{0:08x}{1:08x}{0:08x}"
+            f"{len(data):08x}{0:08x}{0:08x}{rdev_maj:08x}{rdev_min:08x}"
+            f"{len(nb):08x}{0:08x}"
+        ).encode()
+        out.extend(hdr); out.extend(nb)
+        while len(out) % 4: out.append(0)
+        out.extend(data)
+        while len(out) % 4: out.append(0)
+    entry("dev", stat.S_IFDIR | 0o755)
+    entry("proc", stat.S_IFDIR | 0o755)
+    entry("dev/console", stat.S_IFCHR | 0o600, rdev_maj=5, rdev_min=1)
+    entry("dev/null", stat.S_IFCHR | 0o666, rdev_maj=1, rdev_min=3)
+    entry("init", stat.S_IFREG | 0o755, data=init_bytes)
+    entry("TRAILER!!!", 0)
+    while len(out) % 512: out.append(0)
+    open(sys.argv[2], "wb").write(out)
+    PY
+    ls -lh "{{out_dir}}/linux/initramfs.cpio"
+
+# Fetch and strip Firecracker's upstream Linux 6.1.102 x86-64 vmlinux for Tier 2 Linux MicroVM tests
+fetch-linux-kernel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}/linux"
+    if [[ ! -f "{{out_dir}}/linux/vmlinux.stripped" ]]; then
+      if [[ ! -f "{{out_dir}}/linux/vmlinux" ]]; then
+        curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-6.1.102" \
+          -o "{{out_dir}}/linux/vmlinux"
+      fi
+      "$STRIP" --strip-all "{{out_dir}}/linux/vmlinux" -o "{{out_dir}}/linux/vmlinux.stripped"
+    fi
+    ls -lh "{{out_dir}}/linux/vmlinux.stripped"
+
 # Pack minimal Talos-style hirsel-os.zbi (Zircon kernel + userboot + hirsel-init + Tier 1 & Tier 2 workloads)
 build-os: build-init build-guest build-linux-shim
     #!/usr/bin/env bash
@@ -538,6 +594,95 @@ test-all: build-rt build-os build-linux-workload
 
     echo "=== 10. Verify Tier 2 Linux static ELF cached 0-byte HIT after cold reboot! ==="
     "$CTL" --addr "127.0.0.1:${PORT}" run --tier 2 --linux-elf "{{out_dir}}/hello-linux"
+
+# Boot a REAL upstream Linux 6.1.102 kernel + initramfs inside Hirsel-OS Zircon AMD SVM Tier 2 MicroVM!
+test-linux-vm: build-os build-linux-initrd fetch-linux-kernel
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -q -p hirsel-os-ctl
+    CTL="{{root}}/target/debug/hirsel-os-ctl"
+    BUILD_DIR="{{fuchsia}}/$(cat "{{fuchsia}}/.fx-build-dir")"
+    QEMU="{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/bin/qemu-system-x86_64"
+    DISK="{{out_dir}}/test-linux-vm.img"
+    LOG="{{out_dir}}/test-linux-vm.log"
+    PORT=14446
+    rm -f "$DISK" "$LOG"
+    truncate -s 64M "$DISK"
+
+    QEMU_PID=""
+    stop_qemu() {
+      if [[ -n "$QEMU_PID" ]]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+      fi
+      pkill -f "hostfwd=tcp:127.0.0.1:${PORT}-:4444" 2>/dev/null || true
+      QEMU_PID=""
+      sleep 0.2
+    }
+    trap stop_qemu EXIT
+
+    ENTROPY="$(head -c 32 /dev/urandom | sha256sum | awk '{print $1}')"
+    QEMU_ARGS=(
+      -L "{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/share/qemu"
+      -machine q35,smbios-entry-point-type=32,i8042=off
+      -device isa-debug-exit,iobase=0xf4,iosize=0x04
+      -device virtio-rng-pci
+      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${PORT}-:4444"
+      -device "virtio-net-pci,netdev=net0"
+      -drive "file=${DISK},format=raw,if=none,id=blk0"
+      -device "virtio-blk-pci,drive=blk0"
+      -enable-kvm -cpu "host,migratable=no,+invtsc"
+      -m 1024
+      -smp 2
+      -vga none
+      -display none
+      -serial "file:${LOG}"
+      -monitor none
+      -kernel "${BUILD_DIR}/kernel.phys_x64/linux-x86-boot-shim.bin"
+      -initrd "{{out_dir}}/hirsel-os.zbi"
+      -append "kernel.serial=legacy kernel.entropy-mixin=${ENTROPY} kernel.halt-on-panic=true"
+    )
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      "$QEMU" "${QEMU_ARGS[@]}" &
+    else
+      sg kvm -c "$(printf '%q ' "$QEMU" "${QEMU_ARGS[@]}")" &
+    fi
+    QEMU_PID=$!
+    for _ in $(seq 1 80); do
+      if grep -qa "Control Plane TCP API listening" "$LOG" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    grep -qa "Control Plane TCP API listening" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
+
+    echo "=== 1. Boot REAL Linux 6.1.102 kernel + initramfs inside Zircon AMD SVM ==="
+    OUT1="$(
+      "$CTL" --addr "127.0.0.1:${PORT}" run --tier 2 \
+        --linux-kernel \
+        --ram-mib 128 \
+        --initrd "{{out_dir}}/linux/initramfs.cpio" \
+        --cmdline "earlycon=uart,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off nomodules" \
+        "{{out_dir}}/linux/vmlinux.stripped"
+    )"
+    printf '%s\n' "$OUT1"
+    grep -q "Linux version 6.1.102" <<<"$OUT1"
+    grep -q "REAL LINUX KERNEL BOOTED TO PID 1!" <<<"$OUT1"
+    grep -q "uname:     Linux 6.1.102 x86_64" <<<"$OUT1"
+    grep -q "pid:       1" <<<"$OUT1"
+
+    echo "=== 2. Second boot (0-byte VMO cache HIT for BOTH vmlinux and initramfs!) ==="
+    OUT2="$(
+      "$CTL" --addr "127.0.0.1:${PORT}" run --tier 2 \
+        --linux-kernel \
+        --ram-mib 128 \
+        --initrd "{{out_dir}}/linux/initramfs.cpio" \
+        --cmdline "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet" \
+        "{{out_dir}}/linux/vmlinux.stripped"
+    )"
+    printf '%s\n' "$OUT2"
+    grep -q "REAL LINUX KERNEL BOOTED TO PID 1!" <<<"$OUT2"
+    grep -q "uname:     Linux 6.1.102 x86_64" <<<"$OUT2"
+    echo "=== PASS: Upstream Linux 6.1.102 microVM booted cleanly to PID 1 twice inside Zircon AMD SVM! ==="
 
 # Run host Rust unit tests (zbi, zx-sys, hirsel-proto, hirsel-vmm, hirsel-virtio)
 test:

@@ -2,9 +2,12 @@
 //!
 //! Uses Zircon's built-in kernel hypervisor (`zx_guest_create`, `zx_vcpu_create`,
 //! `zx_vcpu_enter`, `zx_guest_set_trap`) backed by AMD SVM + NPT (and Intel VMX + EPT)
-//! to execute freestanding 64-bit ELF payloads or raw machine-code workloads with
-//! hardware memory isolation, virtual COM1 UART console capture, paravirt host
-//! clock/CSPRNG hypercalls, and NPT MMIO/doorbell trapping.
+//! to execute:
+//! - Freestanding 64-bit ELF payloads (`run_elf_microvm`),
+//! - Unmodified Linux x86-64 static ELFs in Ring 3 (`run_linux_user_elf`), and
+//! - Full upstream Linux x86-64 kernels (`vmlinux` ELF or `bzImage`) + `initramfs`
+//!   (`run_linux_kernel`) with 16550A COM1 console, CMOS/RTC, i8042 `reboot=k`,
+//!   KVM pvclock, and in-kernel x2APIC timer virtualization.
 
 pub mod linux_boot;
 
@@ -100,26 +103,20 @@ pub fn init_identity_page_tables(ram: &mut [u8]) -> Result<(), String> {
     const W: u64 = 1 << 1;
     const PS: u64 = 1 << 7;
 
-    // Clear 4 page-table pages (0x0000..0x4000).
     ram[0..0x4000].fill(0);
 
     let write_u64 = |buf: &mut [u8], off: usize, val: u64| {
         buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
     };
 
-    // PML4[0] -> PDPT at 0x1000
     write_u64(ram, GPA_PML4 as usize, GPA_PDPT | P | W);
-    // PDPT[0] -> PD_LOW (0..1 GiB)
     write_u64(ram, GPA_PDPT as usize, GPA_PD_LOW | P | W);
-    // PDPT[3] -> PD_HIGH (3..4 GiB, covers 0xD000_0000 MMIO window)
     write_u64(ram, GPA_PDPT as usize + 3 * 8, GPA_PD_HIGH | P | W);
 
-    // Fill PD_LOW: 512 x 2 MiB identity pages covering 0x0000_0000..0x4000_0000.
     for i in 0..512u64 {
         let entry = (i << 21) | P | W | PS;
         write_u64(ram, GPA_PD_LOW as usize + (i as usize) * 8, entry);
     }
-    // Fill PD_HIGH: 512 x 2 MiB identity pages covering 0xC000_0000..0x1_0000_0000.
     for i in 0..512u64 {
         let entry = (0xC000_0000u64 + (i << 21)) | P | W | PS;
         write_u64(ram, GPA_PD_HIGH as usize + (i as usize) * 8, entry);
@@ -162,7 +159,8 @@ struct Elf64Phdr {
 const PT_LOAD: u32 = 1;
 const EM_X86_64: u16 = 62;
 
-/// Loads a static 64-bit x86-64 ELF image into `ram` and returns its entry GPA.
+/// Loads a static 64-bit x86-64 ELF image (`vmlinux` or freestanding guest) into `ram`
+/// and returns its entry GPA.
 pub fn load_elf_into_ram(elf: &[u8], ram: &mut [u8]) -> Result<u64, String> {
     if elf.len() < size_of::<Elf64Ehdr>() || &elf[0..4] != b"\x7fELF" {
         return Err("guest image is not an ELF64 binary".into());
@@ -200,8 +198,9 @@ pub fn load_elf_into_ram(elf: &[u8], ram: &mut [u8]) -> Result<u64, String> {
         }
         if dst_addr < 0x5000 || dst_addr.checked_add(memsz).is_none_or(|e| e > ram.len()) {
             return Err(format!(
-                "guest ELF PT_LOAD [{dst_addr:#x}, {:#x}) outside usable guest RAM",
-                dst_addr.saturating_add(memsz)
+                "guest ELF PT_LOAD [{dst_addr:#x}, {:#x}) outside usable guest RAM ({} MiB)",
+                dst_addr.saturating_add(memsz),
+                ram.len() / (1024 * 1024),
             ));
         }
         ram[dst_addr..dst_addr + filesz].copy_from_slice(&elf[src_off..src_off + filesz]);
@@ -219,6 +218,36 @@ pub fn load_elf_into_ram(elf: &[u8], ram: &mut [u8]) -> Result<u64, String> {
     Ok(ehdr.e_entry)
 }
 
+/// Loads either an uncompressed Linux `vmlinux` ELF64 or a Linux `bzImage` into `ram`,
+/// populates Linux `boot_params` @ `0x7000`, cmdline @ `0x20000`, E820 map, and optional
+/// `initramfs`, returning the 64-bit `startup_64` entry GPA.
+pub fn load_linux_kernel_into_ram(
+    kernel: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    ram: &mut [u8],
+) -> Result<u64, String> {
+    if kernel.len() >= 4 && &kernel[0..4] == b"\x7fELF" {
+        let entry = load_elf_into_ram(kernel, ram)?;
+        linux_boot::install_linux_boot_params(ram, cmdline, initrd, None)?;
+        Ok(entry)
+    } else {
+        let bz = linux_boot::parse_bzimage(kernel)?;
+        let payload = &kernel[bz.payload_offset..];
+        let dst = bz.pref_address as usize;
+        if dst.checked_add(payload.len()).is_none_or(|e| e > ram.len()) {
+            return Err(format!(
+                "bzImage payload ({} bytes at {dst:#x}) exceeds guest RAM ({} MiB)",
+                payload.len(),
+                ram.len() / (1024 * 1024),
+            ));
+        }
+        ram[dst..dst + payload.len()].copy_from_slice(payload);
+        linux_boot::install_linux_boot_params(ram, cmdline, initrd, Some(kernel))?;
+        Ok(bz.code64_entry)
+    }
+}
+
 #[cfg(target_os = "fuchsia")]
 mod fuchsia_vmm {
     use super::*;
@@ -230,6 +259,270 @@ mod fuchsia_vmm {
     const TRAP_KEY_MMIO_HEARTBEAT: u64 = 3;
     const TRAP_KEY_MMIO_BELL: u64 = 4;
     const TRAP_KEY_VIRTIO_CON: u64 = 5;
+    const TRAP_KEY_ALL_IO: u64 = 6;
+
+    struct LaunchSpec {
+        entry_gpa: u64,
+        rsp: u64,
+        rdi: u64,
+        rsi: u64,
+        trap_all_io: bool,
+    }
+
+    /// Minimal 16550A UART state so Linux's `8250` serial driver probes and opens COM1 cleanly.
+    struct Uart16550 {
+        ier: u8,
+        lcr: u8,
+        mcr: u8,
+        scr: u8,
+        dll: u8,
+        dlm: u8,
+        fcr: u8,
+        thr_ipending: bool,
+        loopback_byte: Option<u8>,
+    }
+
+    impl Uart16550 {
+        fn new() -> Self {
+            Self {
+                ier: 0,
+                lcr: 0x03, // 8N1
+                mcr: 0,
+                scr: 0,
+                dll: 0x01, // 115200 baud
+                dlm: 0,
+                fcr: 0,
+                thr_ipending: false,
+                loopback_byte: None,
+            }
+        }
+
+        fn dlab(&self) -> bool {
+            (self.lcr & 0x80) != 0
+        }
+
+        fn read(&mut self, reg: u16) -> u8 {
+            match reg {
+                0 => {
+                    if self.dlab() {
+                        self.dll
+                    } else {
+                        self.loopback_byte.take().unwrap_or(0)
+                    }
+                }
+                1 => {
+                    if self.dlab() {
+                        self.dlm
+                    } else {
+                        self.ier
+                    }
+                }
+                2 => {
+                    // IIR: bit 0 = 0 if interrupt pending, 1 if none; bits 6..7 = FIFO enabled.
+                    let fifo = if (self.fcr & 1) != 0 { 0xC0 } else { 0x00 };
+                    if self.loopback_byte.is_some() && (self.ier & 0x01) != 0 {
+                        fifo | 0x04 // RDA interrupt pending
+                    } else if self.thr_ipending && (self.ier & 0x02) != 0 {
+                        self.thr_ipending = false;
+                        fifo | 0x02 // THRE interrupt pending
+                    } else {
+                        fifo | 0x01 // No interrupt pending
+                    }
+                }
+                3 => self.lcr,
+                4 => self.mcr,
+                5 => {
+                    // LSR: THRE (0x20) | TEMT (0x40), plus DR (0x01) if loopback byte queued.
+                    if self.loopback_byte.is_some() { 0x61 } else { 0x60 }
+                }
+                6 => {
+                    // MSR: in loopback mode (MCR bit 4), reflect MCR[3:0] into MSR[7:4].
+                    if (self.mcr & 0x10) != 0 {
+                        let mut msr = 0u8;
+                        if (self.mcr & 0x02) != 0 {
+                            msr |= 0x10; // RTS -> CTS
+                        }
+                        if (self.mcr & 0x01) != 0 {
+                            msr |= 0x20; // DTR -> DSR
+                        }
+                        if (self.mcr & 0x04) != 0 {
+                            msr |= 0x40; // OUT1 -> RI
+                        }
+                        if (self.mcr & 0x08) != 0 {
+                            msr |= 0x80; // OUT2 -> DCD
+                        }
+                        msr
+                    } else {
+                        0xB0 // DCD | DSR | CTS
+                    }
+                }
+                7 => self.scr,
+                _ => 0,
+            }
+        }
+
+        fn write(&mut self, reg: u16, val: u8, stdout: &mut Vec<u8>) {
+            match reg {
+                0 => {
+                    if self.dlab() {
+                        self.dll = val;
+                    } else if (self.mcr & 0x10) != 0 {
+                        // Hardware loopback self-test (MCR bit 4): route TX back to RBR.
+                        self.loopback_byte = Some(val);
+                    } else {
+                        stdout.push(val);
+                        if (self.ier & 0x02) != 0 {
+                            self.thr_ipending = true;
+                        }
+                    }
+                }
+                1 => {
+                    if self.dlab() {
+                        self.dlm = val;
+                    } else {
+                        let prev = self.ier;
+                        self.ier = val;
+                        if (prev & 0x02) == 0 && (val & 0x02) != 0 {
+                            self.thr_ipending = true;
+                        }
+                    }
+                }
+                2 => self.fcr = val,
+                3 => self.lcr = val,
+                4 => self.mcr = val,
+                7 => self.scr = val,
+                _ => {}
+            }
+        }
+        fn irq_pending(&self) -> bool {
+            // Gate COM1 IRQ 4 through OUT2 (MCR bit 3) and suppress during loopback (MCR bit 4).
+            (self.mcr & 0x18) == 0x08
+                && ((self.thr_ipending && (self.ier & 0x02) != 0)
+                    || (self.loopback_byte.is_some() && (self.ier & 0x01) != 0))
+        }
+    }
+
+    /// Minimal Intel 8259A PIC chip emulation so Linux can receive COM1 IRQ 4 cleanly.
+    struct Pic8259 {
+        icw_step: u8,
+        icw4_needed: bool,
+        vector_base: u8,
+        imr: u8,
+        isr: u8,
+        read_isr: bool,
+    }
+
+    impl Pic8259 {
+        fn new() -> Self {
+            Self {
+                icw_step: 0,
+                icw4_needed: false,
+                vector_base: 0,
+                imr: 0xFF,
+                isr: 0,
+                read_isr: false,
+            }
+        }
+
+        fn read_cmd(&self) -> u8 {
+            if self.read_isr { self.isr } else { 0 }
+        }
+
+        fn read_data(&self) -> u8 {
+            self.imr
+        }
+
+        fn write_cmd(&mut self, val: u8) {
+            if (val & 0x10) != 0 {
+                // ICW1: start initialization sequence.
+                self.icw_step = 1;
+                self.icw4_needed = (val & 0x01) != 0;
+                self.isr = 0;
+            } else if (val & 0x20) != 0 {
+                // OCW2: specific or non-specific EOI.
+                if (val & 0x40) != 0 {
+                    let irq = val & 0x07;
+                    self.isr &= !(1u8 << irq);
+                } else {
+                    self.isr = 0;
+                }
+            } else if (val & 0x08) != 0 {
+                // OCW3: select IRR (0x0A) or ISR (0x0B) for next cmd read.
+                if (val & 0x02) != 0 {
+                    self.read_isr = (val & 0x01) != 0;
+                }
+            }
+        }
+
+        fn write_data(&mut self, val: u8) {
+            match self.icw_step {
+                1 => {
+                    self.vector_base = val & 0xF8;
+                    self.icw_step = 2;
+                }
+                2 => {
+                    self.icw_step = if self.icw4_needed { 3 } else { 0 };
+                }
+                3 => {
+                    self.icw_step = 0;
+                }
+                _ => {
+                    self.imr = val;
+                }
+            }
+        }
+
+        fn try_deliver(&mut self, irq: u8) -> Option<u32> {
+            let mask = 1u8 << irq;
+            if self.vector_base >= 0x20 && (self.imr & mask) == 0 && (self.isr & mask) == 0 {
+                self.isr |= mask;
+                Some(u32::from(self.vector_base + irq))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Minimal PC legacy I/O state (8259A PIC, CMOS/RTC, i8042, Port 0x61, PIT) for Linux boot.
+    struct PcLegacyIo {
+        pic_master: Pic8259,
+        pic_slave: Pic8259,
+        cmos_idx: u8,
+        i8042_cmd: u8,
+        port61: u8,
+        pit_tick: u16,
+    }
+
+    impl PcLegacyIo {
+        fn new() -> Self {
+            Self {
+                pic_master: Pic8259::new(),
+                pic_slave: Pic8259::new(),
+                cmos_idx: 0,
+                i8042_cmd: 0,
+                port61: 0,
+                pit_tick: 0xFFFF,
+            }
+        }
+
+        fn read_cmos(&self) -> u8 {
+            match self.cmos_idx {
+                0x00 => 0x00, // seconds (BCD)
+                0x02 => 0x00, // minutes
+                0x04 => 0x12, // hours
+                0x06 => 0x05, // day of week
+                0x07 => 0x27, // day of month
+                0x08 => 0x11, // month
+                0x09 => 0x26, // year
+                0x32 => 0x20, // century
+                0x0A => 0x26, // Status A (UIP=0)
+                0x0B => 0x02, // Status B (24-hour mode)
+                0x0C => 0x00, // Status C
+                0x0D => 0x80, // Status D (CMOS RAM valid)
+                _ => 0,
+            }
+        }
+    }
 
     fn check(status: zx_status_t, ctx: &str) -> Result<(), String> {
         if status == ZX_OK {
@@ -252,8 +545,16 @@ mod fuchsia_vmm {
         elf_bytes: &[u8],
         config: MicroVmConfig,
     ) -> Result<VmRunReport, String> {
+        let ram_bytes = config.ram_bytes;
         run_microvm_inner(hypervisor_resource, vmex_resource, config, |ram, _| {
-            load_elf_into_ram(elf_bytes, ram)
+            let entry_gpa = load_elf_into_ram(elf_bytes, ram)?;
+            Ok(LaunchSpec {
+                entry_gpa,
+                rsp: (ram_bytes as u64 - 0x1000) & !0xf,
+                rdi: GPA_BOOT_INFO,
+                rsi: 0,
+                trap_all_io: false,
+            })
         })
     }
 
@@ -270,12 +571,12 @@ mod fuchsia_vmm {
         if cfg.ram_bytes < 16 * 1024 * 1024 {
             cfg.ram_bytes = 16 * 1024 * 1024;
         }
+        let ram_bytes = cfg.ram_bytes;
         run_microvm_inner(hypervisor_resource, vmex_resource, cfg, |ram, boot_info| {
             let aux_start = GPA_AUX_PAYLOAD as usize;
             let aux_end = aux_start
                 .checked_add(linux_user_elf.len())
                 .ok_or_else(|| "Linux ELF size overflow".to_string())?;
-            // Aux staging lives in [2 MiB .. 4 MiB); user ELF loads at >= 4 MiB.
             if aux_end > 0x0040_0000 {
                 return Err(format!(
                     "Linux static ELF ({} bytes) exceeds 2 MiB staging window",
@@ -285,14 +586,54 @@ mod fuchsia_vmm {
             ram[aux_start..aux_end].copy_from_slice(linux_user_elf);
             boot_info.aux_gpa = GPA_AUX_PAYLOAD;
             boot_info.aux_bytes = linux_user_elf.len() as u64;
-            // Also populate standard Linux boot_params zero-page at 0x7000.
             let _ = linux_boot::install_linux_boot_params(
                 ram,
                 "console=ttyS0 hirsel.tier=2",
                 None,
                 None,
             );
-            load_elf_into_ram(shim_elf, ram)
+            let entry_gpa = load_elf_into_ram(shim_elf, ram)?;
+            Ok(LaunchSpec {
+                entry_gpa,
+                rsp: (ram_bytes as u64 - 0x1000) & !0xf,
+                rdi: GPA_BOOT_INFO,
+                rsi: 0,
+                trap_all_io: false,
+            })
+        })
+    }
+
+    /// Boots a REAL upstream Linux x86-64 kernel (`vmlinux` ELF or `bzImage`) + optional
+    /// `initramfs` inside a hardware-isolated Zircon hypervisor microVM!
+    pub fn run_linux_kernel(
+        hypervisor_resource: zx_handle_t,
+        vmex_resource: zx_handle_t,
+        kernel_bytes: &[u8],
+        initrd_bytes: Option<&[u8]>,
+        cmdline: &str,
+        config: MicroVmConfig,
+    ) -> Result<VmRunReport, String> {
+        let mut cfg = config;
+        if cfg.ram_bytes < 64 * 1024 * 1024 {
+            cfg.ram_bytes = 128 * 1024 * 1024;
+        }
+        if cfg.max_vm_exits < 500_000 {
+            cfg.max_vm_exits = 2_000_000;
+        }
+        let cmdline_eff = if cmdline.is_empty() {
+            "console=ttyS0 reboot=k panic=1 pci=off nomodules"
+        } else {
+            cmdline
+        };
+        run_microvm_inner(hypervisor_resource, vmex_resource, cfg, |ram, _| {
+            let entry_gpa = load_linux_kernel_into_ram(kernel_bytes, initrd_bytes, cmdline_eff, ram)?;
+            Ok(LaunchSpec {
+                entry_gpa,
+                rsp: 0x0000_6000,
+                rdi: 0,
+                rsi: linux_boot::GPA_ZERO_PAGE,
+                trap_all_io: true,
+            })
         })
     }
 
@@ -305,13 +646,20 @@ mod fuchsia_vmm {
         code: &[u8],
         config: MicroVmConfig,
     ) -> Result<VmRunReport, String> {
+        let ram_bytes = config.ram_bytes;
         run_microvm_inner(hypervisor_resource, vmex_resource, config, |ram, _| {
             let start = entry_gpa as usize;
             if start < 0x5000 || start + code.len() > ram.len() {
                 return Err("raw guest code out of guest RAM bounds".into());
             }
             ram[start..start + code.len()].copy_from_slice(code);
-            Ok(entry_gpa)
+            Ok(LaunchSpec {
+                entry_gpa,
+                rsp: (ram_bytes as u64 - 0x1000) & !0xf,
+                rdi: GPA_BOOT_INFO,
+                rsi: 0,
+                trap_all_io: false,
+            })
         })
     }
 
@@ -322,7 +670,7 @@ mod fuchsia_vmm {
         load_guest: F,
     ) -> Result<VmRunReport, String>
     where
-        F: FnOnce(&mut [u8], &mut GuestBootInfo) -> Result<u64, String>,
+        F: FnOnce(&mut [u8], &mut GuestBootInfo) -> Result<LaunchSpec, String>,
     {
         if hypervisor_resource == ZX_HANDLE_INVALID {
             return Err("hypervisor resource handle is invalid".into());
@@ -402,7 +750,7 @@ mod fuchsia_vmm {
             return Err(e);
         }
 
-        // 3. Populate 4-level identity page tables, GuestBootInfo, and guest ELF image.
+        // 3. Populate 4-level identity page tables, GuestBootInfo, and guest image.
         let load_res = {
             let ram_slice =
                 unsafe { core::slice::from_raw_parts_mut(host_ram_base as *mut u8, config.ram_bytes) };
@@ -420,19 +768,19 @@ mod fuchsia_vmm {
                     aux_bytes: 0,
                     virtio_con_gpa: GPA_VIRTIO_CON,
                 };
-                let entry = load_guest(ram_slice, &mut boot_info)?;
+                let spec = load_guest(ram_slice, &mut boot_info)?;
                 unsafe {
                     ptr::write_unaligned(
                         ram_slice.as_mut_ptr().add(GPA_BOOT_INFO as usize).cast::<GuestBootInfo>(),
                         boot_info,
                     );
                 }
-                Ok(entry)
+                Ok(spec)
             })
         };
 
-        let entry_gpa = match load_res {
-            Ok(e) => e,
+        let spec = match load_res {
+            Ok(s) => s,
             Err(err) => {
                 unsafe {
                     zx_vmar_unmap(host_root_vmar, host_ram_base, config.ram_bytes);
@@ -444,38 +792,54 @@ mod fuchsia_vmm {
             }
         };
 
-        // 4. Register hardware traps: COM1 I/O, Paravirt I/O, MMIO heartbeat, async MMIO bell.
+        // 4. Register hardware traps: I/O ports + MMIO heartbeat, async bell, virtio console.
         let mut bell_port = ZX_HANDLE_INVALID;
         let setup_traps = check(unsafe { zx_port_create(0, &mut bell_port) }, "zx_port_create")
             .and_then(|()| {
-                check(
-                    unsafe {
-                        zx_guest_set_trap(
-                            guest,
-                            ZX_GUEST_TRAP_IO,
-                            PORT_COM1_BASE as usize,
-                            PORT_COM1_LEN,
-                            ZX_HANDLE_INVALID,
-                            TRAP_KEY_COM1,
+                if spec.trap_all_io {
+                    check(
+                        unsafe {
+                            zx_guest_set_trap(
+                                guest,
+                                ZX_GUEST_TRAP_IO,
+                                0,
+                                0xFFFF,
+                                ZX_HANDLE_INVALID,
+                                TRAP_KEY_ALL_IO,
+                            )
+                        },
+                        "zx_guest_set_trap(ALL_IO)",
+                    )
+                } else {
+                    check(
+                        unsafe {
+                            zx_guest_set_trap(
+                                guest,
+                                ZX_GUEST_TRAP_IO,
+                                PORT_COM1_BASE as usize,
+                                PORT_COM1_LEN,
+                                ZX_HANDLE_INVALID,
+                                TRAP_KEY_COM1,
+                            )
+                        },
+                        "zx_guest_set_trap(COM1)",
+                    )
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_IO,
+                                    PORT_PV_BASE as usize,
+                                    PORT_PV_LEN,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_PV,
+                                )
+                            },
+                            "zx_guest_set_trap(PV)",
                         )
-                    },
-                    "zx_guest_set_trap(COM1)",
-                )
-            })
-            .and_then(|()| {
-                check(
-                    unsafe {
-                        zx_guest_set_trap(
-                            guest,
-                            ZX_GUEST_TRAP_IO,
-                            PORT_PV_BASE as usize,
-                            PORT_PV_LEN,
-                            ZX_HANDLE_INVALID,
-                            TRAP_KEY_PV,
-                        )
-                    },
-                    "zx_guest_set_trap(PV)",
-                )
+                    })
+                }
             })
             .and_then(|()| {
                 check(
@@ -537,19 +901,18 @@ mod fuchsia_vmm {
         }
 
         // 5. Run the VCPU on a dedicated thread (Zircon binds each VCPU to its creator thread).
-        let ram_bytes = config.ram_bytes;
         let max_exits = config.max_vm_exits;
         let vcpu_res = thread::spawn(move || -> Result<VmRunReport, String> {
             let mut vcpu = ZX_HANDLE_INVALID;
             check(
-                unsafe { zx_vcpu_create(guest, 0, entry_gpa as usize, &mut vcpu) },
+                unsafe { zx_vcpu_create(guest, 0, spec.entry_gpa as usize, &mut vcpu) },
                 "zx_vcpu_create",
             )?;
 
-            // Set initial 64-bit registers: RSP at top of guest RAM (16-byte aligned), RDI = GuestBootInfo.
             let initial_state = zx_vcpu_state_t {
-                rsp: (ram_bytes as u64 - 0x1000) & !0xf,
-                rdi: GPA_BOOT_INFO,
+                rsp: spec.rsp,
+                rdi: spec.rdi,
+                rsi: spec.rsi,
                 rflags: 0x2,
                 ..Default::default()
             };
@@ -570,17 +933,68 @@ mod fuchsia_vmm {
             }
 
             let mut stdout = Vec::new();
+            let mut uart = Uart16550::new();
+            let mut legacy = PcLegacyIo::new();
             let mut io_exits: u64 = 0;
             let mut mmio_exits: u64 = 0;
             let mut latched_mono: u64 = 0;
             let mut exit_code: Option<i32> = None;
 
+            // Watchdog for Linux kernel boots: kick VCPU after 12s if guest hangs in HLT/loop.
+            let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut watchdog = if spec.trap_all_io {
+                let done_c = std::sync::Arc::clone(&done_flag);
+                let mut vcpu_dup = ZX_HANDLE_INVALID;
+                let _ = unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut vcpu_dup) };
+                Some(thread::spawn(move || {
+                    for _ in 0..120 {
+                        if done_c.load(std::sync::atomic::Ordering::Relaxed) {
+                            unsafe { zx_handle_close(vcpu_dup) };
+                            return;
+                        }
+                        let next = unsafe { zx_clock_get_monotonic() }.saturating_add(100_000_000);
+                        unsafe { zx_nanosleep(next) };
+                    }
+                    if !done_c.load(std::sync::atomic::Ordering::Relaxed) {
+                        println!("[hirsel-vmm] watchdog kicking VCPU after 12s timeout");
+                        unsafe { zx_vcpu_kick(vcpu_dup) };
+                    }
+                    unsafe { zx_handle_close(vcpu_dup) };
+                }))
+            } else {
+                None
+            };
+
+            let mut loop_err: Option<String> = None;
             for _ in 0..max_exits {
                 let mut pkt = zx_port_packet_t::default();
                 let st = unsafe { zx_vcpu_enter(vcpu, &mut pkt) };
                 if st != ZX_OK {
-                    unsafe { zx_handle_close(vcpu) };
-                    return Err(format!("zx_vcpu_enter exited with zx_status={st}"));
+                    if spec.trap_all_io && st == ZX_ERR_BAD_STATE && !stdout.is_empty() {
+                        // Triple-fault / VMEXIT_SHUTDOWN during Linux reboot fallback.
+                        exit_code = Some(0);
+                        break;
+                    }
+                    let mut st_regs = zx_vcpu_state_t::default();
+                    let _ = unsafe {
+                        zx_vcpu_read_state(
+                            vcpu,
+                            ZX_VCPU_STATE,
+                            ptr::from_mut(&mut st_regs).cast(),
+                            size_of::<zx_vcpu_state_t>(),
+                        )
+                    };
+                    loop_err = Some(format!(
+                        "zx_vcpu_enter exited with zx_status={st} (io_exits={io_exits}, stdout_bytes={}, rsp={:#x}, rax={:#x}, rbx={:#x}, rcx={:#x}, rdx={:#x}, rflags={:#x})",
+                        stdout.len(),
+                        st_regs.rsp,
+                        st_regs.rax,
+                        st_regs.rbx,
+                        st_regs.rcx,
+                        st_regs.rdx,
+                        st_regs.rflags
+                    ));
+                    break;
                 }
 
                 match pkt.packet_type {
@@ -591,36 +1005,158 @@ mod fuchsia_vmm {
                         let mut reply: Option<zx_vcpu_io_t> = None;
 
                         match io.port {
-                            // COM1 16550 UART data register (TX)
-                            PORT_COM1_BASE => {
-                                if !is_in {
-                                    stdout.push(io.data[0]);
-                                } else {
+                            // COM1 16550A UART (0x3F8..0x400)
+                            PORT_COM1_BASE..=0x03FF => {
+                                let reg = io.port - PORT_COM1_BASE;
+                                if is_in {
+                                    let b = uart.read(reg);
                                     reply = Some(zx_vcpu_io_t {
                                         access_size: io.access_size,
                                         _pad: [0; 3],
-                                        data: [0; 4],
+                                        data: [b, 0, 0, 0],
                                     });
+                                } else {
+                                    uart.write(reg, io.data[0], &mut stdout);
                                 }
                             }
-                            // COM1 Line Status Register (0x3FD): THRE | TEMT always ready
-                            p if p == PORT_COM1_BASE + 5 => {
+                            // Dual 8259A PIC (Master 0x20/0x21, Slave 0xA0/0xA1)
+                            0x0020 => {
                                 if is_in {
                                     reply = Some(zx_vcpu_io_t {
                                         access_size: 1,
                                         _pad: [0; 3],
-                                        data: [0x60, 0, 0, 0],
+                                        data: [legacy.pic_master.read_cmd(), 0, 0, 0],
+                                    });
+                                } else {
+                                    legacy.pic_master.write_cmd(io.data[0]);
+                                }
+                            }
+                            0x0021 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.pic_master.read_data(), 0, 0, 0],
+                                    });
+                                } else {
+                                    legacy.pic_master.write_data(io.data[0]);
+                                }
+                            }
+                            0x00A0 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.pic_slave.read_cmd(), 0, 0, 0],
+                                    });
+                                } else {
+                                    legacy.pic_slave.write_cmd(io.data[0]);
+                                }
+                            }
+                            0x00A1 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.pic_slave.read_data(), 0, 0, 0],
+                                    });
+                                } else {
+                                    legacy.pic_slave.write_data(io.data[0]);
+                                }
+                            }
+                            // i8042 Keyboard Controller (0x60/0x64) -> `reboot=k` writes 0xFE to 0x64!
+                            0x0060 => {
+                                if is_in {
+                                    let v = if legacy.i8042_cmd == 0xAA { 0x55 } else { 0x00 };
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [v, 0, 0, 0],
                                     });
                                 }
                             }
-                            // Other COM1 control registers (IER, FCR, LCR, MCR, scratch)
-                            p if p > PORT_COM1_BASE && p < PORT_COM1_BASE + PORT_COM1_LEN as u16 => {
+                            0x0064 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [0x01, 0, 0, 0], // output buffer full
+                                    });
+                                } else {
+                                    legacy.i8042_cmd = io.data[0];
+                                    if io.data[0] == 0xFE {
+                                        // Clean Linux `reboot=k` microVM shutdown!
+                                        exit_code = Some(0);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Port 0x61 (NMI Status / PIT Ch2 gate): toggle bit 5 so calibration finishes!
+                            0x0061 => {
+                                if is_in {
+                                    legacy.port61 ^= 0x20;
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.port61, 0, 0, 0],
+                                    });
+                                } else {
+                                    legacy.port61 = (legacy.port61 & 0xF0) | (io.data[0] & 0x0F);
+                                }
+                            }
+                            // MC146818 CMOS/RTC (0x70/0x71)
+                            0x0070 => {
+                                if !is_in {
+                                    legacy.cmos_idx = io.data[0] & 0x7F;
+                                } else {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.cmos_idx, 0, 0, 0],
+                                    });
+                                }
+                            }
+                            0x0071 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [legacy.read_cmos(), 0, 0, 0],
+                                    });
+                                }
+                            }
+                            // Legacy 8254 PIT (0x40..0x43)
+                            0x0040..=0x0043 => {
+                                if is_in {
+                                    legacy.pit_tick = legacy.pit_tick.wrapping_sub(0x101);
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: 1,
+                                        _pad: [0; 3],
+                                        data: [(legacy.pit_tick & 0xFF) as u8, 0, 0, 0],
+                                    });
+                                }
+                            }
+                            // Minimal ACPI PM1a status/control stub (0x600..0x608)
+                            0x0600..=0x0607 => {
                                 if is_in {
                                     reply = Some(zx_vcpu_io_t {
                                         access_size: io.access_size,
                                         _pad: [0; 3],
                                         data: [0; 4],
                                     });
+                                }
+                            }
+                            // ICH/PIIX Reset Control Register (0xCF9): bit 2 = system reset.
+                            0x0CF9 => {
+                                if is_in {
+                                    reply = Some(zx_vcpu_io_t {
+                                        access_size: io.access_size,
+                                        _pad: [0; 3],
+                                        data: [0; 4],
+                                    });
+                                } else if (io.data[0] & 0x04) != 0 {
+                                    exit_code = Some(0);
+                                    break;
                                 }
                             }
                             // Paravirt clean VM exit
@@ -664,6 +1200,7 @@ mod fuchsia_vmm {
                                     });
                                 }
                             }
+                            // All other legacy ports (PIC 0x20/0xA0, PCI 0xCF8/0xCFC, COM2..4, etc.)
                             _ => {
                                 if is_in {
                                     reply = Some(zx_vcpu_io_t {
@@ -688,6 +1225,12 @@ mod fuchsia_vmm {
                                 "zx_vcpu_write_state(ZX_VCPU_IO)",
                             )?;
                         }
+                        // Deliver COM1 IRQ 4 via 8259A master PIC whenever UART THRE/RDA is pending.
+                        if spec.trap_all_io && uart.irq_pending() {
+                            if let Some(vec) = legacy.pic_master.try_deliver(4) {
+                                let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                            }
+                        }
                     }
                     ZX_PKT_TYPE_GUEST_MEM => {
                         mmio_exits += 1;
@@ -699,26 +1242,33 @@ mod fuchsia_vmm {
                             && mem.addr >= GPA_VIRTIO_CON
                             && mem.addr < GPA_VIRTIO_CON + PAGE_SIZE as u64;
                         if !in_hb && !in_con {
-                            unsafe { zx_handle_close(vcpu) };
-                            return Err(format!(
+                            loop_err = Some(format!(
                                 "unexpected GUEST_MEM trap addr={:#x} rip={:#x}",
                                 mem.addr, mem.rip
                             ));
+                            break;
                         }
                     }
                     other => {
-                        unsafe { zx_handle_close(vcpu) };
-                        return Err(format!("unhandled guest packet type={other}"));
+                        loop_err = Some(format!("unhandled guest packet type={other}"));
+                        break;
                     }
                 }
             }
 
+            done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(w) = watchdog.take() {
+                let _ = w.join();
+            }
             unsafe { zx_handle_close(vcpu) };
+
+            if let Some(err) = loop_err {
+                return Err(err);
+            }
 
             let code = exit_code
                 .ok_or_else(|| format!("guest exceeded max_vm_exits ({max_exits})"))?;
 
-            // Drain any async MMIO doorbell packets queued on `bell_port`.
             let mut bell_count: u64 = 0;
             loop {
                 let mut bpkt = zx_port_packet_t::default();
@@ -757,7 +1307,7 @@ mod fuchsia_vmm {
 }
 
 #[cfg(target_os = "fuchsia")]
-pub use fuchsia_vmm::{run_elf_microvm, run_linux_user_elf, run_raw_microvm};
+pub use fuchsia_vmm::{run_elf_microvm, run_linux_kernel, run_linux_user_elf, run_raw_microvm};
 
 #[cfg(test)]
 mod tests {
@@ -773,7 +1323,6 @@ mod tests {
         assert_eq!(pdpt_0, GPA_PD_LOW | 0x3);
         let pdpt_3 = u64::from_le_bytes(ram[0x1018..0x1020].try_into().unwrap());
         assert_eq!(pdpt_3, GPA_PD_HIGH | 0x3);
-        // Check 0xD000_0000 = 3 GiB + 256 MiB => PD_HIGH[128]
         let mmio_pde = u64::from_le_bytes(
             ram[GPA_PD_HIGH as usize + 128 * 8..GPA_PD_HIGH as usize + 129 * 8]
                 .try_into()

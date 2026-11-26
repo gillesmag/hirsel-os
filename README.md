@@ -5,7 +5,10 @@ A minimal, Talos-style, immutable, API-driven capability OS & hypervisor built d
 Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirsel-init`), which brings up Ring-3 `virtio-blk` and `virtio-net` (`smoltcp` TCP/IP) drivers, a mutually authenticated & ChaCha20-Poly1305 AEAD-encrypted control plane, and two hardware-enforced workload execution tiers:
 
 - **Tier 1 — Native Hirsel Processes in Hardened Zircon Jobs**: Compiles Hirsel programs natively for `x86_64-unknown-fuchsia`, streams them content-addressed by SHA-256, seals them into immutable executable VMOs (`vmex`), and executes them in ~2–3 ms inside policy-locked `zx::Job`s (`ZX_POL_VMAR_WX`, `ZX_POL_AMBIENT_MARK_VMO_EXEC`, and `ZX_POL_NEW_PROCESS` all `DENY`). Supports per-job `Args`, attenuated `Env`, wall-clock kill timeouts (`zx_task_kill`), and a Zircon-channel `Dir` capability backed by persistent `virtio-blk` storage (`HRSLFS01`).
-- **Tier 2 — Hardware-Isolated AMD SVM / Intel VMX MicroVMs**: Uses Zircon's kernel hypervisor (`zx_guest_create`, `zx_vcpu_create`, `zx_vcpu_enter`, `zx_guest_set_trap`) to run either freestanding 64-bit Ring-0 ELF guests or **unmodified Linux x86-64 static ELF binaries** in Ring 3 inside `bin/hirsel-linux-shim.elf` with zero-exit `SYSCALL`/`SYSRET` via AMD SVM MSRPM passthrough, Linux `boot_params`/E820 setup, and ~5.5 ms cold-to-exit runtime.
+- **Tier 2 — Hardware-Isolated AMD SVM / Intel VMX MicroVMs**: Uses Zircon's kernel hypervisor (`zx_guest_create`, `zx_vcpu_create`, `zx_vcpu_enter`, `zx_guest_set_trap`, `zx_vcpu_interrupt`) in three modes:
+  1. **Full Upstream Linux x86-64 MicroVMs (`--linux-kernel`)**: Boots unmodified upstream Linux x86-64 kernels (`vmlinux` ELF or `bzImage`) + `initramfs` all the way to real PID 1 (`/init`) with minimal ACPI 2.0 tables (`RSDP`/`XSDT`/`FADT`/`DSDT`/`MADT`), x2APIC MSR + `IA32_TSC_DEADLINE` timer virtualization, KVM `pvclock`, 16550A COM1 UART + dual 8259A PIC (IRQ 4), and clean `reboot=k` exit (~469 ms to PID 1 / ~630 ms total microVM runtime on cache hit).
+  2. **Unmodified Linux x86-64 Static ELFs in Ring 3 (`--linux-elf`)**: Runs static Linux binaries inside `bin/hirsel-linux-shim.elf` with zero-exit `SYSCALL`/`SYSRET` via AMD SVM MSRPM passthrough in ~5.5 ms cold-to-exit.
+  3. **Freestanding 64-bit Ring-0 ELF Guests**: Direct bare-metal Ring-0 microVMs with paravirt I/O, MMIO traps, and async doorbells.
 
 ---
 
@@ -41,7 +44,7 @@ Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirs
 | Crate | Purpose |
 |---|---|
 | [`crates/hirsel-init`](crates/hirsel-init) | Root Zircon process (`userboot.next=bin/hirsel-init`): BOOTFS loader, `fuchsia.ldsvc.Loader`, Tier 1 job runner, Tier 1 `Dir` Zircon-channel server (`caps.rs`), encrypted multi-transport control plane (`api.rs`). |
-| [`crates/hirsel-vmm`](crates/hirsel-vmm) | Tier 2 hardware microVM VMM on `zx_guest_*` / `zx_vcpu_*`, 4-level identity page tables, COM1 UART, paravirt clock/CSPRNG/exit ports, NPT MMIO/doorbell traps, Linux x86-64 `boot_params` / `bzImage` loader (`linux_boot.rs`), and Ring-3 Linux static ELF runner. |
+| [`crates/hirsel-vmm`](crates/hirsel-vmm) | Tier 2 hardware microVM VMM on `zx_guest_*` / `zx_vcpu_*`, 4-level identity page tables, full 16550A COM1 UART + 8259A PIC (IRQ 4), legacy PC I/O (i8042 `reboot=k`, CMOS/RTC, PIT), minimal ACPI 2.0 (`RSDP`/`XSDT`/`FADT`/`DSDT`/`MADT`), Linux x86-64 `boot_params` / `vmlinux` / `bzImage` loader (`linux_boot.rs`), and Ring-3 Linux static ELF runner. |
 | [`crates/hirsel-virtio`](crates/hirsel-virtio) | Ring-3 Virtio 1.0 Modern PCI drivers (`virtio-blk`, `virtio-net`), Zircon IOMMU/BTI contiguous DMA, GPR inline-asm MMIO, `HRSLBLK1` image store, `HRSLFS01` persistent file store, and `HRSLAB01` A/B ZBI upgrade slots. |
 | [`crates/hirsel-proto`](crates/hirsel-proto) | Zero-dependency binary RPC protocol (`HRSL`), IEEE CRC32, SHA-256, RFC 2104 HMAC-SHA256, HKDF-SHA256, and RFC 8439 ChaCha20-Poly1305 AEAD (`crypto.rs`). |
 | [`crates/hirsel-os-ctl`](crates/hirsel-os-ctl) | Operator CLI: `ping`, `info`, `images`, `run`, `run-bootfs`, `upgrade`, `upgrade-status`. Compiles Hirsel packages, deduplicates by SHA-256, and streams over authenticated AEAD sessions. |
@@ -56,10 +59,11 @@ Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirs
 - [`examples/guest-microvm`](examples/guest-microvm): Freestanding 64-bit Ring-0 Tier 2 MicroVM guest verifying CPUID hypervisor leaf, NPT RAM, MMIO traps, async doorbells, clock, and CSPRNG.
 - [`examples/linux-shim`](examples/linux-shim): 14 KiB Ring-0 -> Ring-3 Linux x86-64 compatibility shim (`bin/hirsel-linux-shim.elf`) setting up GDT/TSS/user page tables and zero-exit `SYSCALL`/`SYSRET`.
 - [`examples/linux-workload`](examples/linux-workload): Unmodified Linux x86-64 static ELF (`hello-linux`) using raw Linux `syscall`s (`uname`, `clock_gettime`, `getrandom`, `brk`, `write`, `exit_group`) that runs identically natively on Linux and inside Hirsel-OS Tier 2 AMD SVM Ring 3.
+- [`examples/linux-init`](examples/linux-init): Minimal static Linux x86-64 PID 1 (`/init`) packed into `out/linux/initramfs.cpio` (with `/dev/console` and `/dev/null`), booted by Firecracker's upstream **Linux 6.1.102** `vmlinux` inside Zircon AMD SVM.
 
 ## Upstreamable Patches
 
-- [`patches/zircon-amd-svm.patch`](patches/zircon-amd-svm.patch): Full AMD-V (SVM) + Nested Page Tables (NPT) hypervisor backend for Zircon (`zircon/kernel/arch/x86/hypervisor/`), including MSRPM passthrough and x86-64 MMIO instruction-length decoding for nested KVM (`ktest x86_hypervisor_guest` passes 3/3).
+- [`patches/zircon-amd-svm.patch`](patches/zircon-amd-svm.patch): Full AMD-V (SVM) + Nested Page Tables (NPT) hypervisor backend for Zircon (`zircon/kernel/arch/x86/hypervisor/`), including KVM `pvclock` MSRs & `KVM_HC_CLOCK_PAIRING`, x2APIC MSR + `IA32_TSC_DEADLINE` timer virtualization, `KVMKVMKVM` CPUID, MSRPM passthrough, and x86-64 MMIO instruction-length decoding for nested KVM (`ktest x86_hypervisor_guest` passes 3/3; boots upstream Linux 6.1.102 to PID 1).
 - [`patches/hirsel-fuchsia-target.patch`](patches/hirsel-fuchsia-target.patch): `x86_64-unknown-fuchsia` compiler target, runtime host provider (`host/fuchsia/`), and Zircon-channel `Dir` capability client (`zircon_dir.rs`) for Hirsel.
 
 ---
@@ -86,6 +90,9 @@ just ktest x86_hypervisor_guest
 # Tier 1 Args/Env/persistent Dir, Tier 2 unmodified Linux static ELF in Ring 3,
 # A/B ZBI upgrade staging, and cold reboot persistence verification)
 just test-all
+
+# Boot a REAL upstream Linux 6.1.102 x86-64 kernel + initramfs to PID 1 inside Zircon AMD SVM!
+just test-linux-vm
 ```
 
 ### 3. Boot Interactively & Operate with `hirsel-os-ctl`
@@ -111,6 +118,13 @@ just ctl run --tier 1 \
 just build-linux-workload
 just ctl run --tier 2 --linux-elf out/hello-linux
 
+# Boot a real upstream Linux 6.1.102 x86-64 kernel + initramfs inside Zircon AMD SVM
+just fetch-linux-kernel build-linux-initrd
+just ctl run --tier 2 --linux-kernel --ram-mib 128 \
+  --initrd out/linux/initramfs.cpio \
+  --cmdline "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet" \
+  out/linux/vmlinux.stripped
+
 # Stage an immutable A/B ZBI OS upgrade onto the inactive disk slot
 just ctl upgrade out/hirsel-os.zbi
 just ctl upgrade-status
@@ -122,10 +136,11 @@ just ctl upgrade-status
 
 | Metric | Observed |
 |---|---|
-| `out/hirsel-os.zbi` (Zircon + `hirsel-init` + Tier 1 & Tier 2 guests + Linux shim) | **4.5 MiB** |
+| `out/hirsel-os.zbi` (Zircon + `hirsel-init` + Tier 1 & Tier 2 guests + Linux shim) | **4.4 MiB** |
 | Zircon `ktest x86_hypervisor_guest` (AMD SVM + NPT) | **3/3 pass (20.7 ms)** |
 | Authenticated ChaCha20-Poly1305 AEAD `ping` RTT over `virtio-net` (`smoltcp`) | **~0.2–0.5 ms** |
 | Tier 1 native Hirsel Job cold-to-exit (policy-locked `zx::Job` + `Dir` RPC) | **~2.9–3.4 ms** |
 | Tier 2 unmodified Linux x86-64 static ELF cold-to-exit (AMD SVM Ring 3) | **~5.5 ms** |
+| Tier 2 **real upstream Linux 6.1.102** kernel + initramfs boot to PID 1 (cache hit, quiet) | **469 ms to PID 1 / 630 ms cold-to-exit** |
 | Cold reboot image hydration from `virtio-blk` (`HRSLBLK1`) | **~14 ms** |
-| 4.5 MiB A/B ZBI upgrade streaming + SHA-256 verification + `virtio-blk` write | **1.26 s** |
+| 4.4 MiB A/B ZBI upgrade streaming + SHA-256 verification + `virtio-blk` write | **1.26 s** |

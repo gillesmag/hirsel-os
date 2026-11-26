@@ -21,7 +21,7 @@ pub const FRAME_MAGIC: [u8; 4] = *b"HRSL";
 pub const PROTO_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 16;
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
-pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 48 * 1024;
 pub const FLAG_ENCRYPTED: u16 = 0x0001;
 
 // Request message types (0x01..0x7F)
@@ -68,6 +68,8 @@ pub enum Tier2Mode {
     RawElf = 0,
     /// Unmodified Linux x86-64 static ELF booted in Ring 3 inside `bin/hirsel-linux-shim.elf`.
     LinuxUserElf = 1,
+    /// Full upstream Linux x86-64 kernel (`vmlinux` ELF or `bzImage`) + optional `initramfs`.
+    LinuxKernel = 2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +114,8 @@ pub enum Request {
         ram_mib: u32,
         max_vm_exits: u64,
         mode: Tier2Mode,
+        cmdline: String,
+        initrd: Option<RunTarget>,
     },
     UpgradeStart {
         digest: [u8; 32],
@@ -501,11 +505,21 @@ impl Request {
                 ram_mib,
                 max_vm_exits,
                 mode,
+                cmdline,
+                initrd,
             } => {
                 put_target(&mut p, target);
                 p.extend_from_slice(&ram_mib.to_le_bytes());
                 p.extend_from_slice(&max_vm_exits.to_le_bytes());
                 p.push(*mode as u8);
+                put_string(&mut p, cmdline);
+                match initrd {
+                    Some(rd) => {
+                        p.push(1);
+                        put_target(&mut p, rd);
+                    }
+                    None => p.push(0),
+                }
                 REQ_RUN_TIER2
             }
             Request::UpgradeStart { digest, total_size } => {
@@ -576,13 +590,22 @@ impl Request {
                 let mode = match c.u8()? {
                     0 => Tier2Mode::RawElf,
                     1 => Tier2Mode::LinuxUserElf,
+                    2 => Tier2Mode::LinuxKernel,
                     other => return Err(format!("unknown Tier2Mode {other}")),
+                };
+                let cmdline = c.string()?;
+                let initrd = if c.u8()? != 0 {
+                    Some(c.target()?)
+                } else {
+                    None
                 };
                 Ok(Request::RunTier2 {
                     target,
                     ram_mib,
                     max_vm_exits,
                     mode,
+                    cmdline,
+                    initrd,
                 })
             }
             REQ_UPGRADE_START => Ok(Request::UpgradeStart {

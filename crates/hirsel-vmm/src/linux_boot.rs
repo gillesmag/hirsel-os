@@ -7,6 +7,11 @@ use core::mem::size_of;
 
 pub const GPA_ZERO_PAGE: u64 = 0x0000_7000;
 pub const GPA_CMDLINE: u64 = 0x0002_0000;
+pub const GPA_ACPI_RSDP: u64 = 0x000E_0000;
+pub const GPA_ACPI_XSDT: u64 = 0x000E_0040;
+pub const GPA_ACPI_FADT: u64 = 0x000E_0100;
+pub const GPA_ACPI_DSDT: u64 = 0x000E_0280;
+pub const GPA_ACPI_MADT: u64 = 0x000E_0300;
 pub const GPA_KERNEL_DEFAULT: u64 = 0x0100_0000; // 16 MiB standard 64-bit load address
 
 pub const BOOT_FLAG_MAGIC: u16 = 0xAA55;
@@ -38,6 +43,7 @@ pub struct BzImageInfo {
 
 /// Exact byte offsets inside the 4096-byte Linux `struct boot_params`.
 pub mod offsets {
+    pub const ACPI_RSDP_ADDR: usize = 0x070;
     pub const E820_ENTRIES: usize = 0x1e8;
     pub const SETUP_SECTS: usize = 0x1f1;
     pub const BOOT_FLAG: usize = 0x1fe;
@@ -145,6 +151,11 @@ pub fn install_linux_boot_params(
     // Bootloader identity & flags (LOADED_HIGH = bit 0, CAN_USE_HEAP = bit 7).
     ram[zp + offsets::TYPE_OF_LOADER] = LOADER_TYPE_UNDEFINED;
     ram[zp + offsets::LOADFLAGS] |= 0x81;
+    // Allow initrd anywhere in low 2 GiB when booting direct vmlinux ELF.
+    if bzimage_setup_hdr.is_none() {
+        ram[zp + offsets::INITRD_ADDR_MAX..zp + offsets::INITRD_ADDR_MAX + 4]
+            .copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+    }
 
     // Write NUL-terminated kernel command line.
     ram[cmd_gpa..cmd_gpa + cmdline.len()].copy_from_slice(cmdline.as_bytes());
@@ -197,6 +208,118 @@ pub fn install_linux_boot_params(
         ram[dst + 8..dst + 16].copy_from_slice(&size.to_le_bytes());
         ram[dst + 16..dst + 20].copy_from_slice(&ty.to_le_bytes());
     }
+    // Install minimal ACPI 2.0 tables (RSDP, XSDT, HW-reduced FADT, DSDT, 1-CPU MADT)
+    // in the reserved BIOS ROM region [0x000E_0000 .. 0x000E_1000) and point boot_params
+    // `acpi_rsdp_addr` directly at RSDP so Linux discovers CPU 0 Local APIC / x2APIC cleanly.
+    install_minimal_acpi(ram)?;
+    ram[zp + offsets::ACPI_RSDP_ADDR..zp + offsets::ACPI_RSDP_ADDR + 8]
+        .copy_from_slice(&GPA_ACPI_RSDP.to_le_bytes());
+
+    Ok(())
+}
+
+fn acpi_checksum(bytes: &[u8]) -> u8 {
+    let sum = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    0u8.wrapping_sub(sum)
+}
+
+fn write_acpi_header(buf: &mut [u8], sig: &[u8; 4], rev: u8) {
+    let len = buf.len() as u32;
+    buf[0..4].copy_from_slice(sig);
+    buf[4..8].copy_from_slice(&len.to_le_bytes());
+    buf[8] = rev;
+    buf[9] = 0; // checksum filled after body
+    buf[10..16].copy_from_slice(b"HIRSEL");
+    buf[16..24].copy_from_slice(b"HIRSELVM");
+    buf[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM revision
+    buf[28..32].copy_from_slice(b"HRSL"); // Creator ID
+    buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator revision
+}
+
+fn install_minimal_acpi(ram: &mut [u8]) -> Result<(), String> {
+    if ram.len() < 0x000F_0000 {
+        return Err("guest RAM too small for ACPI tables".into());
+    }
+    ram[GPA_ACPI_RSDP as usize..GPA_ACPI_RSDP as usize + 0x1000].fill(0);
+
+    // 1. DSDT (36-byte empty AML definition block)
+    {
+        let dsdt = &mut ram[GPA_ACPI_DSDT as usize..GPA_ACPI_DSDT as usize + 36];
+        write_acpi_header(dsdt, b"DSDT", 2);
+        dsdt[9] = acpi_checksum(dsdt);
+    }
+
+    // 2. FADT ("FACP", ACPI 6.x, 276 bytes, force physical x2APIC + i8042 reset + PM1a stub)
+    {
+        let fadt = &mut ram[GPA_ACPI_FADT as usize..GPA_ACPI_FADT as usize + 276];
+        write_acpi_header(fadt, b"FACP", 6);
+        fadt[40..44].copy_from_slice(&(GPA_ACPI_DSDT as u32).to_le_bytes()); // DSDT
+        fadt[46..48].copy_from_slice(&9u16.to_le_bytes()); // SCI_INT = 9
+        fadt[56..60].copy_from_slice(&0x0600u32.to_le_bytes()); // PM1a_EVT_BLK
+        fadt[64..68].copy_from_slice(&0x0604u32.to_le_bytes()); // PM1a_CNT_BLK
+        fadt[88] = 4; // PM1_EVT_LEN
+        fadt[89] = 2; // PM1_CNT_LEN
+        // Flags: RESET_REG_SUP (1<<10) | FORCE_APIC_PHYSICAL (1<<19)
+        // Leave HW_REDUCED_ACPI unset so Linux keeps the legacy 8259A PIC active for COM1 IRQ 4.
+        let flags: u32 = (1 << 10) | (1 << 19);
+        fadt[112..116].copy_from_slice(&flags.to_le_bytes());
+        // RESET_REG Generic Address Structure (offset 116, 12 bytes): System I/O 0x64, 8-bit
+        fadt[116] = 1; // Address Space ID: System I/O
+        fadt[117] = 8; // Register Bit Width
+        fadt[118] = 0; // Register Bit Offset
+        fadt[119] = 1; // Access Size: Byte
+        fadt[120..128].copy_from_slice(&0x0064u64.to_le_bytes());
+        fadt[128] = 0xFE; // RESET_VALUE
+        // X_DSDT (offset 140)
+        fadt[140..148].copy_from_slice(&GPA_ACPI_DSDT.to_le_bytes());
+        // X_PM1a_EVT_BLK (offset 148, 12-byte GAS): System I/O 0x600, 32-bit
+        fadt[148] = 1;
+        fadt[149] = 32;
+        fadt[151] = 2;
+        fadt[152..160].copy_from_slice(&0x0600u64.to_le_bytes());
+        // X_PM1a_CNT_BLK (offset 172, 12-byte GAS): System I/O 0x604, 16-bit
+        fadt[172] = 1;
+        fadt[173] = 16;
+        fadt[175] = 2;
+        fadt[176..184].copy_from_slice(&0x0604u64.to_le_bytes());
+        fadt[9] = acpi_checksum(fadt);
+    }
+
+    // 3. MADT ("APIC", 44-byte header + 8-byte Processor Local APIC entry for CPU 0)
+    {
+        let madt = &mut ram[GPA_ACPI_MADT as usize..GPA_ACPI_MADT as usize + 52];
+        write_acpi_header(madt, b"APIC", 4);
+        madt[36..40].copy_from_slice(&0xFEE0_0000u32.to_le_bytes()); // Local Interrupt Controller Address
+        madt[40..44].copy_from_slice(&1u32.to_le_bytes()); // Flags: PCAT_COMPAT (dual-8259 present)
+        // Entry 0: Processor Local APIC (Type=0, Len=8, ACPI UID=0, APIC ID=0, Flags=Enabled)
+        madt[44] = 0;
+        madt[45] = 8;
+        madt[46] = 0;
+        madt[47] = 0;
+        madt[48..52].copy_from_slice(&1u32.to_le_bytes());
+        madt[9] = acpi_checksum(madt);
+    }
+
+    // 4. XSDT (36-byte header + 2 * 8-byte pointers to FADT and MADT)
+    {
+        let xsdt = &mut ram[GPA_ACPI_XSDT as usize..GPA_ACPI_XSDT as usize + 52];
+        write_acpi_header(xsdt, b"XSDT", 1);
+        xsdt[36..44].copy_from_slice(&GPA_ACPI_FADT.to_le_bytes());
+        xsdt[44..52].copy_from_slice(&GPA_ACPI_MADT.to_le_bytes());
+        xsdt[9] = acpi_checksum(xsdt);
+    }
+
+    // 5. RSDP v2 (36 bytes at 0x000E_0000)
+    {
+        let rsdp = &mut ram[GPA_ACPI_RSDP as usize..GPA_ACPI_RSDP as usize + 36];
+        rsdp[0..8].copy_from_slice(b"RSD PTR ");
+        rsdp[9..15].copy_from_slice(b"HIRSEL");
+        rsdp[15] = 2; // ACPI 2.0+
+        rsdp[20..24].copy_from_slice(&36u32.to_le_bytes());
+        rsdp[24..32].copy_from_slice(&GPA_ACPI_XSDT.to_le_bytes());
+        rsdp[8] = acpi_checksum(&rsdp[0..20]);
+        rsdp[32] = acpi_checksum(&rsdp[0..36]);
+    }
     Ok(())
 }
 
@@ -231,6 +354,24 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rd_size as usize, b"mock-initramfs-cpio".len());
+        let rsdp_ptr = u64::from_le_bytes(
+            ram[zp + offsets::ACPI_RSDP_ADDR..zp + offsets::ACPI_RSDP_ADDR + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(rsdp_ptr, GPA_ACPI_RSDP);
+        // Verify every ACPI table checksum sums to 0 mod 256.
+        let sum = |addr: u64, len: usize| -> u8 {
+            ram[addr as usize..addr as usize + len]
+                .iter()
+                .fold(0u8, |a, &b| a.wrapping_add(b))
+        };
+        assert_eq!(sum(GPA_ACPI_RSDP, 20), 0);
+        assert_eq!(sum(GPA_ACPI_RSDP, 36), 0);
+        assert_eq!(sum(GPA_ACPI_XSDT, 52), 0);
+        assert_eq!(sum(GPA_ACPI_FADT, 276), 0);
+        assert_eq!(sum(GPA_ACPI_DSDT, 36), 0);
+        assert_eq!(sum(GPA_ACPI_MADT, 52), 0);
     }
 
     #[test]

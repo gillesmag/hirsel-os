@@ -488,8 +488,8 @@ fn serve_tcp_control_plane(
     let mut sockets = SocketSet::new(vec![]);
     let mut conns = Vec::with_capacity(TCP_POOL_SIZE);
     for _ in 0..TCP_POOL_SIZE {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 128 * 1024]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 128 * 1024]);
         let mut sock = tcp::Socket::new(rx_buf, tx_buf);
         sock.set_nagle_enabled(false);
         sock.set_ack_delay(None);
@@ -497,7 +497,7 @@ fn serve_tcp_control_plane(
         let handle = sockets.add(sock);
         conns.push(ConnSlot {
             handle,
-            rx_accum: Vec::with_capacity(32 * 1024),
+            rx_accum: Vec::with_capacity(64 * 1024),
             tx_queue: Vec::new(),
             tx_offset: 0,
             session: SessionState::new(),
@@ -770,7 +770,7 @@ fn handle_request(
             total_size,
             name,
         } => {
-            let max_size = 32 * 1024 * 1024u64;
+            let max_size = 64 * 1024 * 1024u64;
             if total_size == 0 || total_size > max_size {
                 return Response::Error {
                     message: format!("invalid image size {total_size}"),
@@ -1032,32 +1032,40 @@ fn handle_request(
             ram_mib,
             max_vm_exits,
             mode,
+            cmdline,
+            initrd,
         } => {
             let cfg = hirsel_vmm::MicroVmConfig {
                 ram_bytes: (ram_mib.max(2) as usize) * 1024 * 1024,
                 max_vm_exits: if max_vm_exits == 0 {
-                    200_000
+                    if mode == Tier2Mode::LinuxKernel {
+                        2_000_000
+                    } else {
+                        200_000
+                    }
                 } else {
                     max_vm_exits
                 },
             };
-            let payload_res = match target {
-                RunTarget::Bootfs(path) => ctx.read_bootfs_bytes(&path),
-                RunTarget::Digest(digest) => {
-                    let bytes = {
-                        let st = state.lock().unwrap();
-                        st.cache.get(&digest).map(|img| img.bytes.clone())
-                    };
-                    bytes.ok_or_else(|| {
-                        format!("image not in cache: sha256:{}", hex_encode(&digest))
-                    })
+            let resolve_bytes = |t: RunTarget| -> Result<Vec<u8>, String> {
+                match t {
+                    RunTarget::Bootfs(path) => ctx.read_bootfs_bytes(&path),
+                    RunTarget::Digest(digest) => {
+                        let bytes = {
+                            let st = state.lock().unwrap();
+                            st.cache.get(&digest).map(|img| img.bytes.clone())
+                        };
+                        bytes.ok_or_else(|| {
+                            format!("image not in cache: sha256:{}", hex_encode(&digest))
+                        })
+                    }
                 }
             };
-            let res = payload_res.and_then(|elf| match mode {
+            let res = resolve_bytes(target).and_then(|payload| match mode {
                 Tier2Mode::RawElf => hirsel_vmm::run_elf_microvm(
                     ctx.hypervisor_resource,
                     ctx.vmex_resource,
-                    &elf,
+                    &payload,
                     cfg,
                 ),
                 Tier2Mode::LinuxUserElf => {
@@ -1066,7 +1074,21 @@ fn handle_request(
                         ctx.hypervisor_resource,
                         ctx.vmex_resource,
                         &shim,
-                        &elf,
+                        &payload,
+                        cfg,
+                    )
+                }
+                Tier2Mode::LinuxKernel => {
+                    let rd_bytes = match initrd {
+                        Some(rd) => Some(resolve_bytes(rd)?),
+                        None => None,
+                    };
+                    hirsel_vmm::run_linux_kernel(
+                        ctx.hypervisor_resource,
+                        ctx.vmex_resource,
+                        &payload,
+                        rd_bytes.as_deref(),
+                        &cmdline,
                         cfg,
                     )
                 }
