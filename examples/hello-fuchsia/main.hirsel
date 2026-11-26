@@ -1,0 +1,59 @@
+// Minimal Hirsel program compiled for x86_64-unknown-fuchsia and executed
+// inside a policy-hardened Tier 1 Zircon Job by hirsel-init.
+
+fn os_name() -> String {
+    match target.os {
+        Fuchsia => "Zircon/Fuchsia",
+        Linux => "Linux",
+        Macos => "macOS",
+    }
+}
+
+fn arch_name() -> String {
+    match target.arch {
+        X86_64 => "x86_64",
+        Aarch64 => "aarch64",
+    }
+}
+
+pub fn main(out: Stdout, clock: Clock, rng: Random) -> Result[(), Exit] waits {
+    let t0 = host.mono_ns(clock)
+
+    let mut entropy: Bytes = list.with_capacity(8)
+    host.random(rng, mut entropy)
+    let rand_hex = std.hex.encode(entropy)
+
+    // Exercise pure Hirsel computation + stdlib formatting.
+    let mut sum: u64 = 0
+    for i in 1u64 .. 101 {
+        sum += i
+    }
+
+    let t1 = host.mono_ns(clock)
+
+    let mut line = string.new()
+    string.push(mut line, "hello from native Hirsel on ")
+    string.push(mut line, os_name())
+    string.push(mut line, " (")
+    string.push(mut line, arch_name())
+    string.push(mut line, ")!\n")
+
+    string.push(mut line, "  mono_ns:  t0=")
+    string.push_u64(mut line, t0)
+    string.push(mut line, " t1=")
+    string.push_u64(mut line, t1)
+    string.push(mut line, " delta=")
+    string.push_u64(mut line, t1 - t0)
+    string.push(mut line, " ns\n")
+
+    string.push(mut line, "  cprng:    0x")
+    string.push(mut line, rand_hex)
+    string.push(mut line, "\n")
+
+    string.push(mut line, "  sum(1..=100) = ")
+    string.push_u64(mut line, sum)
+    string.push(mut line, "\n")
+
+    let _ = stdout.write(out, line)
+    Ok(())
+}

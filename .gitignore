@@ -1,0 +1,17 @@
+# Build outputs
+/target/
+/out/
+*.zbi
+*.img
+*.bin
+*.log
+hirsel.lock
+.hirsel-core/
+
+# External Zircon / Fuchsia source tree (managed by scripts/bootstrap-zircon.sh)
+/third-party/
+
+# Editor / OS
+.DS_Store
+*.swp
+.direnv/

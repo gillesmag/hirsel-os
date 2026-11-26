@@ -1,0 +1,2591 @@
+diff --git a/zircon/kernel/arch/x86/hypervisor/BUILD.gn b/zircon/kernel/arch/x86/hypervisor/BUILD.gn
+index 6745558260b..0f85daad95f 100644
+--- a/zircon/kernel/arch/x86/hypervisor/BUILD.gn
++++ b/zircon/kernel/arch/x86/hypervisor/BUILD.gn
+@@ -7,7 +7,10 @@
+ import("//zircon/kernel/kernel_rust_mod.gni")
+ 
+ source_set("hypervisor") {
+-  sources = [ "vmx.S" ]
++  sources = [
++    "svm.S",
++    "vmx.S",
++  ]
+   deps = [
+     ":hypervisor-rs",
+     "//zircon/kernel/arch/x86:headers",
+@@ -20,7 +23,10 @@ kernel_rust_mod("hypervisor-rs") {
+     "invalidate.rs",
+     "mod.rs",
+     "pv.rs",
++    "svm_cpu_state.rs",
++    "svm_vmexit.rs",
+     "vcpu.rs",
++    "vmcb.rs",
+     "vmcs.rs",
+     "vmexit.rs",
+     "vmx_cpu_state.rs",
+diff --git a/zircon/kernel/arch/x86/hypervisor/guest.rs b/zircon/kernel/arch/x86/hypervisor/guest.rs
+index 16002cfba6f..e42f8ad5a07 100644
+--- a/zircon/kernel/arch/x86/hypervisor/guest.rs
++++ b/zircon/kernel/arch/x86/hypervisor/guest.rs
+@@ -15,8 +15,11 @@ use zx_status::Status;
+ use zx_types::{ZX_GUEST_TRAP_BELL, ZX_GUEST_TRAP_IO, ZX_GUEST_TRAP_MEM, zx_vaddr_t};
+ 
+ use super::invalidate::ept_pointer_from_pml4;
++use super::svm_cpu_state::{
++    SvmContiguousPages, alloc_svm_state, broadcast_svm_tlb_flush, free_svm_state, svm_ignore_msr,
++};
+ use super::vmx_cpu_state::{VmxInfo, VmxPage, alloc_vmx_state, broadcast_invept, free_vmx_state};
+-use crate::arch_rs::x86::feature::{X86_FEATURE_VMX, x86_feature_test};
++use crate::arch_rs::x86::feature::{X86_FEATURE_SVM, X86_FEATURE_VMX, x86_feature_test};
+ use crate::arch_rs::x86::registers::{
+     X86_MSR_IA32_EFER, X86_MSR_IA32_FMASK, X86_MSR_IA32_FS_BASE, X86_MSR_IA32_GS_BASE,
+     X86_MSR_IA32_KERNEL_GS_BASE, X86_MSR_IA32_LSTAR, X86_MSR_IA32_PAT, X86_MSR_IA32_STAR,
+@@ -77,8 +80,9 @@ unsafe fn ignore_msr(mut msr_bitmaps: *mut u8, msr: u32) {
+ 
+ /// Represents a guest within the hypervisor.
+ ///
+-/// Dropping a guest frees the VMX state (`free_vmx_state`) before dropping its fields. The fields
+-/// are independent of each other, so their drop order does not matter.
++/// Dropping a guest frees the VMX or SVM state (`free_vmx_state` / `free_svm_state`) before
++/// dropping its fields. The fields are independent of each other, so their drop order does not
++/// matter.
+ #[pin_data(PinnedDrop)]
+ #[derive(Recyclable)]
+ pub struct Guest {
+@@ -88,42 +92,62 @@ pub struct Guest {
+     #[pin]
+     vpid_allocator: VpidAllocator,
+     msr_bitmaps_page: VmxPage,
++    is_svm: bool,
++    svm_msrpm: SvmContiguousPages,
++    svm_iopm: SvmContiguousPages,
+ }
+ 
+ impl Guest {
+-    fn init(gpa: GuestPhysicalAspace) -> impl PinInit<Self, Status> {
++    fn init(gpa: GuestPhysicalAspace, is_svm: bool) -> impl PinInit<Self, Status> {
+         pin_init!(Self {
+             gpa,
+             traps <- TrapMap::new(),
+             vpid_allocator <- VpidAllocator::init(),
+             msr_bitmaps_page: VmxPage::default(),
++            is_svm,
++            svm_msrpm: SvmContiguousPages::default(),
++            svm_iopm: SvmContiguousPages::default(),
+         }? Status)
+     }
+ 
+     /// Creates a guest.
+     pub fn create() -> Result<Pin<UniquePtr<Guest>>, Status> {
+-        // Check that the CPU supports VMX.
+-        if !x86_feature_test(X86_FEATURE_VMX) {
++        // Prefer Intel VMX when available, otherwise fall back to AMD SVM.
++        let is_svm = if x86_feature_test(X86_FEATURE_VMX) {
++            false
++        } else if x86_feature_test(X86_FEATURE_SVM) {
++            true
++        } else {
+             return Err(Status::NOT_SUPPORTED);
+-        }
++        };
+ 
+         let gpa = GuestPhysicalAspace::create()?;
+ 
+-        // Invalidate the EPT across all CPUs.
+-        let eptp = ept_pointer_from_pml4(gpa.arch_aspace().arch_table_phys().0);
+-        broadcast_invept(eptp);
+-
+-        // SAFETY: `Guest::create` is only invoked from userspace syscalls or kernel unit tests
+-        // after `LK_INIT_LEVEL_KERNEL` initialization has completed, and CPU hotplug is not used
+-        // while guests exist (see TODO on `alloc_vmx_state`).
+-        unsafe { alloc_vmx_state() }?;
++        if is_svm {
++            broadcast_svm_tlb_flush();
++            // SAFETY: Matches `free_svm_state` in `PinnedDrop` (or error cleanup below).
++            unsafe { alloc_svm_state() }?;
++        } else {
++            // Invalidate the EPT across all CPUs.
++            let eptp = ept_pointer_from_pml4(gpa.arch_aspace().arch_table_phys().0);
++            broadcast_invept(eptp);
++
++            // SAFETY: `Guest::create` is only invoked from userspace syscalls or kernel unit tests
++            // after `LK_INIT_LEVEL_KERNEL` initialization has completed, and CPU hotplug is not
++            // used while guests exist (see TODO on `alloc_vmx_state`).
++            unsafe { alloc_vmx_state() }?;
++        }
+ 
+-        let guest = match kalloc::Box::try_pin_init(Self::init(gpa)) {
++        let guest = match kalloc::Box::try_pin_init(Self::init(gpa, is_svm)) {
+             Ok(guest) => guest,
+             Err(status) => {
+-                // SAFETY: Matches the `alloc_vmx_state` call above, and no VCPU has been created
+-                // for this guest.
+-                unsafe { free_vmx_state() };
++                // SAFETY: Matches the `alloc_svm_state`/`alloc_vmx_state` call above, and no VCPU
++                // has been created for this guest.
++                if is_svm {
++                    unsafe { free_svm_state() };
++                } else {
++                    unsafe { free_vmx_state() };
++                }
+                 return Err(status);
+             }
+         };
+@@ -137,32 +161,56 @@ impl Guest {
+         // above.
+         let mut guest = unsafe { Pin::new_unchecked(guest) };
+ 
+-        // Set up common MSR bitmaps.
+-        // SAFETY: `x86_feature_test` checked above that the boot CPU supports VMX, and all CPUs
+-        // have the same features, so the current CPU supports VMX too.
+-        let vmx_info = unsafe { VmxInfo::new() };
+         let this = guest.as_mut().project();
+-        this.msr_bitmaps_page.alloc(&vmx_info, u8::MAX)?;
+-        let msr_bitmaps = this.msr_bitmaps_page.virtual_address::<u8>();
+-
+-        // SAFETY: `msr_bitmaps` points to the 4KiB MSR bitmaps page allocated and initialized
+-        // above, which `guest` exclusively owns.
+-        unsafe {
+-            // These are saved/restored by VMCS controls.
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_CS);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_ESP);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_EIP);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_PAT);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_EFER);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_FS_BASE);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_GS_BASE);
+-
+-            // These are saved/restored manually.
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_STAR);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_LSTAR);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_FMASK);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_KERNEL_GS_BASE);
+-            ignore_msr(msr_bitmaps, X86_MSR_IA32_TSC_AUX);
++        if is_svm {
++            // AMD SVM: allocate 8 KiB MSRPM (2 contiguous pages) and 12 KiB IOPM (3 contiguous
++            // pages), both filled with 0xFF (intercept everything by default).
++            this.svm_msrpm.alloc(2, u8::MAX)?;
++            this.svm_iopm.alloc(3, u8::MAX)?;
++            let msrpm = this.svm_msrpm.virtual_address::<u8>();
++            // SAFETY: `msrpm` points to the exclusively owned 8 KiB SVM MSRPM.
++            unsafe {
++                // Saved/restored by VMCB + VMSAVE/VMLOAD.
++                svm_ignore_msr(msrpm, X86_MSR_IA32_SYSENTER_CS);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_SYSENTER_ESP);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_SYSENTER_EIP);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_PAT);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_EFER);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_FS_BASE);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_GS_BASE);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_STAR);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_LSTAR);
++                svm_ignore_msr(msrpm, 0xc000_0083); // CSTAR
++                svm_ignore_msr(msrpm, X86_MSR_IA32_FMASK);
++                svm_ignore_msr(msrpm, X86_MSR_IA32_KERNEL_GS_BASE);
++            }
++        } else {
++            // Set up common VMX MSR bitmaps.
++            // SAFETY: `x86_feature_test` checked above that the boot CPU supports VMX, and all CPUs
++            // have the same features, so the current CPU supports VMX too.
++            let vmx_info = unsafe { VmxInfo::new() };
++            this.msr_bitmaps_page.alloc(&vmx_info, u8::MAX)?;
++            let msr_bitmaps = this.msr_bitmaps_page.virtual_address::<u8>();
++
++            // SAFETY: `msr_bitmaps` points to the 4KiB MSR bitmaps page allocated and initialized
++            // above, which `guest` exclusively owns.
++            unsafe {
++                // These are saved/restored by VMCS controls.
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_CS);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_ESP);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_SYSENTER_EIP);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_PAT);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_EFER);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_FS_BASE);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_GS_BASE);
++
++                // These are saved/restored manually.
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_STAR);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_LSTAR);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_FMASK);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_KERNEL_GS_BASE);
++                ignore_msr(msr_bitmaps, X86_MSR_IA32_TSC_AUX);
++            }
+         }
+ 
+         Ok(guest)
+@@ -225,6 +273,21 @@ impl Guest {
+         self.msr_bitmaps_page.physical_address()
+     }
+ 
++    /// Returns whether this guest uses AMD SVM instead of Intel VMX.
++    pub fn is_svm(&self) -> bool {
++        self.is_svm
++    }
++
++    /// Returns the physical address of the 8 KiB AMD SVM MSR permission map.
++    pub fn svm_msrpm_address(&self) -> PAddr {
++        self.svm_msrpm.physical_address()
++    }
++
++    /// Returns the physical address of the 12 KiB AMD SVM I/O permission map.
++    pub fn svm_iopm_address(&self) -> PAddr {
++        self.svm_iopm.physical_address()
++    }
++
+     /// Allocates a VPID for a VCPU of the guest.
+     pub fn try_alloc_vpid(&self) -> Result<u16, Status> {
+         self.vpid_allocator.try_alloc()
+@@ -239,10 +302,13 @@ impl Guest {
+ #[pinned_drop]
+ impl PinnedDrop for Guest {
+     fn drop(self: Pin<&mut Self>) {
+-        // SAFETY: `Guest::create` called `alloc_vmx_state`, and `Vcpu::create`'s safety contract
+-        // requires every `Vcpu` (which `VMCLEAR`s its VMCS on drop) to be dropped before its
+-        // `Guest`.
+-        unsafe { free_vmx_state() };
++        // SAFETY: `Guest::create` called `alloc_svm_state` or `alloc_vmx_state`, and
++        // `Vcpu::create`'s safety contract requires every `Vcpu` to be dropped before its `Guest`.
++        if self.is_svm {
++            unsafe { free_svm_state() };
++        } else {
++            unsafe { free_vmx_state() };
++        }
+     }
+ }
+ 
+diff --git a/zircon/kernel/arch/x86/hypervisor/mod.rs b/zircon/kernel/arch/x86/hypervisor/mod.rs
+index a874410e7eb..4c403dc6d2b 100644
+--- a/zircon/kernel/arch/x86/hypervisor/mod.rs
++++ b/zircon/kernel/arch/x86/hypervisor/mod.rs
+@@ -9,7 +9,10 @@
+ pub mod guest;
+ pub mod invalidate;
+ pub mod pv;
++pub mod svm_cpu_state;
++pub mod svm_vmexit;
+ pub mod vcpu;
++pub mod vmcb;
+ pub mod vmcs;
+ pub mod vmexit;
+ pub mod vmx_cpu_state;
+diff --git a/zircon/kernel/arch/x86/hypervisor/svm.S b/zircon/kernel/arch/x86/hypervisor/svm.S
+new file mode 100644
+index 00000000000..cf547ac2922
+--- /dev/null
++++ b/zircon/kernel/arch/x86/hypervisor/svm.S
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Hirsel-OS Authors
++//
++// Use of this source code is governed by a MIT-style
++// license that can be found in the LICENSE file or at
++// https://opensource.org/licenses/MIT
++
++#include <asm.h>
++
++#include <arch/x86/hypervisor/vmx_state.h>
++#include <zircon/errors.h>
++
++.text
++
++/* zx_status_t svm_enter_asm(VmxState* state, zx_paddr_t guest_vmcb_pa, zx_paddr_t host_vmcb_pa)
++ *   %rdi = state (GuestState GPRs)
++ *   %rsi = guest_vmcb_pa (physical address of guest VMCB)
++ *   %rdx = host_vmcb_pa  (physical address of per-CPU host VMSAVE/VMLOAD page)
++ */
++FUNCTION(svm_enter_asm)
++    // Save callee-saved host registers and RFLAGS on the host stack.
++    push %rbx
++    push %rbp
++    push %r12
++    push %r13
++    push %r14
++    push %r15
++    pushf
++
++    // Save arguments on the host stack so they survive VMRUN (hardware saves/restores
++    // host %rsp automatically via VM_HSAVE_PA).
++    //   16(%rsp) = state
++    //    8(%rsp) = guest_vmcb_pa
++    //    0(%rsp) = host_vmcb_pa
++    push %rdi
++    push %rsi
++    push %rdx
++
++    // Clear Global Interrupt Flag around VMSAVE / VMLOAD / VMRUN / VMSAVE / VMLOAD.
++    // Under V_INTR_MASKING=1 (AMD64 APM Vol 2 §15.21.1), physical INTR delivery inside
++    // VMRUN is gated by host RFLAGS.IF, so we set IF=1 while GIF=0 (safe: GIF=0 blocks
++    // host interrupts until VMRUN implicitly sets GIF=1) and clear IF=0 again before STGI.
++    clgi
++    sti
++
++    // Save host FS/GS/TR/LDTR/KERNEL_GS_BASE/STAR/LSTAR/CSTAR/SFMASK/SYSENTER.
++    mov 0(%rsp), %rax
++    vmsave %rax
++
++    // Load guest FS/GS/TR/LDTR/KERNEL_GS_BASE/STAR/LSTAR/CSTAR/SFMASK/SYSENTER.
++    mov 8(%rsp), %rax
++    vmload %rax
++
++    // Load guest GPRs from VmxState.guest_state (RAX comes from VMCB.save.rax).
++    mov 16(%rsp), %rax
++    mov GS_RCX(%rax), %rcx
++    mov GS_RDX(%rax), %rdx
++    mov GS_RBX(%rax), %rbx
++    mov GS_RBP(%rax), %rbp
++    mov GS_RSI(%rax), %rsi
++    mov GS_RDI(%rax), %rdi
++    mov GS_R8(%rax), %r8
++    mov GS_R9(%rax), %r9
++    mov GS_R10(%rax), %r10
++    mov GS_R11(%rax), %r11
++    mov GS_R12(%rax), %r12
++    mov GS_R13(%rax), %r13
++    mov GS_R14(%rax), %r14
++    mov GS_R15(%rax), %r15
++
++    // %rax = guest_vmcb_pa; enter guest!
++    mov 8(%rsp), %rax
++    vmrun %rax
++
++    // On #VMEXIT, hardware has already restored host RIP, RSP, RFLAGS, CR0/3/4,
++    // EFER, CS/SS/DS/ES, GDTR, IDTR, and saved guest RAX into VMCB.save.rax.
++    // Save guest GPRs back to VmxState.guest_state (using %rax as base pointer).
++    mov 16(%rsp), %rax
++    mov %rcx, GS_RCX(%rax)
++    mov %rdx, GS_RDX(%rax)
++    mov %rbx, GS_RBX(%rax)
++    mov %rbp, GS_RBP(%rax)
++    mov %rsi, GS_RSI(%rax)
++    mov %rdi, GS_RDI(%rax)
++    mov %r8, GS_R8(%rax)
++    mov %r9, GS_R9(%rax)
++    mov %r10, GS_R10(%rax)
++    mov %r11, GS_R11(%rax)
++    mov %r12, GS_R12(%rax)
++    mov %r13, GS_R13(%rax)
++    mov %r14, GS_R14(%rax)
++    mov %r15, GS_R15(%rax)
++
++    // Save guest extra state and restore host FS/GS/TR/LDTR/SYSCALL MSRs.
++    mov 8(%rsp), %rax
++    vmsave %rax
++    mov 0(%rsp), %rax
++    vmload %rax
++
++    // Clear host RFLAGS.IF before re-enabling GIF so caller's interrupts-disabled
++    // invariant holds until svm_vmexit_handler explicitly services pending INTRs.
++    cli
++    stgi
++
++    // Zero guest-controlled GPRs (Spectre hygiene, matching vmx.S).
++    xor %ebx, %ebx
++    xor %ecx, %ecx
++    xor %edx, %edx
++    xor %esi, %esi
++    xor %edi, %edi
++    xor %r8, %r8
++    xor %r9, %r9
++    xor %r10, %r10
++    xor %r11, %r11
++    xor %r12, %r12
++    xor %r13, %r13
++    xor %r14, %r14
++    xor %r15, %r15
++
++    // Return ZX_OK.
++    xor %eax, %eax
++
++    // Pop saved arguments and callee-saved host registers.
++    add $24, %rsp
++    popf
++    pop %r15
++    pop %r14
++    pop %r13
++    pop %r12
++    pop %rbp
++    pop %rbx
++    ret
++END_FUNCTION(svm_enter_asm)
+diff --git a/zircon/kernel/arch/x86/hypervisor/svm_cpu_state.rs b/zircon/kernel/arch/x86/hypervisor/svm_cpu_state.rs
+new file mode 100644
+index 00000000000..3452c0a43aa
+--- /dev/null
++++ b/zircon/kernel/arch/x86/hypervisor/svm_cpu_state.rs
+@@ -0,0 +1,329 @@
++// Copyright 2026 The Hirsel-OS Authors
++//
++// Use of this source code is governed by a MIT-style
++// license that can be found in the LICENSE file or at
++// https://opensource.org/licenses/MIT
++
++//! Per-CPU AMD SVM state: enabling SVM (`EFER.SVME` + `VM_HSAVE_PA`) on every
++//! CPU while any SVM guest exists, plus host `VMSAVE`/`VMLOAD` pages and
++//! contiguous bitmap pages (IOPM / MSRPM).
++
++use core::arch::x86_64::__cpuid;
++use core::pin::Pin;
++use core::ptr;
++use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use debug::dprintf;
++use ksync::{KCell, KMutex};
++use lazy_init::{LazyInit, NoCheck};
++use pin_init::{pin_init, stack_pin_init};
++use zx_status::Status;
++
++use crate::arch_rs::max_num_cpus;
++use crate::arch_rs::x86::feature::{X86_FEATURE_SVM, x86_feature_test};
++use crate::arch_rs::x86::registers::{
++    X86_EFER_SVME, X86_MSR_AMD_VM_CR, X86_MSR_AMD_VM_HSAVE_PA, X86_MSR_IA32_EFER,
++};
++use crate::arch_rs::x86::x86::{read_msr, write_msr};
++use crate::hypervisor::cpu::percpu_exec;
++use crate::hypervisor::page::Page;
++use crate::kernel::mp::{self, MpIpiTarget, cpu_num_t, sync_exec};
++use crate::kernel::types::PAddr;
++use crate::ksync_kernel::TrackedMutex;
++use crate::vm::page::VmPageDoublyLinkedList;
++use crate::vm::{physmap, pmm};
++
++/// `VM_CR.SVMDIS` (bit 4): when set, SVM is disabled by BIOS/firmware.
++const VM_CR_SVMDIS: u64 = 1 << 4;
++
++/// SVM capability summary read from `CPUID 0x8000_000A`.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SvmInfo {
++    pub revision: u8,
++    pub nasid: u32,
++    pub npt: bool,
++    pub nrips: bool,
++    pub flush_by_asid: bool,
++    pub decode_assists: bool,
++}
++
++impl SvmInfo {
++    /// Reads SVM capabilities from `CPUID 0x8000_000A`.
++    ///
++    /// # Safety
++    ///
++    /// The current CPU must support SVM (`X86_FEATURE_SVM`).
++    pub unsafe fn new() -> Self {
++        let leaf = __cpuid(0x8000_000a);
++        Self {
++            revision: (leaf.eax & 0xff) as u8,
++            nasid: leaf.ebx,
++            npt: (leaf.edx & (1 << 0)) != 0,
++            nrips: (leaf.edx & (1 << 3)) != 0,
++            flush_by_asid: (leaf.edx & (1 << 6)) != 0,
++            decode_assists: (leaf.edx & (1 << 7)) != 0,
++        }
++    }
++}
++
++/// Contiguous wired physical pages for SVM IOPM (3 pages = 12 KiB) or MSRPM (2 pages = 8 KiB).
++pub struct SvmContiguousPages {
++    pa: PAddr,
++    count: usize,
++}
++
++// SAFETY: `SvmContiguousPages` uniquely owns its contiguous physical pages.
++unsafe impl Send for SvmContiguousPages {}
++// SAFETY: Shared references only inspect `pa` and `count`.
++unsafe impl Sync for SvmContiguousPages {}
++
++impl Default for SvmContiguousPages {
++    fn default() -> Self {
++        Self { pa: PAddr(0), count: 0 }
++    }
++}
++
++impl SvmContiguousPages {
++    pub fn alloc(&mut self, count: usize, fill: u8) -> Result<(), Status> {
++        assert_eq!(self.pa.0, 0);
++        stack_pin_init!(let list = VmPageDoublyLinkedList::new());
++        let pa = pmm::alloc_contiguous(count, 0, page::SHIFT as u8, list.as_mut())?;
++        assert!(pa.0 != 0);
++
++        // Detach each page from the temporary list (pages remain tracked by `self.pa` / `self.count`).
++        while list.as_mut().pop_front().is_some() {}
++
++        self.pa = pa;
++        self.count = count;
++        // SAFETY: The `count * page::SIZE` bytes starting at `pa` are mapped in the physmap
++        // and exclusively owned by `self`.
++        unsafe {
++            ptr::write_bytes(self.virtual_address::<u8>(), fill, count * page::SIZE);
++        }
++        Ok(())
++    }
++
++    #[inline]
++    pub fn physical_address(&self) -> PAddr {
++        self.pa
++    }
++
++    #[inline]
++    pub fn virtual_address<T>(&self) -> *mut T {
++        debug_assert!(self.pa.0 != 0);
++        physmap::paddr_to_physmap_mut(self.pa)
++    }
++
++    #[inline]
++    pub fn is_allocated(&self) -> bool {
++        self.pa.0 != 0
++    }
++}
++
++impl Drop for SvmContiguousPages {
++    fn drop(&mut self) {
++        if self.pa.0 != 0 {
++            for i in 0..self.count {
++                let pa = PAddr(self.pa.0 + i * page::SIZE);
++                if let Some(page_ptr) = pmm::paddr_to_vm_page(pa) {
++                    // SAFETY: We exclusively own every page in `[self.pa, self.pa + count * SIZE)`.
++                    unsafe { pmm::free_page(page_ptr) };
++                }
++            }
++            self.pa = PAddr(0);
++            self.count = 0;
++        }
++    }
++}
++
++/// Clears the 2-bit read+write intercept bits for `msr` in an 8 KiB SVM MSRPM.
++///
++/// AMD64 APM Vol 2, §15.11:
++/// - `0x0000_0000..=0x0000_1FFF` -> byte offset `0x0000..0x0800`
++/// - `0xC000_0000..=0xC000_1FFF` -> byte offset `0x0800..0x1000`
++/// - `0xC001_0000..=0xC001_1FFF` -> byte offset `0x1000..0x1800`
++///
++/// Two bits per MSR: bit `2*n` = RDMSR intercept, bit `2*n + 1` = WRMSR intercept.
++///
++/// # Safety
++///
++/// `msrpm` must point to an exclusively owned 8 KiB SVM MSRPM allocation.
++pub unsafe fn svm_ignore_msr(msrpm: *mut u8, msr: u32) {
++    let (base_off, idx) = if msr <= 0x0000_1fff {
++        (0x0000usize, msr as usize)
++    } else if (0xc000_0000..=0xc000_1fff).contains(&msr) {
++        (0x0800usize, (msr - 0xc000_0000) as usize)
++    } else if (0xc001_0000..=0xc001_1fff).contains(&msr) {
++        (0x1000usize, (msr - 0xc001_0000) as usize)
++    } else {
++        return;
++    };
++    let byte_off = base_off + (idx / 4);
++    let bit_shift = (idx % 4) * 2;
++    // SAFETY: `byte_off < 0x1800 < 0x2000` and `msrpm` is 8 KiB.
++    unsafe {
++        *msrpm.add(byte_off) &= !(0b11u8 << bit_shift);
++    }
++}
++
++struct PerCpuSvmPages {
++    hsave: fbl::Array<Page>,
++    host_vmcb: fbl::Array<Page>,
++}
++
++// SAFETY: `PerCpuSvmPages` uniquely owns its `Page`s, which are `Send + Sync`.
++unsafe impl Send for PerCpuSvmPages {}
++unsafe impl Sync for PerCpuSvmPages {}
++
++#[ksync::guarded]
++struct SvmGlobalState {
++    #[mutex]
++    lock: KMutex<TrackedMutex>,
++    #[guarded_by(lock)]
++    pages: PerCpuSvmPages,
++}
++
++static SVM_GLOBAL_STATE: LazyInit<SvmGlobalState, NoCheck> = LazyInit::uninit();
++static NUM_SVM_GUESTS: AtomicUsize = AtomicUsize::new(0);
++static SVM_TLB_GEN: AtomicU64 = AtomicU64::new(1);
++
++// Host VMCB physical addresses indexed by CPU number, published while `NUM_SVM_GUESTS > 0`.
++static HOST_VMCB_PAS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
++
++fn init_svm_cpu_state(_level: init::LkInitLevel) {
++    // SAFETY: Runs once on the boot CPU before any guest can be created.
++    unsafe {
++        let Ok(()) = Pin::static_ref(&SVM_GLOBAL_STATE).init_pin(pin_init!(SvmGlobalState {
++            lock <- KMutex::init(),
++            pages: KCell::new(PerCpuSvmPages {
++                hsave: fbl::Array::new(),
++                host_vmcb: fbl::Array::new(),
++            }),
++        }));
++    }
++}
++
++init::lk_init_hook!(x86_svm_cpu_state, init_svm_cpu_state, init::LK_INIT_LEVEL_KERNEL);
++
++/// Enables SVM on the current CPU (`EFER.SVME` + `MSR_VM_HSAVE_PA`).
++unsafe fn svm_on_task(hsave_pages: &fbl::Array<Page>, cpu_num: cpu_num_t) -> Result<(), Status> {
++    let info = unsafe { SvmInfo::new() };
++    if !info.npt || info.nasid < 2 {
++        dprintf!(
++            CRITICAL,
++            "hypervisor: AMD SVM missing NPT ({}) or ASIDs ({})\n",
++            info.npt,
++            info.nasid
++        );
++        return Err(Status::NOT_SUPPORTED);
++    }
++
++    let vm_cr = unsafe { read_msr(X86_MSR_AMD_VM_CR) };
++    if (vm_cr & VM_CR_SVMDIS) != 0 {
++        dprintf!(CRITICAL, "hypervisor: AMD SVM disabled by VM_CR.SVMDIS\n");
++        return Err(Status::NOT_SUPPORTED);
++    }
++
++    let efer = unsafe { read_msr(X86_MSR_IA32_EFER) };
++    unsafe {
++        write_msr(X86_MSR_IA32_EFER, efer | X86_EFER_SVME);
++        write_msr(X86_MSR_AMD_VM_HSAVE_PA, hsave_pages[cpu_num as usize].physical_address().0 as u64);
++    }
++    Ok(())
++}
++
++/// Disables SVM on the current CPU.
++unsafe fn svm_off_task() {
++    unsafe {
++        write_msr(X86_MSR_AMD_VM_HSAVE_PA, 0);
++        let efer = read_msr(X86_MSR_IA32_EFER);
++        write_msr(X86_MSR_IA32_EFER, efer & !X86_EFER_SVME);
++    }
++}
++
++/// Enables AMD SVM on every online CPU if this is the first SVM guest.
++///
++/// # Safety
++///
++/// Same lifecycle invariants as `alloc_vmx_state`: called after `LK_INIT_LEVEL_KERNEL`
++/// and balanced with `free_svm_state`.
++pub unsafe fn alloc_svm_state() -> Result<(), Status> {
++    ksync::lock!(let mut guard = unsafe { SVM_GLOBAL_STATE.get_unchecked() }.lock_lock());
++    if NUM_SVM_GUESTS.load(Ordering::SeqCst) == 0 {
++        if !x86_feature_test(X86_FEATURE_SVM) {
++            return Err(Status::NOT_SUPPORTED);
++        }
++        let num_cpus = max_num_cpus() as usize;
++        if num_cpus > HOST_VMCB_PAS.len() {
++            return Err(Status::NOT_SUPPORTED);
++        }
++
++        let mut hsave = fbl::Array::<Page>::try_new(num_cpus).map_err(|_| Status::NO_MEMORY)?;
++        let mut host_vmcb = fbl::Array::<Page>::try_new(num_cpus).map_err(|_| Status::NO_MEMORY)?;
++        for p in hsave.iter_mut() {
++            p.alloc(0)?;
++        }
++        for (i, p) in host_vmcb.iter_mut().enumerate() {
++            p.alloc(0)?;
++            HOST_VMCB_PAS[i].store(p.physical_address().0 as u64, Ordering::Release);
++        }
++
++        let cpu_mask = percpu_exec(|cpu_num| unsafe { svm_on_task(&hsave, cpu_num) });
++        if cpu_mask != mp::get_online_mask() {
++            unsafe { sync_exec(MpIpiTarget::Mask, cpu_mask, || svm_off_task()) };
++            for slot in &HOST_VMCB_PAS[..num_cpus] {
++                slot.store(0, Ordering::Release);
++            }
++            return Err(Status::NOT_SUPPORTED);
++        }
++
++        *guard.as_mut().pages_mut() = PerCpuSvmPages { hsave, host_vmcb };
++    }
++    let prev = NUM_SVM_GUESTS.fetch_add(1, Ordering::SeqCst);
++    assert!(prev != usize::MAX);
++    Ok(())
++}
++
++/// Disables AMD SVM on every CPU if this is the last SVM guest.
++///
++/// # Safety
++///
++/// Must match a prior successful `alloc_svm_state` after all SVM VCPUs have been dropped.
++pub unsafe fn free_svm_state() {
++    ksync::lock!(let mut guard = unsafe { SVM_GLOBAL_STATE.get_unchecked() }.lock_lock());
++    let prev = NUM_SVM_GUESTS.fetch_sub(1, Ordering::SeqCst);
++    debug_assert!(prev != 0);
++    if prev == 1 {
++        unsafe { sync_exec(MpIpiTarget::All, 0, || svm_off_task()) };
++        for slot in &HOST_VMCB_PAS {
++            slot.store(0, Ordering::Release);
++        }
++        *guard.as_mut().pages_mut() =
++            PerCpuSvmPages { hsave: fbl::Array::new(), host_vmcb: fbl::Array::new() };
++    }
++}
++
++/// Returns the host `VMSAVE`/`VMLOAD` page physical address for `cpu_num`.
++#[inline]
++pub fn host_vmcb_paddr(cpu_num: cpu_num_t) -> PAddr {
++    let pa = HOST_VMCB_PAS[cpu_num as usize].load(Ordering::Acquire) as usize;
++    debug_assert!(pa != 0);
++    PAddr(pa)
++}
++
++/// Returns the current global SVM NPT TLB invalidation generation.
++#[inline]
++pub fn svm_tlb_gen() -> u64 {
++    SVM_TLB_GEN.load(Ordering::Acquire)
++}
++
++/// Broadcasts an NPT TLB flush to all CPUs by bumping the SVM TLB generation and
++/// issuing a synchronous IPI (so any currently running guest exits and reloads
++/// `tlb_control = FLUSH_ALL` before resuming).
++pub fn broadcast_svm_tlb_flush() {
++    SVM_TLB_GEN.fetch_add(1, Ordering::SeqCst);
++    if NUM_SVM_GUESTS.load(Ordering::SeqCst) != 0 {
++        // SAFETY: `MpIpiTarget::All` forces any CPU currently in a guest to take
++        // `VMEXIT_INTR`, re-check `svm_tlb_gen()`, and flush its NPT TLB on re-entry.
++        unsafe { sync_exec(MpIpiTarget::All, 0, || {}) };
++    }
++}
+diff --git a/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
+new file mode 100644
+index 00000000000..b1f20de1a87
+--- /dev/null
++++ b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
+@@ -0,0 +1,714 @@
++// Copyright 2026 The Hirsel-OS Authors
++//
++// Use of this source code is governed by a MIT-style
++// license that can be found in the LICENSE file or at
++// https://opensource.org/licenses/MIT
++
++//! AMD SVM VM-exit handling and interrupt/guard helpers.
++
++use core::arch::asm;
++use core::mem::size_of;
++use core::sync::atomic::Ordering;
++use debug::dprintf;
++use zx_status::Status;
++use zx_types::{
++    ZX_GUEST_TRAP_BELL, ZX_GUEST_TRAP_IO, ZX_GUEST_TRAP_MEM, ZX_TIME_INFINITE, zx_gpaddr_t,
++    zx_packet_guest_bell_t, zx_packet_guest_io_t, zx_packet_guest_mem_t, zx_packet_type_t,
++    zx_port_packet_t, zx_vaddr_t,
++};
++
++use super::pv::PvClockState;
++use super::vcpu::LocalApicState;
++use super::vmcb::{
++    EVENT_INJ_EV, EVENT_INJ_TYPE_EXCEPTION, EVENT_INJ_TYPE_INTR, EVENT_INJ_TYPE_NMI,
++    EVENT_INJ_VALID, INTERCEPT_VINTR, V_INTR_IGN_TPR, V_INTR_IRQ, VMEXIT_CPUID, VMEXIT_HLT,
++    VMEXIT_INTR, VMEXIT_INVALID, VMEXIT_INVD, VMEXIT_IOIO, VMEXIT_MSR, VMEXIT_NMI, VMEXIT_NPF,
++    VMEXIT_SHUTDOWN, VMEXIT_VINTR, VMEXIT_VMMCALL, VMEXIT_XSETBV, Vmcb,
++};
++use super::vmx_state::GuestState;
++use crate::arch_rs::x86::feature::{
++    CpuidLeaf, MAX_SUPPORTED_CPUID, MAX_SUPPORTED_CPUID_EXT, X86_FEATURE_HYPERVISOR,
++    X86_FEATURE_SVM, X86_FEATURE_VMX, X86CpuidBit, X86CpuidLeafNum, get_cpuid_subleaf,
++};
++use crate::arch_rs::x86::interrupts::{
++    X86_INT_ALIGNMENT_CHECK, X86_INT_DOUBLE_FAULT, X86_INT_GP_FAULT, X86_INT_INVALID_TSS,
++    X86_INT_NMI, X86_INT_PAGE_FAULT, X86_INT_PLATFORM_BASE, X86_INT_SEGMENT_NOT_PRESENT,
++    X86_INT_STACK_FAULT, X86_INT_VIRT, X86InterruptVector,
++};
++use crate::arch_rs::x86::registers::{
++    X86_CR0_PG, X86_EFER_LMA, X86_FLAGS_IF, X86_MSR_IA32_APIC_BASE, X86_MSR_IA32_MISC_ENABLE,
++    X86_XSAVE_STATE_BIT_AVX, X86_XSAVE_STATE_BIT_SSE, X86_XSAVE_STATE_BIT_X87,
++};
++use crate::arch_rs::{
++    InterruptSavedState, arch_interrupt_restore, arch_interrupt_save, ints_disabled,
++    set_blocking_disallowed,
++};
++use crate::hypervisor::aspace::GuestPhysicalAspace;
++use crate::hypervisor::trap_map::TrapMap;
++use crate::kernel::auto_preempt_disabler::AutoPreemptDisabler;
++use crate::kernel::percpu::PerCpu;
++
++/// Guard holding preemption and interrupts disabled around one SVM VCPU entry/exit cycle.
++pub struct AutoSvmGuard {
++    valid: bool,
++    int_state: InterruptSavedState,
++    preempt: Option<AutoPreemptDisabler>,
++}
++
++impl AutoSvmGuard {
++    /// Disables preemption and interrupts for SVM entry.
++    pub fn new() -> Self {
++        let preempt = AutoPreemptDisabler::new();
++        let int_state = arch_interrupt_save();
++        set_blocking_disallowed(true);
++        Self { valid: true, int_state, preempt: Some(preempt) }
++    }
++
++    /// Re-enables interrupts and preemption early (e.g., before blocking on a page fault or HLT).
++    pub fn invalidate(&mut self) {
++        if self.valid {
++            self.valid = false;
++            set_blocking_disallowed(false);
++            arch_interrupt_restore(self.int_state);
++            self.preempt = None;
++        }
++    }
++
++    /// Temporarily opens a single-instruction interrupt window (`sti; nop; cli`) while
++    /// keeping preemption disabled so any pending external LAPIC interrupt is dispatched
++    /// and EOI'd before `AutoPreemptDisabler` flushes preemption.
++    pub fn service_pending_external_interrupt(&self) {
++        debug_assert!(self.valid);
++        debug_assert!(ints_disabled());
++        // Zircon's IDT interrupt entry checks `!blocking_disallowed()` to detect recursive
++        // interrupt handlers (mirroring `vmexit.rs::handle_external_interrupt`).
++        set_blocking_disallowed(false);
++        // SAFETY: Preemption is disabled via `self.preempt`; briefly enabling interrupts
++        // delivers the pending external interrupt through the kernel IDT and returns with
++        // interrupts disabled again.
++        unsafe {
++            asm!("sti", "nop", "nop", "cli", options(nomem, nostack));
++        }
++        set_blocking_disallowed(true);
++    }
++}
++
++impl Drop for AutoSvmGuard {
++    fn drop(&mut self) {
++        self.invalidate();
++    }
++}
++
++fn feature_mask(bit: X86CpuidBit) -> u32 {
++    1u32 << bit.bit
++}
++
++fn set_packet<T: Copy>(packet: &mut zx_port_packet_t, value: T) {
++    const { assert!(size_of::<T>() <= size_of::<[u8; 32]>()) };
++    // SAFETY: `T` is `Copy` and fits within `packet.union` (32 bytes).
++    unsafe {
++        core::ptr::copy_nonoverlapping(
++            core::ptr::from_ref(&value).cast::<u8>(),
++            packet.union.as_mut_ptr(),
++            size_of::<T>(),
++        );
++    }
++}
++
++fn advance_rip(vmcb: &mut Vmcb, fallback_len: u64) {
++    if vmcb.control.next_rip > vmcb.save.rip {
++        vmcb.save.rip = vmcb.control.next_rip;
++    } else {
++        vmcb.save.rip = vmcb.save.rip.wrapping_add(fallback_len);
++    }
++}
++
++fn exception_has_error_code(vector: u32) -> bool {
++    matches!(
++        vector as u8,
++        v if v == X86_INT_DOUBLE_FAULT.0
++            || v == X86_INT_INVALID_TSS.0
++            || v == X86_INT_SEGMENT_NOT_PRESENT.0
++            || v == X86_INT_STACK_FAULT.0
++            || v == X86_INT_GP_FAULT.0
++            || v == X86_INT_PAGE_FAULT.0
++            || v == X86_INT_ALIGNMENT_CHECK.0
++    )
++}
++
++fn svm_issue_event(vmcb: &mut Vmcb, vector: u32) {
++    let mut inj = u64::from(vector & 0xff) | EVENT_INJ_VALID;
++    if vector == X86_INT_NMI.0 as u32 {
++        inj |= EVENT_INJ_TYPE_NMI;
++    } else if vector <= X86_INT_VIRT.0 as u32 {
++        inj |= EVENT_INJ_TYPE_EXCEPTION;
++        if exception_has_error_code(vector) {
++            inj |= EVENT_INJ_EV;
++        }
++    } else {
++        inj |= EVENT_INJ_TYPE_INTR;
++    }
++    vmcb.control.event_inj = inj;
++}
++
++/// Injects a pending virtual interrupt or exception into `vmcb`, arming `INTERCEPT_VINTR`
++/// if guest interrupts are currently masked.
++pub fn svm_local_apic_maybe_interrupt(
++    vmcb: &mut Vmcb,
++    local_apic_state: &LocalApicState,
++) -> Result<(), Status> {
++    const NMI: u32 = X86_INT_NMI.0 as u32;
++    const VIRT: u32 = X86_INT_VIRT.0 as u32;
++    const PLATFORM_BASE: u32 = X86_INT_PLATFORM_BASE.0 as u32;
++
++    let vector = if local_apic_state.interrupt_tracker.try_pop(NMI) {
++        NMI
++    } else {
++        let Some(popped) = local_apic_state.interrupt_tracker.pop() else {
++            return Ok(());
++        };
++        debug_assert!(popped != X86InterruptVector::COUNT as u32);
++        popped
++    };
++
++    let interrupt_shadow = (vmcb.control.interrupt_shadow & 1) != 0;
++    let can_inject_ext = (vmcb.save.rflags & X86_FLAGS_IF) != 0 && !interrupt_shadow;
++    let can_inject_nmi = !interrupt_shadow;
++
++    if vector > VIRT && vector < PLATFORM_BASE {
++        return Err(Status::NOT_SUPPORTED);
++    } else if (vector >= PLATFORM_BASE && !can_inject_ext) || (vector == NMI && !can_inject_nmi) {
++        let result = local_apic_state.interrupt_tracker.track(vector);
++        if result.is_ok() {
++            // Request an exit as soon as guest opens an interrupt window.
++            vmcb.control.intercept_misc1 |= INTERCEPT_VINTR;
++            vmcb.control.v_intr_ctrl |= V_INTR_IRQ | V_INTR_IGN_TPR;
++        }
++        return result;
++    }
++
++    svm_issue_event(vmcb, vector);
++    local_apic_state.interrupt_tracker.clear(0, NMI);
++    local_apic_state.interrupt_tracker.clear(NMI + 1, VIRT + 1);
++    Ok(())
++}
++
++fn default_operand_size(vmcb: &Vmcb) -> u8 {
++    // 64-bit mode (`EFER.LMA=1` and `CS.L=1`) or 32-bit mode (`CS.D=1`) default to 4-byte operands.
++    let is_64 = (vmcb.save.efer & X86_EFER_LMA) != 0 && (vmcb.save.cs.attrib & (1 << 9)) != 0;
++    let is_32 = (vmcb.save.cs.attrib & (1 << 10)) != 0;
++    if is_64 || is_32 { 4 } else { 2 }
++}
++
++fn decode_x86_mmio_inst_len(bytes: &[u8], is_64: bool) -> u8 {
++    let mut i = 0usize;
++    let mut op_override = false;
++    let mut addr_override = false;
++
++    while i < bytes.len() {
++        match bytes[i] {
++            0x66 => op_override = true,
++            0x67 => addr_override = true,
++            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0xF0 | 0xF2 | 0xF3 => {}
++            _ => break,
++        }
++        i += 1;
++    }
++
++    let mut rex_w = false;
++    if is_64 && i < bytes.len() && (bytes[i] & 0xF0) == 0x40 {
++        rex_w = (bytes[i] & 0x08) != 0;
++        i += 1;
++    }
++
++    if i >= bytes.len() {
++        return 0;
++    }
++    let op = bytes[i];
++    i += 1;
++
++    let mut two_byte = false;
++    let mut op2 = 0u8;
++    if op == 0x0F {
++        if i >= bytes.len() {
++            return 0;
++        }
++        two_byte = true;
++        op2 = bytes[i];
++        i += 1;
++    } else if (0xA0..=0xA3).contains(&op) {
++        let moffs_len = if addr_override || !is_64 { 4 } else { 8 };
++        let total = i + moffs_len;
++        return if total <= 15 && total <= bytes.len() { total as u8 } else { 0 };
++    }
++
++    if i >= bytes.len() {
++        return 0;
++    }
++    let modrm = bytes[i];
++    i += 1;
++
++    let mod_bits = modrm >> 6;
++    let reg = (modrm >> 3) & 7;
++    let rm = modrm & 7;
++
++    if mod_bits != 3 {
++        if rm == 4 {
++            if i >= bytes.len() {
++                return 0;
++            }
++            let sib = bytes[i];
++            i += 1;
++            let base = sib & 7;
++            if mod_bits == 0 && base == 5 {
++                i += 4;
++            }
++        } else if mod_bits == 0 && rm == 5 {
++            i += 4;
++        }
++        if mod_bits == 1 {
++            i += 1;
++        } else if mod_bits == 2 {
++            i += 4;
++        }
++    }
++
++    let imm_len = if two_byte {
++        if op2 == 0xBA { 1 } else { 0 }
++    } else {
++        match op {
++            0xC6 | 0x80 | 0x82 | 0x83 | 0xC0 | 0xC1 | 0x6B => 1,
++            0xC7 | 0x81 | 0x69 => {
++                if op_override && !rex_w {
++                    2
++                } else {
++                    4
++                }
++            }
++            0xF6 if reg <= 1 => 1,
++            0xF7 if reg <= 1 => {
++                if op_override && !rex_w {
++                    2
++                } else {
++                    4
++                }
++            }
++            _ => 0,
++        }
++    };
++
++    i += imm_len;
++    if i <= 15 && i <= bytes.len() { i as u8 } else { 0 }
++}
++
++fn read_guest_u64(gpa: &GuestPhysicalAspace, paddr: zx_gpaddr_t) -> Option<u64> {
++    let ptr = gpa.create_guest_ptr(paddr, size_of::<u64>()).ok()?;
++    let raw = ptr.as_ptr::<u64>();
++    if raw.is_null() {
++        return None;
++    }
++    // SAFETY: `GuestPtr` pins and maps the 8-byte range in kernel memory until dropped.
++    Some(unsafe { core::ptr::read_unaligned(raw) })
++}
++
++fn guest_vaddr_to_gpa(
++    gpa: &GuestPhysicalAspace,
++    cr0: u64,
++    cr3: u64,
++    efer: u64,
++    vaddr: u64,
++) -> Option<zx_gpaddr_t> {
++    if (cr0 & X86_CR0_PG) == 0 {
++        return Some(vaddr as zx_gpaddr_t);
++    }
++    if (efer & X86_EFER_LMA) == 0 {
++        return None;
++    }
++    const PTE_PRESENT: u64 = 1 << 0;
++    const PTE_PS: u64 = 1 << 7;
++    const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
++
++    let pml4_idx = ((vaddr >> 39) & 0x1ff) * 8;
++    let pml4e = read_guest_u64(gpa, ((cr3 & ADDR_MASK) + pml4_idx) as zx_gpaddr_t)?;
++    if (pml4e & PTE_PRESENT) == 0 {
++        return None;
++    }
++    let pdpt_idx = ((vaddr >> 30) & 0x1ff) * 8;
++    let pdpte = read_guest_u64(gpa, ((pml4e & ADDR_MASK) + pdpt_idx) as zx_gpaddr_t)?;
++    if (pdpte & PTE_PRESENT) == 0 {
++        return None;
++    }
++    if (pdpte & PTE_PS) != 0 {
++        let base = pdpte & 0x000f_ffff_c000_0000;
++        return Some((base | (vaddr & 0x3fff_ffff)) as zx_gpaddr_t);
++    }
++    let pd_idx = ((vaddr >> 21) & 0x1ff) * 8;
++    let pde = read_guest_u64(gpa, ((pdpte & ADDR_MASK) + pd_idx) as zx_gpaddr_t)?;
++    if (pde & PTE_PRESENT) == 0 {
++        return None;
++    }
++    if (pde & PTE_PS) != 0 {
++        let base = pde & 0x000f_ffff_ffe0_0000;
++        return Some((base | (vaddr & 0x1f_ffff)) as zx_gpaddr_t);
++    }
++    let pt_idx = ((vaddr >> 12) & 0x1ff) * 8;
++    let pte = read_guest_u64(gpa, ((pde & ADDR_MASK) + pt_idx) as zx_gpaddr_t)?;
++    if (pte & PTE_PRESENT) == 0 {
++        return None;
++    }
++    Some(((pte & ADDR_MASK) | (vaddr & 0xfff)) as zx_gpaddr_t)
++}
++
++fn read_guest_inst_len(
++    guard: &mut AutoSvmGuard,
++    vmcb: &Vmcb,
++    gpa: &GuestPhysicalAspace,
++) -> u8 {
++    let is_64 = (vmcb.save.efer & X86_EFER_LMA) != 0 && (vmcb.save.cs.attrib & (1 << 9)) != 0;
++    if vmcb.control.next_rip > vmcb.save.rip {
++        let delta = vmcb.control.next_rip - vmcb.save.rip;
++        if delta <= 15 {
++            return delta as u8;
++        }
++    }
++    let fetched = usize::from(vmcb.control.guest_inst_len).min(15);
++    if fetched > 0 {
++        let decoded = decode_x86_mmio_inst_len(&vmcb.control.guest_inst_bytes[..fetched], is_64);
++        if decoded > 0 {
++            return decoded;
++        }
++    }
++    // Fallback: walk guest page tables and read instruction bytes directly from guest RAM.
++    guard.invalidate();
++    let mut buf = [0u8; 15];
++    let mut count = 0usize;
++    let rip = vmcb.save.rip;
++    while count < buf.len() {
++        let va = rip.wrapping_add(count as u64);
++        let Some(paddr) = guest_vaddr_to_gpa(gpa, vmcb.save.cr0, vmcb.save.cr3, vmcb.save.efer, va)
++        else {
++            break;
++        };
++        let page_rem = 4096usize - (paddr & 0xfff);
++        let chunk = (buf.len() - count).min(page_rem);
++        let Ok(ptr) = gpa.create_guest_ptr(paddr, chunk) else {
++            break;
++        };
++        let raw = ptr.as_ptr::<u8>();
++        if raw.is_null() {
++            break;
++        }
++        // SAFETY: `GuestPtr` pins and maps `chunk` bytes in kernel memory until dropped.
++        unsafe {
++            core::ptr::copy_nonoverlapping(raw, buf.as_mut_ptr().add(count), chunk);
++        }
++        count += chunk;
++    }
++    if count > 0 {
++        decode_x86_mmio_inst_len(&buf[..count], is_64)
++    } else {
++        0
++    }
++}
++
++fn handle_npf(
++    guard: &mut AutoSvmGuard,
++    vmcb: &mut Vmcb,
++    gpa: &GuestPhysicalAspace,
++    traps: &TrapMap,
++    packet: &mut zx_port_packet_t,
++) -> Result<(), Status> {
++    let guest_paddr = vmcb.control.exit_info_2 as zx_gpaddr_t;
++    let is_write = (vmcb.control.exit_info_1 & (1 << 1)) != 0;
++    let is_read = !is_write;
++
++    if let Ok(trap) = traps.find_trap(ZX_GUEST_TRAP_BELL, guest_paddr) {
++        let rip = vmcb.save.rip as zx_vaddr_t;
++        let inst_len = read_guest_inst_len(guard, vmcb, gpa);
++        if inst_len > 0 {
++            vmcb.save.rip = vmcb.save.rip.wrapping_add(u64::from(inst_len));
++        }
++
++        return match trap.kind() {
++            ZX_GUEST_TRAP_BELL => {
++                if is_read {
++                    return Err(Status::NOT_SUPPORTED);
++                }
++                *packet = zx_port_packet_t::default();
++                packet.key = trap.key();
++                packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_BELL;
++                set_packet(packet, zx_packet_guest_bell_t { addr: guest_paddr });
++                if !trap.has_port() {
++                    return Err(Status::BAD_STATE);
++                }
++                guard.invalidate();
++                trap.queue(packet, None)
++            }
++            ZX_GUEST_TRAP_MEM => {
++                *packet = zx_port_packet_t::default();
++                packet.key = trap.key();
++                packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_MEM;
++                set_packet(
++                    packet,
++                    zx_packet_guest_mem_t {
++                        addr: guest_paddr,
++                        cr3: vmcb.save.cr3 as zx_gpaddr_t,
++                        rip,
++                        instruction_size: inst_len,
++                        default_operand_size: default_operand_size(vmcb),
++                    },
++                );
++                Err(Status::NEXT)
++            }
++            _ => Err(Status::BAD_STATE),
++        };
++    }
++
++    // Ordinary NPT demand page fault: release interrupt/preempt guard before blocking.
++    guard.invalidate();
++    if guest_paddr >= gpa.size() {
++        return Err(Status::OUT_OF_RANGE);
++    }
++    let result = gpa.page_fault(guest_paddr);
++    if result.is_err() {
++        dprintf!(
++            CRITICAL,
++            "hypervisor(svm): Unhandled NPF gpa={:#x} info1={:#x} rip={:#x}\n",
++            guest_paddr,
++            vmcb.control.exit_info_1,
++            vmcb.save.rip
++        );
++    }
++    result
++}
++
++fn handle_ioio(
++    vmcb: &mut Vmcb,
++    guest_state: &mut GuestState,
++    traps: &TrapMap,
++    packet: &mut zx_port_packet_t,
++) -> Result<(), Status> {
++    let info1 = vmcb.control.exit_info_1;
++    let is_in = (info1 & (1 << 0)) != 0;
++    let is_str = (info1 & (1 << 2)) != 0;
++    let is_rep = (info1 & (1 << 3)) != 0;
++    if is_str || is_rep {
++        return Err(Status::NOT_SUPPORTED);
++    }
++    let access_size: u8 = if (info1 & (1 << 4)) != 0 {
++        1
++    } else if (info1 & (1 << 5)) != 0 {
++        2
++    } else if (info1 & (1 << 6)) != 0 {
++        4
++    } else {
++        return Err(Status::NOT_SUPPORTED);
++    };
++    let port = ((info1 >> 16) & 0xffff) as u16;
++
++    // For IOIO exits, AMD hardware stores the sequential next RIP in EXITINFO2.
++    vmcb.save.rip = vmcb.control.exit_info_2;
++
++    let trap = traps.find_trap(ZX_GUEST_TRAP_IO, usize::from(port))?;
++    *packet = zx_port_packet_t::default();
++    packet.key = trap.key();
++    packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_IO;
++
++    let mut io = zx_packet_guest_io_t {
++        port,
++        access_size,
++        input: is_in,
++        data: [0; 4],
++    };
++    if !is_in {
++        let bytes = guest_state.rax.to_ne_bytes();
++        io.data[..usize::from(access_size)].copy_from_slice(&bytes[..usize::from(access_size)]);
++    }
++    set_packet(packet, io);
++    Err(Status::NEXT)
++}
++
++fn handle_cpuid(vmcb: &mut Vmcb, guest_state: &mut GuestState) -> Result<(), Status> {
++    let leaf = guest_state.eax();
++    let subleaf = guest_state.ecx();
++    advance_rip(vmcb, 2);
++
++    // Mask hypervisor/nested-virt features and expose standard hypervisor leaf.
++    let res = if leaf == 0x4000_0000 {
++        CpuidLeaf {
++            a: 0x4000_0001,
++            b: u32::from_le_bytes(*b"KVMK"),
++            c: u32::from_le_bytes(*b"VMKV"),
++            d: u32::from_le_bytes(*b"M\0\0\0"),
++        }
++    } else if leaf == 0x4000_0001 {
++        CpuidLeaf { a: 0, b: 0, c: 0, d: 0 }
++    } else if leaf <= MAX_SUPPORTED_CPUID || (0x8000_0000..=MAX_SUPPORTED_CPUID_EXT).contains(&leaf)
++    {
++        // SAFETY: `leaf` is a valid standard or extended CPUID leaf.
++        let raw = core::arch::x86_64::__cpuid_count(leaf, subleaf);
++        CpuidLeaf { a: raw.eax, b: raw.ebx, c: raw.ecx, d: raw.edx }
++    } else {
++        CpuidLeaf { a: 0, b: 0, c: 0, d: 0 }
++    };
++
++    let mut eax = res.a;
++    let ebx = res.b;
++    let mut ecx = res.c;
++    let edx = res.d;
++
++    if leaf == X86CpuidLeafNum::ModelFeatures as u32 {
++        ecx &= !feature_mask(X86_FEATURE_VMX);
++        ecx |= feature_mask(X86_FEATURE_HYPERVISOR);
++    } else if leaf == X86CpuidLeafNum::ExtModelFeatures as u32 {
++        ecx &= !feature_mask(X86_FEATURE_SVM);
++    } else if leaf == X86CpuidLeafNum::ExtBase as u32 {
++        eax = eax.min(MAX_SUPPORTED_CPUID_EXT);
++    }
++
++    let _ = get_cpuid_subleaf; // keep import clean if extended later
++    guest_state.rax = u64::from(eax);
++    guest_state.rbx = u64::from(ebx);
++    guest_state.rcx = u64::from(ecx);
++    guest_state.rdx = u64::from(edx);
++    Ok(())
++}
++
++fn handle_msr(vmcb: &mut Vmcb, guest_state: &mut GuestState) -> Result<(), Status> {
++    let is_write = vmcb.control.exit_info_1 != 0;
++    let msr = guest_state.ecx();
++    advance_rip(vmcb, 2);
++
++    if !is_write {
++        match msr {
++            X86_MSR_IA32_APIC_BASE => {
++                // Report xAPIC enabled + BSP at standard 0xFEE0_0000.
++                guest_state.set_edx_eax(0xfee0_0900);
++                Ok(())
++            }
++            X86_MSR_IA32_MISC_ENABLE => {
++                guest_state.set_edx_eax(0);
++                Ok(())
++            }
++            _ => {
++                svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++                Ok(())
++            }
++        }
++    } else {
++        match msr {
++            X86_MSR_IA32_APIC_BASE | X86_MSR_IA32_MISC_ENABLE => Ok(()),
++            _ => {
++                svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++                Ok(())
++            }
++        }
++    }
++}
++
++fn handle_xsetbv(vmcb: &mut Vmcb, guest_state: &mut GuestState) -> Result<(), Status> {
++    let xcr = guest_state.ecx();
++    let val = guest_state.edx_eax();
++    let allowed = X86_XSAVE_STATE_BIT_X87 | X86_XSAVE_STATE_BIT_SSE | X86_XSAVE_STATE_BIT_AVX;
++    if xcr != 0 || (val & X86_XSAVE_STATE_BIT_X87) == 0 || (val & !allowed) != 0 {
++        svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
++        return Ok(());
++    }
++    guest_state.xcr0 = val;
++    advance_rip(vmcb, 3);
++    Ok(())
++}
++
++/// Dispatches an AMD SVM VM exit.
++#[allow(clippy::too_many_arguments)]
++pub fn svm_vmexit_handler(
++    guard: &mut AutoSvmGuard,
++    vmcb: &mut Vmcb,
++    guest_state: &mut GuestState,
++    local_apic_state: &LocalApicState,
++    _pv_clock_state: &mut PvClockState,
++    gpa: &GuestPhysicalAspace,
++    traps: &TrapMap,
++    packet: &mut zx_port_packet_t,
++) -> Result<(), Status> {
++    // Sync guest RAX from VMCB save area into `guest_state`.
++    guest_state.rax = vmcb.save.rax;
++    guest_state.cr2 = vmcb.save.cr2;
++
++    let result = match vmcb.control.exit_code {
++        VMEXIT_INTR => {
++            PerCpu::get_current().gstats.arch.interrupts.fetch_add(1, Ordering::Relaxed);
++            // Service pending host interrupt and EOI while preemption is still disabled.
++            guard.service_pending_external_interrupt();
++            Ok(())
++        }
++        VMEXIT_NMI => Ok(()),
++        VMEXIT_VINTR => {
++            vmcb.control.intercept_misc1 &= !INTERCEPT_VINTR;
++            vmcb.control.v_intr_ctrl &= !V_INTR_IRQ;
++            Ok(())
++        }
++        VMEXIT_NPF => {
++            PerCpu::get_current().gstats.arch.ept_violations.fetch_add(1, Ordering::Relaxed);
++            handle_npf(guard, vmcb, gpa, traps, packet)
++        }
++        VMEXIT_IOIO => {
++            PerCpu::get_current().gstats.arch.io_instructions.fetch_add(1, Ordering::Relaxed);
++            handle_ioio(vmcb, guest_state, traps, packet)
++        }
++        VMEXIT_CPUID => {
++            PerCpu::get_current().gstats.arch.cpuid_instructions.fetch_add(1, Ordering::Relaxed);
++            handle_cpuid(vmcb, guest_state)
++        }
++        VMEXIT_HLT => {
++            PerCpu::get_current().gstats.arch.hlt_instructions.fetch_add(1, Ordering::Relaxed);
++            advance_rip(vmcb, 1);
++            guard.invalidate();
++            local_apic_state
++                .interrupt_tracker
++                .wait(crate::platform_rs::timer::InstantMono(ZX_TIME_INFINITE), None)
++        }
++        VMEXIT_INVD => {
++            advance_rip(vmcb, 2);
++            Ok(())
++        }
++        VMEXIT_MSR => {
++            PerCpu::get_current().gstats.arch.wrmsr_instructions.fetch_add(1, Ordering::Relaxed);
++            handle_msr(vmcb, guest_state)
++        }
++        VMEXIT_XSETBV => handle_xsetbv(vmcb, guest_state),
++        VMEXIT_VMMCALL => {
++            advance_rip(vmcb, 3);
++            guest_state.rax = (-38i64) as u64; // -ENOSYS
++            Ok(())
++        }
++        VMEXIT_SHUTDOWN => Err(Status::BAD_STATE),
++        VMEXIT_INVALID => {
++            dprintf!(
++                CRITICAL,
++                "hypervisor(svm): VMEXIT_INVALID rip={:#x} cr0={:#x} cr4={:#x} efer={:#x}\n",
++                vmcb.save.rip,
++                vmcb.save.cr0,
++                vmcb.save.cr4,
++                vmcb.save.efer
++            );
++            Err(Status::INTERNAL)
++        }
++        other => {
++            dprintf!(
++                CRITICAL,
++                "hypervisor(svm): Unhandled VMEXIT code={:#x} info1={:#x} info2={:#x} rip={:#x}\n",
++                other,
++                vmcb.control.exit_info_1,
++                vmcb.control.exit_info_2,
++                vmcb.save.rip
++            );
++            Err(Status::NOT_SUPPORTED)
++        }
++    };
++
++    // Write potentially updated RAX/CR2 back into VMCB for the next entry.
++    vmcb.save.rax = guest_state.rax;
++    vmcb.save.cr2 = guest_state.cr2;
++    result
++}
+diff --git a/zircon/kernel/arch/x86/hypervisor/vcpu.rs b/zircon/kernel/arch/x86/hypervisor/vcpu.rs
+index 7b8e01b759e..ba42f566081 100644
+--- a/zircon/kernel/arch/x86/hypervisor/vcpu.rs
++++ b/zircon/kernel/arch/x86/hypervisor/vcpu.rs
+@@ -26,6 +26,16 @@ use zx_types::{
+ use super::guest::Guest;
+ use super::invalidate::{InvVpid, ept_pointer_from_pml4, invvpid};
+ use super::pv::{PvClockState, pv_clock_update_system_time};
++use super::svm_cpu_state::{host_vmcb_paddr, svm_tlb_gen};
++use super::svm_vmexit::{AutoSvmGuard, svm_local_apic_maybe_interrupt, svm_vmexit_handler};
++use super::vmcb::{
++    INTERCEPT_CLGI, INTERCEPT_CPUID, INTERCEPT_HLT, INTERCEPT_INIT, INTERCEPT_INTR,
++    INTERCEPT_INVD, INTERCEPT_IOIO_PROT, INTERCEPT_MSR_PROT, INTERCEPT_NMI, INTERCEPT_SHUTDOWN,
++    INTERCEPT_SKINIT, INTERCEPT_STGI, INTERCEPT_VMLOAD, INTERCEPT_VMMCALL, INTERCEPT_VMRUN,
++    INTERCEPT_VMSAVE, INTERCEPT_XSETBV, NP_ENABLE_NESTED_PAGING, SVM_SEG_ATTR_CODE16,
++    SVM_SEG_ATTR_CODE64, SVM_SEG_ATTR_DATA, SVM_SEG_ATTR_LDT, SVM_SEG_ATTR_TSS_BUSY,
++    TLB_CONTROL_DO_NOTHING, TLB_CONTROL_FLUSH_ALL, V_INTR_MASKING, Vmcb, VmcbSeg,
++};
+ use super::vmcs::{
+     AutoVmcs, ENTRY_CTLS_64BIT_MODE, ENTRY_CTLS_LOAD_IA32_EFER, ENTRY_CTLS_LOAD_IA32_PAT,
+     EXIT_CTLS_64BIT_MODE, EXIT_CTLS_ACK_INT_ON_EXIT, EXIT_CTLS_LOAD_IA32_EFER,
+@@ -72,7 +82,7 @@ use crate::arch_rs::x86::pv::pv_clock_is_stable;
+ use crate::arch_rs::x86::registers::{
+     X86_CR0_CD, X86_CR0_ET, X86_CR0_NE, X86_CR0_NW, X86_CR0_PE, X86_CR0_PG, X86_CR0_WP,
+     X86_CR4_FSGSBASE, X86_CR4_LA57, X86_CR4_OSFXSR, X86_CR4_OSXSAVE, X86_CR4_PAE, X86_CR4_PGE,
+-    X86_CR4_VMXE, X86_EFER_LMA, X86_EFER_LME, X86_FLAGS_IF, X86_FLAGS_RESERVED_ONES,
++    X86_CR4_VMXE, X86_EFER_LMA, X86_EFER_LME, X86_EFER_SVME, X86_FLAGS_IF, X86_FLAGS_RESERVED_ONES,
+     X86_FLAGS_USER, X86_MAX_EXTENDED_REGISTER_SIZE, X86_MSR_IA32_EFER, X86_MSR_IA32_FLUSH_CMD,
+     X86_MSR_IA32_FMASK, X86_MSR_IA32_FS_BASE, X86_MSR_IA32_GS_BASE, X86_MSR_IA32_KERNEL_GS_BASE,
+     X86_MSR_IA32_LSTAR, X86_MSR_IA32_PAT, X86_MSR_IA32_STAR, X86_MSR_IA32_TSC_AUX,
+@@ -177,6 +187,10 @@ unsafe extern "C" {
+     /// The location where we jump to when a guest exits. An internal implementation detail of
+     /// `vmx_enter_asm`.
+     fn vmx_exit_asm();
++
++    /// Low-level AMD SVM guest entry/exit wrapper (`clgi`/`vmsave`/`vmload`/`vmrun`/`stgi`).
++    fn svm_enter_asm(vmx_state: *mut VmxState, guest_vmcb_pa: u64, host_vmcb_pa: u64)
++        -> zx_status_t;
+ }
+ 
+ /// Returns the CPU number and the address of the default TSS of the current CPU, from its
+@@ -695,6 +709,126 @@ unsafe fn vmcs_init(
+     Ok(())
+ }
+ 
++/// Initializes an AMD SVM VMCB and the VCPU's extended register buffer.
++///
++/// # Safety
++///
++/// `vmcb` must point to an exclusively owned, zero-initialized 4 KiB VMCB page, `vmx_state` and
++/// `extended_register_state` must be valid for writes, and `iopm_pa`, `msrpm_pa`, and `npt_pml4`
++/// must remain allocated while the VMCB is in use.
++#[allow(clippy::too_many_arguments)]
++unsafe fn vmcb_init(
++    vmcb: &mut Vmcb,
++    vpid: u16,
++    entry: usize,
++    iopm_pa: PAddr,
++    msrpm_pa: PAddr,
++    npt_pml4: PAddr,
++    vmx_state: *mut VmxState,
++    extended_register_state: *mut u8,
++) {
++    let is_base_processor = vpid == BASE_PROCESSOR_VPID;
++
++    vmcb.control.intercept_misc1 = INTERCEPT_INTR
++        | INTERCEPT_NMI
++        | INTERCEPT_INIT
++        | INTERCEPT_CPUID
++        | INTERCEPT_INVD
++        | INTERCEPT_HLT
++        | INTERCEPT_IOIO_PROT
++        | INTERCEPT_MSR_PROT
++        | INTERCEPT_SHUTDOWN;
++    vmcb.control.intercept_misc2 = INTERCEPT_VMRUN
++        | INTERCEPT_VMMCALL
++        | INTERCEPT_VMLOAD
++        | INTERCEPT_VMSAVE
++        | INTERCEPT_STGI
++        | INTERCEPT_CLGI
++        | INTERCEPT_SKINIT
++        | INTERCEPT_XSETBV;
++    vmcb.control.iopm_base_pa = iopm_pa.0 as u64;
++    vmcb.control.msrpm_base_pa = msrpm_pa.0 as u64;
++    vmcb.control.guest_asid = u32::from(vpid);
++    vmcb.control.tlb_control = TLB_CONTROL_FLUSH_ALL;
++    vmcb.control.v_intr_ctrl = V_INTR_MASKING;
++    vmcb.control.np_enable = NP_ENABLE_NESTED_PAGING;
++    vmcb.control.n_cr3 = npt_pml4.0 as u64;
++    vmcb.control.clean_bits = 0;
++
++    let mut cr0 = X86_CR0_ET | X86_CR0_NE | X86_CR0_WP;
++    if is_base_processor {
++        cr0 |= X86_CR0_PE | X86_CR0_PG;
++    }
++    let xsave = xsave_supported();
++    let mut cr4 = X86_CR4_OSFXSR | X86_CR4_FSGSBASE;
++    if xsave {
++        cr4 |= X86_CR4_OSXSAVE;
++    }
++    if is_base_processor {
++        cr4 |= X86_CR4_PAE | X86_CR4_PGE;
++    }
++
++    // SAFETY: CPL 0; IA32_PAT and IA32_EFER exist on all x86-64 CPUs.
++    let (host_pat, host_efer) = unsafe { (read_msr(X86_MSR_IA32_PAT), read_msr(X86_MSR_IA32_EFER)) };
++    // AMD64 APM Vol 2 §15.5.1 requires `EFER.SVME == 1` in the VMCB save area.
++    let mut guest_efer = host_efer | X86_EFER_SVME;
++    if !is_base_processor {
++        guest_efer &= !(X86_EFER_LME | X86_EFER_LMA);
++    }
++
++    vmcb.save.g_pat = host_pat;
++    vmcb.save.efer = guest_efer;
++    vmcb.save.cr0 = cr0;
++    vmcb.save.cr4 = cr4;
++    vmcb.save.cr3 = 0;
++    vmcb.save.dr6 = 0xffff_0ff0;
++    vmcb.save.dr7 = 0x0400;
++    vmcb.save.rflags = X86_FLAGS_RESERVED_ONES;
++    vmcb.save.rsp = 0;
++    vmcb.save.cpl = 0;
++
++    if is_base_processor {
++        vmcb.save.cs = VmcbSeg { selector: 0, attrib: SVM_SEG_ATTR_CODE64, limit: 0xffff_ffff, base: 0 };
++        vmcb.save.rip = entry as u64;
++    } else {
++        vmcb.save.cs = VmcbSeg {
++            selector: (entry >> 4) as u16,
++            attrib: SVM_SEG_ATTR_CODE16,
++            limit: 0xffff,
++            base: entry as u64,
++        };
++        vmcb.save.rip = 0;
++    }
++
++    let data_seg = VmcbSeg { selector: 0, attrib: SVM_SEG_ATTR_DATA, limit: 0xffff_ffff, base: 0 };
++    vmcb.save.ds = data_seg;
++    vmcb.save.es = data_seg;
++    vmcb.save.ss = data_seg;
++    vmcb.save.fs = data_seg;
++    vmcb.save.gs = data_seg;
++    vmcb.save.tr = VmcbSeg { selector: 0, attrib: SVM_SEG_ATTR_TSS_BUSY, limit: 0xffff, base: 0 };
++    vmcb.save.ldtr = VmcbSeg { selector: 0, attrib: SVM_SEG_ATTR_LDT, limit: 0xffff, base: 0 };
++    vmcb.save.gdtr = VmcbSeg { selector: 0, attrib: 0, limit: 0xffff, base: 0 };
++    vmcb.save.idtr = VmcbSeg { selector: 0, attrib: 0, limit: 0xffff, base: 0 };
++    vmcb.save.sw_last_tlb_gen = 0;
++
++    if xsave {
++        unsafe {
++            let host_xcr0 = xgetbv(0);
++            (*vmx_state).host_state.xcr0 = host_xcr0;
++            (*vmx_state).guest_state.xcr0 = host_xcr0 & GUEST_XCR0_MASK;
++            extended_register_init_state_from_bv(
++                extended_register_state,
++                (*vmx_state).guest_state.xcr0,
++            );
++        }
++    } else {
++        unsafe {
++            extended_register_init_state(extended_register_state);
++        }
++    }
++}
++
+ #[cold]
+ #[inline(never)]
+ fn log_invalid_interrupt_vector(vector: u32) {
+@@ -832,6 +966,7 @@ pub struct Vcpu {
+     kicked: AtomicBool,
+     entered: AtomicBool,
+     in_use: AtomicBool,
++    is_svm: bool,
+     /// `last_cpu` contains the CPU dedicated to holding the guest's VMCS state,
+     /// or INVALID_CPU if there is no such VCPU. If this Vcpu is actively running,
+     /// then `last_cpu` will point to that CPU.
+@@ -939,8 +1074,9 @@ impl Vcpu {
+         }
+ 
+         let vpid = guest.try_alloc_vpid()?;
++        let is_svm = guest.is_svm();
+ 
+-        let mut vcpu = match kalloc::Box::try_pin_init(Self::init(guest, vpid, thread)) {
++        let mut vcpu = match kalloc::Box::try_pin_init(Self::init(guest, vpid, is_svm, thread)) {
+             Ok(vcpu) => vcpu,
+             Err(_) => {
+                 let result = guest.free_vpid(vpid);
+@@ -952,8 +1088,6 @@ impl Vcpu {
+         // before `vmcs_page.alloc` (which can reschedule or migrate `thread`).
+         unsafe { &*thread }.set_vcpu(true);
+ 
+-        // SAFETY: `guest` exists, so `alloc_vmx_state` succeeded and the CPU supports VMX.
+-        let vmx_info = unsafe { VmxInfo::new() };
+         {
+             let this = vcpu.as_mut().project();
+ 
+@@ -965,12 +1099,18 @@ impl Vcpu {
+                 x86_feature_test(X86_FEATURE_INVAR_TSC)
+             });
+ 
+-            this.vmcs_page.alloc(&vmx_info, 0)?;
+-
+-            let region = this.vmcs_page.virtual_address::<VmxRegion>();
+-            // SAFETY: `region` points to the start of the VMCS page allocated above, which nothing
+-            // else accesses yet.
+-            unsafe { (*region).revision_id = vmx_info.revision_id };
++            if is_svm {
++                this.vmcs_page.alloc_raw(0)?;
++            } else {
++                // SAFETY: `guest` exists and is VMX, so `alloc_vmx_state` succeeded.
++                let vmx_info = unsafe { VmxInfo::new() };
++                this.vmcs_page.alloc(&vmx_info, 0)?;
++
++                let region = this.vmcs_page.virtual_address::<VmxRegion>();
++                // SAFETY: `region` points to the start of the VMCS page allocated above, which
++                // nothing else accesses yet.
++                unsafe { (*region).revision_id = vmx_info.revision_id };
++            }
+         }
+ 
+         // SAFETY: Only the pointer to the VCPU moves, not the VCPU, and the `UniquePtr` is pinned
+@@ -983,32 +1123,48 @@ impl Vcpu {
+ 
+         let ept_pml4 = guest.physical_aspace().arch_aspace().arch_table_phys();
+         let vmcs_address = vcpu.vmcs_page.physical_address();
+-        // We create the `AutoVmcs` object here, so that we ensure that interrupts are
+-        // disabled from `vmcs_init` until `set_migrate_fn_locked`. This is important to ensure
+-        // that we do not migrate CPUs while setting up the VCPU.
+-        // SAFETY: `vmcs_address` is the VMCS page of the VCPU, which is only accessed through VMX
+-        // instructions, and remains allocated until the VCPU is dropped, which clears it. The
+-        // calling thread does not block, nor make another VMCS current, until `vmcs` is invalidated
+-        // or dropped.
+-        let mut vmcs = unsafe {
+-            AutoVmcs::new(vmcs_address, /*clear=*/ true)
++        // Keep interrupts and preemption disabled from VMCS/VMCB initialization until
++        // `set_migrate_fn_locked` completes so we do not migrate CPUs during setup.
++        let mut vmcs_guard = if !is_svm {
++            // SAFETY: `vmcs_address` is the VMCS page of the VCPU, which is only accessed through
++            // VMX instructions, and remains allocated until the VCPU is dropped, which clears it.
++            Some(unsafe { AutoVmcs::new(vmcs_address, /*clear=*/ true) })
++        } else {
++            None
+         };
++        let svm_guard = if is_svm { Some(AutoSvmGuard::new()) } else { None };
+         vcpu.last_cpu.store(curr_cpu_num(), Ordering::Relaxed);
+-        // SAFETY: `vmcs` has not been invalidated (so interrupts are disabled and its VMCS is
+-        // current on this CPU), CPL is 0, `%gs.base` and extended registers are initialized, and
+-        // `vmx_state` and `extended_register_state` are fields of the pinned VCPU, which owns the
+-        // VMCS.
+-        unsafe {
+-            vmcs_init(
+-                &mut vmcs,
+-                vpid,
+-                entry,
+-                guest.msr_bitmaps_address(),
+-                ept_pml4,
+-                vcpu.vmx_state.get(),
+-                vcpu.extended_register_state.get().cast(),
+-            )
+-        }?;
++        if is_svm {
++            // SAFETY: `vcpu.vmcs_page` is a zero-initialized 4 KiB page exclusively owned by
++            // `vcpu`, and interrupts/preemption are disabled by `svm_guard`.
++            unsafe {
++                vmcb_init(
++                    vcpu.vmcb_mut(),
++                    vpid,
++                    entry,
++                    guest.svm_iopm_address(),
++                    guest.svm_msrpm_address(),
++                    ept_pml4,
++                    vcpu.vmx_state.get(),
++                    vcpu.extended_register_state.get().cast(),
++                );
++            }
++        } else {
++            // SAFETY: `vmcs` has not been invalidated (so interrupts are disabled and its VMCS is
++            // current on this CPU), CPL is 0, `%gs.base` and extended registers are initialized,
++            // and `vmx_state` and `extended_register_state` are fields of the pinned VCPU.
++            unsafe {
++                vmcs_init(
++                    vmcs_guard.as_mut().unwrap(),
++                    vpid,
++                    entry,
++                    guest.msr_bitmaps_address(),
++                    ept_pml4,
++                    vcpu.vmx_state.get(),
++                    vcpu.extended_register_state.get().cast(),
++                )
++            }?;
++        }
+ 
+         let vcpu_cb_ptr = VcpuCallbackPtr(vcpu_ptr);
+         let migrate_fn = MigrateFn::new(move |thread: &Thread, stage: MigrateStage| {
+@@ -1037,9 +1193,9 @@ impl Vcpu {
+         });
+         let (old_migrate, old_context_switch) = {
+             ksync::lock!(let mut list_guard = Thread::get_list_lock().lock());
+-            // SAFETY: `thread` is the live current thread, and `vmcs` keeps interrupts and
+-            // preemption disabled so no context switch or migration can form `&mut` borrows on
+-            // `Thread` subfields while `thread_ref` is live.
++            // SAFETY: `thread` is the live current thread, and `vmcs_guard`/`svm_guard` keeps
++            // interrupts and preemption disabled so no context switch or migration can form `&mut`
++            // borrows on `Thread` subfields while `thread_ref` is live.
+             let thread_ref = unsafe { &*thread };
+             single_chain_lock_guard_owned!(
+                 thread_guard,
+@@ -1048,8 +1204,7 @@ impl Vcpu {
+                 clt_tag!("Vcpu::Create")
+             );
+ 
+-            // Only set the thread migrate function after we have initialized the VMCS.
+-            // Otherwise, the migrate function may interact with an uninitialized VMCS.
++            // Only set the thread migrate function after we have initialized the VMCS/VMCB.
+             // SAFETY: `thread_lists_init` has completed, `thread_ref` is the live current thread
+             // (not erased from thread lists), and no scheduler `queue_lock_` is held.
+             let old_migrate = unsafe {
+@@ -1062,20 +1217,22 @@ impl Vcpu {
+             (old_migrate, old_context_switch)
+         };
+ 
+-        drop(vmcs);
++        drop(vmcs_guard);
++        drop(svm_guard);
+         drop((old_migrate, old_context_switch));
+         Ok(vcpu)
+     }
+ 
+     /// Creates an in-place initializer for a `Vcpu` of `guest` with VPID `vpid`, which runs on
+     /// `thread`.
+-    fn init(guest: &Guest, vpid: u16, thread: *mut Thread) -> impl PinInit<Self> {
++    fn init(guest: &Guest, vpid: u16, is_svm: bool, thread: *mut Thread) -> impl PinInit<Self> {
+         pin_init!(Self {
+             guest: NonNull::from(guest),
+             vpid,
+             kicked: AtomicBool::new(false),
+             entered: AtomicBool::new(false),
+             in_use: AtomicBool::new(false),
++            is_svm,
+             last_cpu: AtomicU32::new(INVALID_CPU),
+             thread: AtomicPtr::new(thread),
+             vmcs_page: VmxPage::default(),
+@@ -1090,6 +1247,30 @@ impl Vcpu {
+         })
+     }
+ 
++    /// Returns a shared reference to the VMCB (only valid when `self.is_svm`).
++    ///
++    /// # Safety
++    ///
++    /// Caller must ensure `self.is_svm` and no concurrent mutable access to the VMCB.
++    #[inline]
++    unsafe fn vmcb_ref(&self) -> &Vmcb {
++        debug_assert!(self.is_svm);
++        unsafe { &*self.vmcs_page.virtual_address::<Vmcb>() }
++    }
++
++    /// Returns a mutable reference to the VMCB (only valid when `self.is_svm`).
++    ///
++    /// # Safety
++    ///
++    /// Caller must ensure `self.is_svm` and exclusive access to the VMCB (e.g., on the VCPU
++    /// thread with interrupts disabled, or during `MigrateStage::Restore`).
++    #[inline]
++    #[allow(clippy::mut_from_ref)]
++    unsafe fn vmcb_mut(&self) -> &mut Vmcb {
++        debug_assert!(self.is_svm);
++        unsafe { &mut *self.vmcs_page.virtual_address::<Vmcb>() }
++    }
++
+     fn guest(&self) -> &Guest {
+         // SAFETY: The guest outlives the VCPU, as `create` requires.
+         unsafe { self.guest.as_ref() }
+@@ -1154,12 +1335,14 @@ impl Vcpu {
+             //   ensures that all VMCS data that may be cached by the processor are
+             //   flushed to memory.
+             MigrateStage::Save => {
+-                // SAFETY: The VMCS page of the VCPU remains allocated until the VCPU is dropped,
+-                // which first clears the migrate function, and is only accessed through VMX
+-                // instructions.
+-                unsafe { vmclear(self.vmcs_page.physical_address().0) };
+-                // After VMCLEAR, `last_cpu` can be cleared to indicate this VCPU is both
+-                // not presently running, and its state is not loaded anywhere.
++                if !self.is_svm {
++                    // SAFETY: The VMCS page of the VCPU remains allocated until the VCPU is
++                    // dropped, which first clears the migrate function, and is only accessed
++                    // through VMX instructions.
++                    unsafe { vmclear(self.vmcs_page.physical_address().0) };
++                }
++                // After VMCLEAR (or immediately on SVM), `last_cpu` can be cleared to indicate
++                // this VCPU is both not presently running, and its state is not loaded anywhere.
+                 self.last_cpu.store(INVALID_CPU, Ordering::Relaxed);
+             }
+             // * Copy the VMCS region from one memory location to another location. This
+@@ -1168,6 +1351,16 @@ impl Vcpu {
+             // * Perform a VMPTRLD of the physical address of VMCS region on the
+             //   destination processor to establish its current VMCS pointer.
+             MigrateStage::Restore => {
++                if self.is_svm {
++                    debug_assert!(self.last_cpu.load(Ordering::Relaxed) == INVALID_CPU);
++                    self.last_cpu
++                        .store(thread_proof.scheduler_state().last_cpu(), Ordering::Relaxed);
++                    // Flush ASID/NPT TLB entries on the destination CPU on next VMRUN.
++                    // SAFETY: `thread` is being migrated and not running elsewhere.
++                    unsafe { self.vmcb_mut().control.tlb_control = TLB_CONTROL_FLUSH_ALL };
++                    return;
++                }
++
+                 // Volume 3, Section 31.8.2: To migrate a VMCS to another logical
+                 // processor, a VMM must use the sequence of VMCLEAR, VMPTRLD and
+                 // VMLAUNCH.
+@@ -1237,6 +1430,11 @@ impl Vcpu {
+     /// Must be called by the thread of the VCPU with interrupts disabled, or by its context switch
+     /// function.
+     unsafe fn context_switch(&self, include_gs: bool) {
++        if self.is_svm {
++            // AMD SVM's `VMSAVE`/`VMLOAD` saves and restores SYSCALL/GS/FS/TR MSRs around every
++            // `VMRUN`, and `TSC_AUX` remains intercepted in the SVM MSRPM.
++            return;
++        }
+         // SAFETY: Guaranteed by the caller, so nothing else accesses `msr_state` meanwhile.
+         let msr_state = unsafe { &mut *self.msr_state.get() };
+         // SAFETY: These MSRs hold the system call and TSC_AUX state of the thread running on this
+@@ -1290,22 +1488,13 @@ impl Vcpu {
+     /// # Safety
+     ///
+     /// Must be called by the thread of the VCPU (holding `VcpuInUseGuard`) with interrupts
+-    /// disabled while `vmcs` is current, at CPL 0 with `CR0.EM == 0`, `CR0.TS == 0`, and
+-    /// `extended_register_init` completed on CPU 0.
+-    unsafe fn load_extended_registers(&self, vmcs: &AutoVmcs) {
++    /// disabled, at CPL 0 with `CR0.EM == 0`, `CR0.TS == 0`, and `extended_register_init`
++    /// completed on CPU 0.
++    unsafe fn load_extended_registers_with_cr4(&self, guest_cr4: u64) {
+         let thread = current_get();
+         let save_host = xsave_supported();
+-        let load_guest = save_host && (vmcs.read(VmcsFieldXX::GUEST_CR4) & X86_CR4_OSXSAVE != 0);
++        let load_guest = save_host && (guest_cr4 & X86_CR4_OSXSAVE != 0);
+         let vmx_state = self.vmx_state.get();
+-        // SAFETY: The buffers are the 64-byte-aligned XSAVE areas of the current thread and of the
+-        // VCPU, and only the current thread accesses them and `vmx_state` while interrupts are
+-        // disabled. Restoring `self.extended_register_state` before narrowing `XCR0` ensures
+-        // hardware `XCR0` is still `host_xcr0` (a superset of `xcomp_bv`), avoiding `#GP(0)` in
+-        // `xrstors`. When `load_guest` is true, `xsave_supported()` guarantees `CR4.OSXSAVE == 1`
+-        // and hardware support for x87 and SSE, and masking `guest_state.xcr0` with
+-        // `host_xcr0 & GUEST_XCR0_MASK` (preserving x87 and clearing AVX when SSE is clear)
+-        // guarantees a valid `XCR0` configuration supported by the CPU and fitting within
+-        // `X86_MAX_EXTENDED_REGISTER_SIZE`.
+         unsafe {
+             extended_register_save_state(x86_thread_extended_register_buffer(thread));
+             let mut host_xcr0 = 0;
+@@ -1325,19 +1514,23 @@ impl Vcpu {
+         }
+     }
+ 
++    /// # Safety
++    ///
++    /// Same preconditions as [`Self::load_extended_registers_with_cr4`], plus `vmcs` is current.
++    unsafe fn load_extended_registers(&self, vmcs: &AutoVmcs) {
++        unsafe { self.load_extended_registers_with_cr4(vmcs.read(VmcsFieldXX::GUEST_CR4)) };
++    }
++
+     /// # Safety
+     ///
+     /// Must be called by the thread of the VCPU (holding `VcpuInUseGuard`) with interrupts
+-    /// disabled while `vmcs` is current, after a matching `load_extended_registers` on this entry,
+-    /// at CPL 0 with `CR0.EM == 0`, `CR0.TS == 0`, and `extended_register_init` completed on CPU 0.
+-    unsafe fn save_extended_registers(&self, vmcs: &AutoVmcs) {
++    /// disabled, after a matching `load_extended_registers_with_cr4` on this entry, at CPL 0 with
++    /// `CR0.EM == 0`, `CR0.TS == 0`, and `extended_register_init` completed on CPU 0.
++    unsafe fn save_extended_registers_with_cr4(&self, guest_cr4: u64) {
+         let thread = current_get();
+         let load_host = xsave_supported();
+-        let save_guest = load_host && (vmcs.read(VmcsFieldXX::GUEST_CR4) & X86_CR4_OSXSAVE != 0);
++        let save_guest = load_host && (guest_cr4 & X86_CR4_OSXSAVE != 0);
+         let vmx_state = self.vmx_state.get();
+-        // SAFETY: As in `load_extended_registers`. Widening `XCR0` back to `host_state.xcr0`
+-        // (saved by `load_extended_registers`) before restoring the host thread's XSAVE area
+-        // ensures hardware `XCR0` is a superset of the host buffer's `xcomp_bv`.
+         unsafe {
+             extended_register_save_state(self.extended_register_state.get().cast());
+             if save_guest {
+@@ -1350,6 +1543,125 @@ impl Vcpu {
+         }
+     }
+ 
++    /// # Safety
++    ///
++    /// Same preconditions as [`Self::save_extended_registers_with_cr4`], plus `vmcs` is current.
++    unsafe fn save_extended_registers(&self, vmcs: &AutoVmcs) {
++        unsafe { self.save_extended_registers_with_cr4(vmcs.read(VmcsFieldXX::GUEST_CR4)) };
++    }
++
++    /// Enters an AMD SVM guest, returning once the guest traps, faults, or is kicked.
++    fn enter_svm(&self, packet: &mut zx_port_packet_t) -> Result<(), Status> {
++        let current_thread = current_get();
++        let _in_use = self.enter_our_thread(current_thread)?;
++
++        let extended_registers_loaded = Cell::new(false);
++        let _defer = zr::defer(|| {
++            if extended_registers_loaded.get() {
++                let _guard = AutoSvmGuard::new();
++                // SAFETY: This is the thread of the VCPU holding `_in_use` with interrupts
++                // disabled.
++                unsafe {
++                    let guest_cr4 = self.vmcb_ref().save.cr4;
++                    self.save_extended_registers_with_cr4(guest_cr4);
++                }
++                self.entered.store(false, Ordering::SeqCst);
++            }
++            if !BootOptions::get().x86_disable_spec_mitigations && x86_cpu_has_ibpb() {
++                // SAFETY: Kernel code runs at CPL 0 and `x86_cpu_has_ibpb()` checked support.
++                unsafe { x86_cpu_ibpb() };
++            }
++        });
++
++        let mut result;
++        loop {
++            // SAFETY: `current_thread` is the live current thread.
++            if let Err(err) = unsafe { &*current_thread }.check_kill_or_suspend_signal() {
++                core::hint::cold_path();
++                return Err(err);
++            }
++
++            let mut guard = AutoSvmGuard::new();
++
++            if self.kicked.swap(false, Ordering::SeqCst) {
++                core::hint::cold_path();
++                return Err(Status::CANCELED);
++            }
++
++            // SAFETY: Holding `_in_use` and `AutoSvmGuard` (interrupts + preemption disabled).
++            let vmcb = unsafe { self.vmcb_mut() };
++
++            if let Err(err) = svm_local_apic_maybe_interrupt(vmcb, &self.local_apic_state) {
++                core::hint::cold_path();
++                return Err(err);
++            }
++
++            // SAFETY: Only this thread accesses `pv_clock_state`.
++            pv_clock_update_system_time(unsafe { &mut *self.pv_clock_state.get() });
++
++            if !extended_registers_loaded.get() {
++                self.entered.store(true, Ordering::SeqCst);
++                // SAFETY: Holding `_in_use` and `AutoSvmGuard`.
++                unsafe {
++                    self.load_extended_registers_with_cr4(vmcb.save.cr4);
++                }
++                extended_registers_loaded.set(true);
++            }
++
++            let cur_tlb_gen = svm_tlb_gen();
++            if vmcb.save.sw_last_tlb_gen != cur_tlb_gen {
++                vmcb.control.tlb_control = TLB_CONTROL_FLUSH_ALL;
++                vmcb.save.sw_last_tlb_gen = cur_tlb_gen;
++            }
++            vmcb.control.clean_bits = 0;
++
++            let vmx_state = self.vmx_state.get();
++            // SAFETY: Only this thread accesses `vmx_state.guest_state`.
++            unsafe {
++                vmcb.save.rax = (*vmx_state).guest_state.rax;
++                vmcb.save.cr2 = (*vmx_state).guest_state.cr2;
++            }
++
++            ktrace_vcpu_enter();
++            guest_stats_inc!(vm_entries);
++
++            let guest_vmcb_pa = self.vmcs_page.physical_address().0 as u64;
++            let host_vmcb_pa = host_vmcb_paddr(curr_cpu_num()).0 as u64;
++            // SAFETY: Interrupts/preemption are disabled, SVM is active on this CPU,
++            // `guest_vmcb_pa` is a valid initialized VMCB, and `host_vmcb_pa` is this CPU's
++            // dedicated host VMSAVE/VMLOAD page.
++            let raw_status = unsafe { svm_enter_asm(vmx_state, guest_vmcb_pa, host_vmcb_pa) };
++            result = Status::ok(raw_status);
++            guest_stats_inc!(vm_exits);
++
++            // Reset one-shot TLB flush control after VMEXIT.
++            vmcb.control.tlb_control = TLB_CONTROL_DO_NOTHING;
++
++            if !BootOptions::get().x86_disable_spec_mitigations {
++                x86_ras_fill();
++            }
++
++            if result.is_ok() {
++                // SAFETY: Holding `_in_use`, `vmx_state` and `pv_clock_state` are thread-owned.
++                result = svm_vmexit_handler(
++                    &mut guard,
++                    vmcb,
++                    unsafe { &mut (*vmx_state).guest_state },
++                    &self.local_apic_state,
++                    unsafe { &mut *self.pv_clock_state.get() },
++                    self.guest().physical_aspace(),
++                    self.guest().traps(),
++                    packet,
++                );
++            }
++            if result.is_err() {
++                core::hint::cold_path();
++                break;
++            }
++        }
++        if result == Err(Status::NEXT) { Ok(()) } else { result }
++    }
++
+     /// Enters the guest, returning once the guest traps, faults, or is kicked.
+     ///
+     /// While the thread of the VCPU runs this, `vmx_state`, `msr_state`, `pv_clock_state` and
+@@ -1357,6 +1669,9 @@ impl Vcpu {
+     /// is valid), except for `vmx_state.guest_state` and `pv_clock_state` while handling a VM exit,
+     /// which the migrate and context switch functions do not access.
+     pub fn enter(&self, packet: &mut zx_port_packet_t) -> Result<(), Status> {
++        if self.is_svm {
++            return self.enter_svm(packet);
++        }
+         let current_thread = current_get();
+         let _in_use = self.enter_our_thread(current_thread)?;
+ 
+@@ -1557,11 +1872,19 @@ impl Vcpu {
+         // SAFETY: `_in_use` guarantees this is the VCPU's thread in a non-reentrant context, so
+         // nothing else accesses `vmx_state.guest_state`.
+         register_copy!(&mut vcpu_state, unsafe { &(*self.vmx_state.get()).guest_state });
+-        // SAFETY: As in `create`; `_in_use` verified `!ints_disabled()`, `!blocking_disallowed()`,
+-        // and `num_spinlocks_held() == 0`.
+-        let vmcs = unsafe { AutoVmcs::new(self.vmcs_page.physical_address(), false) };
+-        vcpu_state.rsp = vmcs.read(VmcsFieldXX::GUEST_RSP);
+-        vcpu_state.rflags = vmcs.read(VmcsFieldXX::GUEST_RFLAGS) & X86_FLAGS_USER;
++        if self.is_svm {
++            let _guard = AutoSvmGuard::new();
++            // SAFETY: Holding `_in_use` and `AutoSvmGuard`.
++            let vmcb = unsafe { self.vmcb_ref() };
++            vcpu_state.rsp = vmcb.save.rsp;
++            vcpu_state.rflags = vmcb.save.rflags & X86_FLAGS_USER;
++        } else {
++            // SAFETY: As in `create`; `_in_use` verified `!ints_disabled()`,
++            // `!blocking_disallowed()`, and `num_spinlocks_held() == 0`.
++            let vmcs = unsafe { AutoVmcs::new(self.vmcs_page.physical_address(), false) };
++            vcpu_state.rsp = vmcs.read(VmcsFieldXX::GUEST_RSP);
++            vcpu_state.rflags = vmcs.read(VmcsFieldXX::GUEST_RFLAGS) & X86_FLAGS_USER;
++        }
+         Ok(vcpu_state)
+     }
+ 
+@@ -1571,16 +1894,29 @@ impl Vcpu {
+         // SAFETY: `_in_use` guarantees this is the VCPU's thread in a non-reentrant context, so
+         // nothing else accesses `vmx_state.guest_state`.
+         register_copy!(unsafe { &mut (*self.vmx_state.get()).guest_state }, vcpu_state);
+-        // SAFETY: As in `create`; `_in_use` verified `!ints_disabled()`, `!blocking_disallowed()`,
+-        // and `num_spinlocks_held() == 0`.
+-        let mut vmcs = unsafe { AutoVmcs::new(self.vmcs_page.physical_address(), false) };
+-        // SAFETY: The guest RSP is guest state, and does not affect the host.
+-        unsafe { vmcs.write(VmcsFieldXX::GUEST_RSP, vcpu_state.rsp) };
+-        if vcpu_state.rflags & X86_FLAGS_RESERVED_ONES != 0 {
+-            let rflags = vmcs.read(VmcsFieldXX::GUEST_RFLAGS);
+-            let user_flags = (rflags & !X86_FLAGS_USER) | (vcpu_state.rflags & X86_FLAGS_USER);
+-            // SAFETY: Only the user flags of the guest RFLAGS, which is guest state, are changed.
+-            unsafe { vmcs.write(VmcsFieldXX::GUEST_RFLAGS, user_flags) };
++        if self.is_svm {
++            let _guard = AutoSvmGuard::new();
++            // SAFETY: Holding `_in_use` and `AutoSvmGuard`.
++            let vmcb = unsafe { self.vmcb_mut() };
++            vmcb.save.rax = vcpu_state.rax;
++            vmcb.save.rsp = vcpu_state.rsp;
++            if vcpu_state.rflags & X86_FLAGS_RESERVED_ONES != 0 {
++                let rflags = vmcb.save.rflags;
++                vmcb.save.rflags = (rflags & !X86_FLAGS_USER) | (vcpu_state.rflags & X86_FLAGS_USER);
++            }
++        } else {
++            // SAFETY: As in `create`; `_in_use` verified `!ints_disabled()`,
++            // `!blocking_disallowed()`, and `num_spinlocks_held() == 0`.
++            let mut vmcs = unsafe { AutoVmcs::new(self.vmcs_page.physical_address(), false) };
++            // SAFETY: The guest RSP is guest state, and does not affect the host.
++            unsafe { vmcs.write(VmcsFieldXX::GUEST_RSP, vcpu_state.rsp) };
++            if vcpu_state.rflags & X86_FLAGS_RESERVED_ONES != 0 {
++                let rflags = vmcs.read(VmcsFieldXX::GUEST_RFLAGS);
++                let user_flags = (rflags & !X86_FLAGS_USER) | (vcpu_state.rflags & X86_FLAGS_USER);
++                // SAFETY: Only the user flags of the guest RFLAGS, which is guest state, are
++                // changed.
++                unsafe { vmcs.write(VmcsFieldXX::GUEST_RFLAGS, user_flags) };
++            }
+         }
+         Ok(())
+     }
+@@ -1672,7 +2008,7 @@ impl PinnedDrop for Vcpu {
+         // that actually makes this safe.
+         let cpu = self.last_cpu.load(Ordering::Relaxed);
+ 
+-        if self.vmcs_page.is_allocated() && cpu != INVALID_CPU {
++        if !self.is_svm && self.vmcs_page.is_allocated() && cpu != INVALID_CPU {
+             // Clear VMCS state from the CPU.
+             //
+             // The destructor may be called from a different thread, therefore we must
+diff --git a/zircon/kernel/arch/x86/hypervisor/vmcb.rs b/zircon/kernel/arch/x86/hypervisor/vmcb.rs
+new file mode 100644
+index 00000000000..2c45d7ed42e
+--- /dev/null
++++ b/zircon/kernel/arch/x86/hypervisor/vmcb.rs
+@@ -0,0 +1,229 @@
++// Copyright 2026 The Hirsel-OS Authors
++//
++// Use of this source code is governed by a MIT-style
++// license that can be found in the LICENSE file or at
++// https://opensource.org/licenses/MIT
++
++//! AMD SVM Virtual Machine Control Block (VMCB) layout and constants.
++//!
++//! Reference: AMD64 Architecture Programmer's Manual, Volume 2, Appendix B
++//! (Layout of VMCB).
++
++use core::mem::{align_of, offset_of, size_of};
++use zr::static_assert;
++
++/// Segment register entry in the VMCB State Save Area (16 bytes).
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++pub struct VmcbSeg {
++    pub selector: u16,
++    pub attrib: u16,
++    pub limit: u32,
++    pub base: u64,
++}
++
++static_assert!(size_of::<VmcbSeg>() == 16);
++
++// VMCB intercept_misc1 (offset 0x00C) bits.
++pub const INTERCEPT_INTR: u32 = 1 << 0;
++pub const INTERCEPT_NMI: u32 = 1 << 1;
++pub const INTERCEPT_INIT: u32 = 1 << 3;
++pub const INTERCEPT_VINTR: u32 = 1 << 4;
++pub const INTERCEPT_CPUID: u32 = 1 << 18;
++pub const INTERCEPT_INVD: u32 = 1 << 22;
++pub const INTERCEPT_HLT: u32 = 1 << 24;
++pub const INTERCEPT_IOIO_PROT: u32 = 1 << 27;
++pub const INTERCEPT_MSR_PROT: u32 = 1 << 28;
++pub const INTERCEPT_SHUTDOWN: u32 = 1 << 31;
++
++// VMCB intercept_misc2 (offset 0x010) bits.
++pub const INTERCEPT_VMRUN: u32 = 1 << 0;
++pub const INTERCEPT_VMMCALL: u32 = 1 << 1;
++pub const INTERCEPT_VMLOAD: u32 = 1 << 2;
++pub const INTERCEPT_VMSAVE: u32 = 1 << 3;
++pub const INTERCEPT_STGI: u32 = 1 << 4;
++pub const INTERCEPT_CLGI: u32 = 1 << 5;
++pub const INTERCEPT_SKINIT: u32 = 1 << 6;
++pub const INTERCEPT_XSETBV: u32 = 1 << 13;
++
++// VMCB tlb_control (offset 0x05C) values.
++pub const TLB_CONTROL_DO_NOTHING: u8 = 0;
++pub const TLB_CONTROL_FLUSH_ALL: u8 = 1;
++pub const TLB_CONTROL_FLUSH_ASID: u8 = 3;
++
++// VMCB np_enable (offset 0x090) bits.
++pub const NP_ENABLE_NESTED_PAGING: u64 = 1 << 0;
++
++// VMCB v_intr_ctrl (offset 0x060) bits.
++pub const V_INTR_IRQ: u64 = 1 << 8;
++pub const V_INTR_IGN_TPR: u64 = 1 << 20;
++pub const V_INTR_MASKING: u64 = 1 << 24;
++
++// VMCB event_inj (offset 0x0A8) fields.
++pub const EVENT_INJ_TYPE_INTR: u64 = 0 << 8;
++pub const EVENT_INJ_TYPE_NMI: u64 = 2 << 8;
++pub const EVENT_INJ_TYPE_EXCEPTION: u64 = 3 << 8;
++pub const EVENT_INJ_EV: u64 = 1 << 11;
++pub const EVENT_INJ_VALID: u64 = 1 << 31;
++
++// AMD SVM VMEXIT codes (APM Vol 2, Appendix C).
++pub const VMEXIT_INTR: u64 = 0x060;
++pub const VMEXIT_NMI: u64 = 0x061;
++pub const VMEXIT_SMI: u64 = 0x062;
++pub const VMEXIT_INIT: u64 = 0x063;
++pub const VMEXIT_VINTR: u64 = 0x064;
++pub const VMEXIT_CPUID: u64 = 0x072;
++pub const VMEXIT_HLT: u64 = 0x078;
++pub const VMEXIT_INVD: u64 = 0x076;
++pub const VMEXIT_IOIO: u64 = 0x07b;
++pub const VMEXIT_MSR: u64 = 0x07c;
++pub const VMEXIT_SHUTDOWN: u64 = 0x07f;
++pub const VMEXIT_VMRUN: u64 = 0x080;
++pub const VMEXIT_VMMCALL: u64 = 0x081;
++pub const VMEXIT_VMLOAD: u64 = 0x082;
++pub const VMEXIT_VMSAVE: u64 = 0x083;
++pub const VMEXIT_STGI: u64 = 0x084;
++pub const VMEXIT_CLGI: u64 = 0x085;
++pub const VMEXIT_SKINIT: u64 = 0x086;
++pub const VMEXIT_XSETBV: u64 = 0x08d;
++pub const VMEXIT_NPF: u64 = 0x400;
++pub const VMEXIT_INVALID: u64 = u64::MAX;
++
++// Packed 12-bit AMD segment attributes (APM Vol 2, §15.5.1):
++// bits 3:0 = Type, bit 4 = S, bits 6:5 = DPL, bit 7 = P,
++// bit 8 = AVL, bit 9 = L, bit 10 = D/B, bit 11 = G.
++pub const SVM_SEG_ATTR_CODE64: u16 = 0x029b; // P=1, S=1, Type=0xB (code/R/A), L=1
++pub const SVM_SEG_ATTR_CODE16: u16 = 0x009b; // P=1, S=1, Type=0xB (code/R/A)
++pub const SVM_SEG_ATTR_DATA: u16 = 0x0093; // P=1, S=1, Type=0x3 (data/W/A)
++pub const SVM_SEG_ATTR_TSS_BUSY: u16 = 0x008b; // P=1, S=0, Type=0xB (64-bit TSS busy)
++pub const SVM_SEG_ATTR_LDT: u16 = 0x0082; // P=1, S=0, Type=0x2 (LDT)
++
++/// VMCB Control Area (bytes `0x000..0x400`).
++#[repr(C)]
++pub struct VmcbControlArea {
++    pub intercept_cr: u32,           // 0x000
++    pub intercept_dr: u32,           // 0x004
++    pub intercept_exceptions: u32,   // 0x008
++    pub intercept_misc1: u32,        // 0x00C
++    pub intercept_misc2: u32,        // 0x010
++    pub intercept_misc3: u32,        // 0x014
++    pub _reserved1: [u8; 0x24],      // 0x018..0x03C
++    pub pause_filter_thresh: u16,    // 0x03C
++    pub pause_filter_count: u16,     // 0x03E
++    pub iopm_base_pa: u64,           // 0x040
++    pub msrpm_base_pa: u64,          // 0x048
++    pub tsc_offset: u64,             // 0x050
++    pub guest_asid: u32,             // 0x058
++    pub tlb_control: u8,             // 0x05C
++    pub _reserved2: [u8; 3],         // 0x05D..0x060
++    pub v_intr_ctrl: u64,            // 0x060
++    pub interrupt_shadow: u64,       // 0x068
++    pub exit_code: u64,              // 0x070
++    pub exit_info_1: u64,            // 0x078
++    pub exit_info_2: u64,            // 0x080
++    pub exit_int_info: u64,          // 0x088
++    pub np_enable: u64,              // 0x090
++    pub avic_apic_bar: u64,          // 0x098
++    pub ghcb_gpa: u64,               // 0x0A0
++    pub event_inj: u64,              // 0x0A8
++    pub n_cr3: u64,                  // 0x0B0
++    pub lbr_virt_enable: u64,        // 0x0B8
++    pub clean_bits: u32,             // 0x0C0
++    pub _reserved3: u32,             // 0x0C4
++    pub next_rip: u64,               // 0x0C8
++    pub guest_inst_len: u8,          // 0x0D0
++    pub guest_inst_bytes: [u8; 15],  // 0x0D1..0x0E0
++    pub _reserved4: [u8; 0x320],     // 0x0E0..0x400
++}
++
++/// VMCB State Save Area (bytes `0x400..0x1000`).
++#[repr(C)]
++pub struct VmcbSaveArea {
++    pub es: VmcbSeg,                 // 0x000 (0x400)
++    pub cs: VmcbSeg,                 // 0x010 (0x410)
++    pub ss: VmcbSeg,                 // 0x020 (0x420)
++    pub ds: VmcbSeg,                 // 0x030 (0x430)
++    pub fs: VmcbSeg,                 // 0x040 (0x440)
++    pub gs: VmcbSeg,                 // 0x050 (0x450)
++    pub gdtr: VmcbSeg,               // 0x060 (0x460)
++    pub ldtr: VmcbSeg,               // 0x070 (0x470)
++    pub idtr: VmcbSeg,               // 0x080 (0x480)
++    pub tr: VmcbSeg,                 // 0x090 (0x490)
++    pub _reserved1: [u8; 0x2B],      // 0x0A0..0x0CB
++    pub cpl: u8,                     // 0x0CB (0x4CB)
++    pub _reserved2: u32,             // 0x0CC..0x0D0
++    pub efer: u64,                   // 0x0D0 (0x4D0)
++    pub _reserved3: [u8; 0x70],      // 0x0D8..0x148
++    pub cr4: u64,                    // 0x148 (0x548)
++    pub cr3: u64,                    // 0x150 (0x550)
++    pub cr0: u64,                    // 0x158 (0x558)
++    pub dr7: u64,                    // 0x160 (0x560)
++    pub dr6: u64,                    // 0x168 (0x568)
++    pub rflags: u64,                 // 0x170 (0x570)
++    pub rip: u64,                    // 0x178 (0x578)
++    pub _reserved4: [u8; 0x58],      // 0x180..0x1D8
++    pub rsp: u64,                    // 0x1D8 (0x5D8)
++    pub _reserved5: [u8; 0x18],      // 0x1E0..0x1F8
++    pub rax: u64,                    // 0x1F8 (0x5F8)
++    pub star: u64,                   // 0x200 (0x600)
++    pub lstar: u64,                  // 0x208 (0x608)
++    pub cstar: u64,                  // 0x210 (0x610)
++    pub sfmask: u64,                 // 0x218 (0x618)
++    pub kernel_gs_base: u64,         // 0x220 (0x620)
++    pub sysenter_cs: u64,            // 0x228 (0x628)
++    pub sysenter_esp: u64,           // 0x230 (0x630)
++    pub sysenter_eip: u64,           // 0x238 (0x638)
++    pub cr2: u64,                    // 0x240 (0x640)
++    pub _reserved6: [u8; 0x20],      // 0x248..0x268
++    pub g_pat: u64,                  // 0x268 (0x668)
++    pub _reserved7: [u8; 0x988],     // 0x270..0xBF8
++    /// Software-only field in unused VMCB tail tracking the last observed global SVM TLB gen.
++    pub sw_last_tlb_gen: u64,        // 0xBF8 (0xFF8)
++}
++
++/// Complete 4 KiB AMD SVM VMCB.
++#[repr(C, align(4096))]
++pub struct Vmcb {
++    pub control: VmcbControlArea,
++    pub save: VmcbSaveArea,
++}
++
++static_assert!(size_of::<VmcbControlArea>() == 0x400);
++static_assert!(size_of::<VmcbSaveArea>() == 0xC00);
++static_assert!(size_of::<Vmcb>() == 4096);
++static_assert!(align_of::<Vmcb>() == 4096);
++
++// Control area offset checks (AMD64 APM Vol 2, Table B-1).
++static_assert!(offset_of!(VmcbControlArea, intercept_misc1) == 0x00C);
++static_assert!(offset_of!(VmcbControlArea, intercept_misc2) == 0x010);
++static_assert!(offset_of!(VmcbControlArea, iopm_base_pa) == 0x040);
++static_assert!(offset_of!(VmcbControlArea, msrpm_base_pa) == 0x048);
++static_assert!(offset_of!(VmcbControlArea, guest_asid) == 0x058);
++static_assert!(offset_of!(VmcbControlArea, tlb_control) == 0x05C);
++static_assert!(offset_of!(VmcbControlArea, v_intr_ctrl) == 0x060);
++static_assert!(offset_of!(VmcbControlArea, interrupt_shadow) == 0x068);
++static_assert!(offset_of!(VmcbControlArea, exit_code) == 0x070);
++static_assert!(offset_of!(VmcbControlArea, exit_info_1) == 0x078);
++static_assert!(offset_of!(VmcbControlArea, exit_info_2) == 0x080);
++static_assert!(offset_of!(VmcbControlArea, np_enable) == 0x090);
++static_assert!(offset_of!(VmcbControlArea, event_inj) == 0x0A8);
++static_assert!(offset_of!(VmcbControlArea, n_cr3) == 0x0B0);
++static_assert!(offset_of!(VmcbControlArea, clean_bits) == 0x0C0);
++static_assert!(offset_of!(VmcbControlArea, next_rip) == 0x0C8);
++static_assert!(offset_of!(VmcbControlArea, guest_inst_len) == 0x0D0);
++
++// State save area offset checks (AMD64 APM Vol 2, Table B-2).
++static_assert!(offset_of!(Vmcb, save) == 0x400);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, cpl) == 0x4CB);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, efer) == 0x4D0);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, cr4) == 0x548);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, cr3) == 0x550);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, cr0) == 0x558);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, dr7) == 0x560);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, rflags) == 0x570);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, rip) == 0x578);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, rsp) == 0x5D8);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, rax) == 0x5F8);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, star) == 0x600);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, cr2) == 0x640);
++static_assert!(offset_of!(Vmcb, save) + offset_of!(VmcbSaveArea, g_pat) == 0x668);
+diff --git a/zircon/kernel/arch/x86/hypervisor/vmx_cpu_state.rs b/zircon/kernel/arch/x86/hypervisor/vmx_cpu_state.rs
+index 78224a16853..0194c9264f3 100644
+--- a/zircon/kernel/arch/x86/hypervisor/vmx_cpu_state.rs
++++ b/zircon/kernel/arch/x86/hypervisor/vmx_cpu_state.rs
+@@ -189,6 +189,12 @@ impl VmxPage {
+         // unconditionally allocating a page is adequate.
+         self.0.alloc(fill)
+     }
++
++    /// Allocates a raw 4 KiB page filled with `fill` without VMX capability checks (used for
++    /// AMD SVM VMCB storage).
++    pub fn alloc_raw(&mut self, fill: u8) -> Result<(), Status> {
++        self.0.alloc(fill)
++    }
+ }
+ 
+ impl Deref for VmxPage {
+diff --git a/zircon/kernel/arch/x86/src/feature.rs b/zircon/kernel/arch/x86/src/feature.rs
+index cbb74d6d6fe..b2878af1b53 100644
+--- a/zircon/kernel/arch/x86/src/feature.rs
++++ b/zircon/kernel/arch/x86/src/feature.rs
+@@ -466,6 +466,7 @@ x86_cpuid_bit! {X86_FEATURE_KVM_PV_CLOCK, KvmFeatures, 0, 3}
+ x86_cpuid_bit! {X86_FEATURE_KVM_PV_EOI, KvmFeatures, 0, 6}
+ x86_cpuid_bit! {X86_FEATURE_KVM_PV_IPI, KvmFeatures, 0, 11}
+ x86_cpuid_bit! {X86_FEATURE_KVM_PV_CLOCK_STABLE, KvmFeatures, 0, 24}
++x86_cpuid_bit! {X86_FEATURE_SVM, ExtModelFeatures, 2, 2}
+ x86_cpuid_bit! {X86_FEATURE_AMD_TOPO, ExtModelFeatures, 2, 22}
+ x86_cpuid_bit! {X86_FEATURE_SYSCALL, ExtModelFeatures, 3, 11}
+ x86_cpuid_bit! {X86_FEATURE_NX, ExtModelFeatures, 3, 20}
+diff --git a/zircon/kernel/arch/x86/src/mmu.rs b/zircon/kernel/arch/x86/src/mmu.rs
+index 986deb272a6..4cca767aad5 100644
+--- a/zircon/kernel/arch/x86/src/mmu.rs
++++ b/zircon/kernel/arch/x86/src/mmu.rs
+@@ -26,8 +26,12 @@ use pin_init::{PinInit, pin_data, pin_init, pin_init_from_closure, pinned_drop};
+ use zx_status::Status;
+ 
+ use super::aspace_bindings;
+-use super::feature::{self, BootStatic, X86_FEATURE_HUGE_PAGE, X86_FEATURE_SMEP, X86CpuidLeafNum};
++use super::feature::{
++    self, BootStatic, X86_FEATURE_HUGE_PAGE, X86_FEATURE_SMEP, X86_FEATURE_SVM, X86_FEATURE_VMX,
++    X86CpuidLeafNum, x86_feature_test,
++};
+ use super::hypervisor::invalidate::ept_pointer_from_pml4;
++use super::hypervisor::svm_cpu_state::broadcast_svm_tlb_flush;
+ use super::hypervisor::vmx_cpu_state::{broadcast_invept, vmx_ept_supports_large_pages};
+ use super::ioport::{IoBitmap, clear_tss_io_bitmap, set_tss_io_bitmap};
+ use super::mmu_mem_types::mmu_mem_type_init;
+@@ -992,7 +996,15 @@ impl X86PageTable<MmuPolicy> {
+     }
+ }
+ 
+-/// Policy for Intel's Extended Page Tables (EPT), for use in virtualization.
++/// Returns true when guest second-level paging uses AMD SVM Nested Page Tables (NPT)
++/// instead of Intel EPT.
++#[inline]
++fn use_svm_npt() -> bool {
++    !x86_feature_test(X86_FEATURE_VMX) && x86_feature_test(X86_FEATURE_SVM)
++}
++
++/// Policy for Intel's Extended Page Tables (EPT) and AMD's Nested Page Tables (NPT),
++/// for use in virtualization.
+ struct EptPolicy;
+ 
+ impl EptPolicy {
+@@ -1004,6 +1016,11 @@ impl EptPolicy {
+ 
+         EPT_TLB_INVALIDATIONS.add(1);
+ 
++        if use_svm_npt() {
++            broadcast_svm_tlb_flush();
++            return;
++        }
++
+         // Target all CPUs with a context invalidation since we do not know what CPUs have this EPT
+         // active. We cannot use `active_cpus()` because it is only updated by `context_switch`,
+         // which does not get called for guests, and also EPT mappings persist even if a guest is
+@@ -1021,15 +1038,12 @@ impl EptPolicy {
+ // SAFETY:
+ // - `SUPPORTS_UNIFIED` is `false`, and `EptPolicy` page tables are never initialized as
+ //   `Restricted`, `Shared`, or `Unified`.
+-// - `intermediate_flags()` returns `X86_EPT_R | X86_EPT_W | X86_EPT_X` (bits 0..=2; neither
+-//   `X86_MMU_PG_PS` nor any bit in `X86_PG_FRAME`).
+-// - `terminal_flags()` sets only EPT permission and memory-type bits (bits 0..=5), and
+-//   `split_flags()` returns the caller-masked flag bits unchanged without corrupting physical
+-//   frame bits.
+-// - `tlb_invalidate()` calls `broadcast_invept`, which synchronously invalidates the EPT context
+-//   across all CPUs whenever any guest exists (`NUM_GUESTS != 0`). When `NUM_GUESTS == 0`, VMX is
+-//   disabled on all CPUs so no EPT translations are active, and re-enabling VMX performs a global
+-//   context invalidation before any guest runs.
++// - On Intel EPT, `intermediate_flags()` returns `X86_EPT_R | X86_EPT_W | X86_EPT_X` and
++//   `terminal_flags()` sets EPT permission and memory-type bits (bits 0..=5).
++// - On AMD NPT, `intermediate_flags()` returns `X86_MMU_PG_RW | X86_MMU_PG_U` and
++//   `terminal_flags()` sets standard x86-64 PTE permission/NX/PAT bits with `X86_MMU_PG_U`
++//   (required by AMD64 APM Vol 2 §15.25.5 since all nested walks are treated as user accesses).
++// - `tlb_invalidate()` calls `broadcast_invept` (Intel) or `broadcast_svm_tlb_flush` (AMD).
+ unsafe impl PageTablePolicy for EptPolicy {
+     type Context = X86ArchVmAspace;
+     const SUPPORTS_UNIFIED: bool = false;
+@@ -1058,7 +1072,7 @@ unsafe impl PageTablePolicy for EptPolicy {
+     fn supports_page_size(&self, level: PageTableLevel) -> bool {
+         debug_assert!(level != PageTableLevel::PtL);
+         match level {
+-            PageTableLevel::PdL => vmx_ept_supports_large_pages(),
++            PageTableLevel::PdL => !use_svm_npt() && vmx_ept_supports_large_pages(),
+             PageTableLevel::PdpL | PageTableLevel::Pml4L => false,
+             PageTableLevel::PtL => panic_unreachable_supports_page_size(),
+         }
+@@ -1066,10 +1080,37 @@ unsafe impl PageTablePolicy for EptPolicy {
+ 
+     #[inline]
+     fn intermediate_flags(&self) -> IntermediatePtFlags {
+-        X86_EPT_R | X86_EPT_W | X86_EPT_X
++        if use_svm_npt() {
++            X86_MMU_PG_RW | X86_MMU_PG_U
++        } else {
++            X86_EPT_R | X86_EPT_W | X86_EPT_X
++        }
+     }
+ 
+     fn terminal_flags(&self, _level: PageTableLevel, flags: ArchMmuFlags) -> PtFlags {
++        if use_svm_npt() {
++            // AMD64 APM Vol 2 §15.25.5: all nested page table accesses are treated as user-mode
++            // accesses, so `X86_MMU_PG_U` must be set on every level.
++            let mut terminal_flags: PtFlags = X86_MMU_PG_U;
++            if (flags & ARCH_MMU_FLAG_PERM_WRITE) != 0 {
++                terminal_flags |= X86_MMU_PG_RW;
++            }
++            if (flags & ARCH_MMU_FLAG_PERM_EXECUTE) == 0 {
++                terminal_flags |= X86_MMU_PG_NX;
++            }
++            match flags & ARCH_MMU_FLAG_CACHE_MASK {
++                ARCH_MMU_FLAG_CACHED => terminal_flags |= X86_MMU_PTE_PAT_WRITEBACK,
++                ARCH_MMU_FLAG_UNCACHED_DEVICE | ARCH_MMU_FLAG_UNCACHED => {
++                    terminal_flags |= X86_MMU_PTE_PAT_UNCACHABLE;
++                }
++                ARCH_MMU_FLAG_WRITE_COMBINING => {
++                    terminal_flags |= X86_MMU_PTE_PAT_WRITE_COMBINING;
++                }
++                _ => panic_unexpected_flags(PtFlags::from(flags)),
++            }
++            return terminal_flags;
++        }
++
+         let mut terminal_flags: PtFlags = 0;
+ 
+         if (flags & ARCH_MMU_FLAG_PERM_READ) != 0 {
+@@ -1097,7 +1138,7 @@ unsafe impl PageTablePolicy for EptPolicy {
+     #[inline]
+     fn split_flags(&self, level: PageTableLevel, flags: PtFlags) -> PtFlags {
+         debug_assert!(level != PageTableLevel::Pml4L && level != PageTableLevel::PtL);
+-        // We don't need to relocate any flags on split for EPT.
++        // We don't need to relocate any flags on split for EPT (and NPT uses 4 KiB pages only).
+         flags
+     }
+ 
+@@ -1116,6 +1157,23 @@ unsafe impl PageTablePolicy for EptPolicy {
+ 
+     #[inline]
+     fn pt_flags_to_mmu_flags(&self, flags: PtFlags, _level: PageTableLevel) -> ArchMmuFlags {
++        if use_svm_npt() {
++            let mut mmu_flags: ArchMmuFlags = ARCH_MMU_FLAG_PERM_READ;
++            if (flags & X86_MMU_PG_RW) != 0 {
++                mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
++            }
++            if (flags & X86_MMU_PG_NX) == 0 {
++                mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
++            }
++            match flags & X86_MMU_PTE_PAT_MASK {
++                X86_MMU_PTE_PAT_WRITEBACK => mmu_flags |= ARCH_MMU_FLAG_CACHED,
++                X86_MMU_PTE_PAT_UNCACHABLE => mmu_flags |= ARCH_MMU_FLAG_UNCACHED,
++                X86_MMU_PTE_PAT_WRITE_COMBINING => mmu_flags |= ARCH_MMU_FLAG_WRITE_COMBINING,
++                _ => panic_unexpected_flags(flags),
++            }
++            return mmu_flags;
++        }
++
+         let mut mmu_flags: ArchMmuFlags = 0;
+ 
+         if (flags & X86_EPT_R) != 0 {
+diff --git a/zircon/kernel/arch/x86/src/registers.rs b/zircon/kernel/arch/x86/src/registers.rs
+index 50835e9539f..6811e656713 100644
+--- a/zircon/kernel/arch/x86/src/registers.rs
++++ b/zircon/kernel/arch/x86/src/registers.rs
+@@ -46,6 +46,7 @@ pub const X86_EFER_SCE: u64 = 0x00000001; /* enable SYSCALL */
+ pub const X86_EFER_LME: u64 = 0x00000100; /* long mode enable */
+ pub const X86_EFER_LMA: u64 = 0x00000400; /* long mode active */
+ pub const X86_EFER_NXE: u64 = 0x00000800; /* to enable execute disable bit */
++pub const X86_EFER_SVME: u64 = 0x00001000; /* AMD Secure Virtual Machine enable */
+ pub const X86_MSR_IA32_PLATFORM_ID: u32 = 0x00000017; /* platform id */
+ pub const X86_MSR_IA32_APIC_BASE: u32 = 0x0000001b; /* APIC base physical address */
+ pub const X86_MSR_IA32_TSC_ADJUST: u32 = 0x0000003b; /* TSC adjust */
+@@ -138,6 +139,8 @@ pub const X86_MSR_IA32_X2APIC_DIV_CONF: u32 = 0x0000083E; /* x2APIC Divide Confi
+ pub const X86_MSR_IA32_X2APIC_SELF_IPI: u32 = 0x0000083F; /* x2APIC Self IPI Register (W/O) */
+ 
+ pub const X86_MSR_IA32_EFER: u32 = 0xc0000080; /* EFER */
++pub const X86_MSR_AMD_VM_CR: u32 = 0xc0010114; /* AMD SVM VM_CR */
++pub const X86_MSR_AMD_VM_HSAVE_PA: u32 = 0xc0010117; /* AMD SVM host save area PA */
+ pub const X86_MSR_IA32_STAR: u32 = 0xc0000081; /* system call address */
+ pub const X86_MSR_IA32_LSTAR: u32 = 0xc0000082; /* long mode call address */
+ pub const X86_MSR_IA32_CSTAR: u32 = 0xc0000083; /* ia32-e compat call address */

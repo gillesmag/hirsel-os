@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FUCHSIA="${ROOT}/third-party/fuchsia"
+BUILD_DIR="${FUCHSIA}/$(cat "${FUCHSIA}/.fx-build-dir")"
+SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+CLANG="${FUCHSIA}/prebuilt/third_party/clang/linux-x64/bin/clang"
+
+exec "$CLANG" \
+  --target=x86_64-unknown-fuchsia \
+  --sysroot="${SYSROOT}" \
+  -fuse-ld=lld \
+  -L"${SYSROOT}/lib" \
+  -L"${BUILD_DIR}/user.basic_x64-shared" \
+  -L"${BUILD_DIR}/user.libc_x64/link_stub" \
+  -L"${BUILD_DIR}/x64-shared/link_stub" \
+  -L"${FUCHSIA}/prebuilt/third_party/clang/linux-x64/lib/x86_64-unknown-fuchsia" \
+  "$@" \
+  -lfdio -lzircon

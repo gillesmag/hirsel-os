@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zbi",
+    "crates/zx-sys",
+    "crates/hirsel-proto",
+    "crates/hirsel-vmm",
+    "crates/hirsel-virtio",
+    "crates/hirsel-init",
+    "crates/hirsel-os-ctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"

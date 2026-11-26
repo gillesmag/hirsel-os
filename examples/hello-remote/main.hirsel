@@ -1,0 +1,43 @@
+// Arbitrary Hirsel program NOT baked into BOOTFS — compiled on the host by
+// `hirsel-os-ctl`, streamed over the framed control-plane API to a running
+// Zircon node, sealed into an immutable executable VMO, and run in Tier 1.
+
+fn fib(n: u64) -> u64 {
+    let mut a: u64 = 0
+    let mut b: u64 = 1
+    for _ in 0u64 .. n {
+        let next = a + b
+        a = b
+        b = next
+    }
+    a
+}
+
+pub fn main(out: Stdout, clock: Clock, rng: Random) -> Result[(), Exit] waits {
+    let t0 = host.mono_ns(clock)
+    let mut entropy: Bytes = list.with_capacity(8)
+    host.random(rng, mut entropy)
+    let f40 = fib(40u64)
+    let t1 = host.mono_ns(clock)
+
+    let os = match target.os {
+        Fuchsia => "Zircon/Fuchsia",
+        Linux => "Linux",
+        Macos => "macOS",
+    }
+
+    let mut msg = string.new()
+    string.push(mut msg, "REMOTE HIRSEL EXECUTION SUCCEEDED on ")
+    string.push(mut msg, os)
+    string.push(mut msg, "!\n")
+    string.push(mut msg, "  fib(40) = ")
+    string.push_u64(mut msg, f40)
+    string.push(mut msg, "\n  cprng   = 0x")
+    string.push(mut msg, std.hex.encode(entropy))
+    string.push(mut msg, "\n  runtime = ")
+    string.push_u64(mut msg, t1 - t0)
+    string.push(mut msg, " ns\n")
+
+    let _ = stdout.write(out, msg)
+    Ok(())
+}

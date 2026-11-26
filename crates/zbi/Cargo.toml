@@ -1,0 +1,9 @@
+[package]
+name = "zbi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zbi"
+path = "src/main.rs"

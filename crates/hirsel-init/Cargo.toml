@@ -1,0 +1,12 @@
+[package]
+name = "hirsel-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zx-sys = { path = "../zx-sys" }
+hirsel-proto = { path = "../hirsel-proto" }
+hirsel-vmm = { path = "../hirsel-vmm" }
+hirsel-virtio = { path = "../hirsel-virtio" }
+smoltcp = { version = "0.13.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "auto-icmp-echo-reply"] }

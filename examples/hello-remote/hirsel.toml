@@ -1,0 +1,15 @@
+[package]
+name = "hello_remote"
+major = 1
+charge = "charge-v1"
+
+[dependencies]
+std = { major = 1 }
+
+[sources]
+"main.hirsel" = "main"
+
+[program]
+module = "main"
+limit = 16777216
+grants = ["Stdout", "Clock", "Random"]

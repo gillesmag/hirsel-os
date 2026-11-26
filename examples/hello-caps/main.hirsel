@@ -1,0 +1,88 @@
+// Tier 1 Hirsel capability showcase on Hirsel-OS (Zircon):
+// Exercises Args, Env (attenuated to HIRSEL_*), persistent Zircon-channel Dir
+// (backed by virtio-blk HRSLFS01 across job runs and cold reboots), Clock, Random, Stdout.
+
+pub fn main(
+    out: Stdout,
+    d: Dir,
+    argv: Args,
+    e: Env,
+    clock: Clock,
+    rng: Random,
+) -> Result[(), Exit] waits {
+    let t0 = host.mono_ns(clock)
+
+    let mut entropy: Bytes = list.with_capacity(8)
+    host.random(rng, mut entropy)
+
+    // 1. Read attenuated Env capability (only HIRSEL_* is visible).
+    let mut role = string.new()
+    match env.get(e, "HIRSEL_ROLE") {
+        Ok(Some(v)) => string.push(mut role, v),
+        Ok(None) => string.push(mut role, "(unset)"),
+        Error(_) => string.push(mut role, "(denied)"),
+    }
+
+    // 2. Read persistent state from Zircon-channel Dir capability (virtio-blk backed).
+    let mut prev_state = string.new()
+    let open_res = host.open(d, "state.txt", Read)
+    match take open_res {
+        Ok(f) => {
+            let mut fh = take f
+            let mut buf: Bytes = list.with_capacity(256)
+            let _ = host.read(mut fh, mut buf)
+            let _ = host.close(take fh)
+            match string.from_utf8(take buf) {
+                Ok(s) => string.push(mut prev_state, s),
+                Error(_) => string.push(mut prev_state, "(binary)"),
+            }
+        }
+        Error(_) => string.push(mut prev_state, "(none - first run)"),
+    }
+
+    // 3. Persist new state containing current role & first arg to virtio-blk via Dir channel.
+    let mut next_state = string.new()
+    string.push(mut next_state, "role=")
+    string.push(mut next_state, role)
+    string.push(mut next_state, ",arg0=")
+    match args.get(argv, 0u64) {
+        Some(a) => string.push(mut next_state, a),
+        None => string.push(mut next_state, "(none)"),
+    }
+
+    let mut wf = result.unwrap(host.open(d, "state.txt", Write))
+    let _ = host.write(mut wf, string.as_bytes(next_state))
+    let _ = host.sync(mut wf)
+    let _ = host.close(take wf)
+
+    let t1 = host.mono_ns(clock)
+
+    let mut msg = string.new()
+    string.push(mut msg, "TIER 1 CAPABILITY GRANT TEST SUCCEEDED!\n")
+    string.push(mut msg, "  args (")
+    string.push_u64(mut msg, args.len(argv))
+    string.push(mut msg, "): ")
+    for i in 0u64 .. args.len(argv) {
+        if i > 0u64 {
+            string.push(mut msg, ", ")
+        }
+        match args.get(argv, i) {
+            Some(a) => string.push(mut msg, a),
+            None => {}
+        }
+    }
+    string.push(mut msg, "\n  env HIRSEL_ROLE: ")
+    string.push(mut msg, role)
+    string.push(mut msg, "\n  dir prev state:  ")
+    string.push(mut msg, prev_state)
+    string.push(mut msg, "\n  dir saved state: ")
+    string.push(mut msg, next_state)
+    string.push(mut msg, "\n  cprng:           0x")
+    string.push(mut msg, std.hex.encode(entropy))
+    string.push(mut msg, "\n  elapsed:         ")
+    string.push_u64(mut msg, t1 - t0)
+    string.push(mut msg, " ns\n")
+
+    let _ = stdout.write(out, msg)
+    Ok(())
+}
