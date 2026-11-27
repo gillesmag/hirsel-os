@@ -27,7 +27,7 @@ done
 
 hostname "$VM_NAME"
 echo "127.0.0.1 localhost $VM_NAME" > /etc/hosts
-echo "nameserver $VM_DNS" > /etc/resolv.conf
+printf "nameserver %s\nnameserver 1.1.1.1\n" "$VM_DNS" > /etc/resolv.conf
 
 ip link set lo up 2>/dev/null || true
 ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true

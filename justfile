@@ -288,9 +288,9 @@ build-linux-ssh-initrd: build-dropbear
     entry("etc/group", stat.S_IFREG | 0o644, data=b"root:x:0:\n")
     entry("etc/shadow", stat.S_IFREG | 0o600, data=b"root:*:19000:0:99999:7:::\n")
     entry("etc/shells", stat.S_IFREG | 0o644, data=b"/bin/sh\n/bin/ash\n")
-    entry("etc/nsswitch.conf", stat.S_IFREG | 0o644, data=b"passwd: files\ngroup: files\nhosts: files\n")
+    entry("etc/nsswitch.conf", stat.S_IFREG | 0o644, data=b"passwd: files\ngroup: files\nhosts: files dns\n")
     entry("etc/hosts", stat.S_IFREG | 0o644, data=b"127.0.0.1 localhost\n")
-    entry("etc/resolv.conf", stat.S_IFREG | 0o644, data=b"nameserver 10.0.2.3\n")
+    entry("etc/resolv.conf", stat.S_IFREG | 0o644, data=b"nameserver 10.0.2.3\nnameserver 1.1.1.1\n")
     entry("root/.ssh/authorized_keys", stat.S_IFREG | 0o600, data=auth_keys)
     entry("TRAILER!!!", 0)
     while len(out) % 512: out.append(0)
@@ -926,9 +926,8 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     grep -q "10.0.3.2/24" <<<"$SSH_OUT"
     grep -q "2 packets received" <<<"$SSH_OUT"
 
-    echo "=== 5. REAL OUTBOUND SSH & ICMP from inside Linux 6.1.102 VM through Hirsel-OS NAT! ==="
-    # Verify outbound TCP+ICMP NAT: SSH from INSIDE dev-1 (`10.0.3.2`) -> NAT (`10.0.2.15`) ->
-    # QEMU SLIRP host (`10.0.2.2:12222`, which loops right back to dev-1's SSH server, or any external host!).
+    echo "=== 5. REAL OUTBOUND DNS, ICMP & SSH from inside Linux 6.1.102 VM through Hirsel-OS NAT! ==="
+    # Verify outbound UDP DNS (`10.0.2.3`), ICMP (`10.0.2.2`), and TCP SSH from INSIDE dev-1!
     OUT_KEY_B64="$(base64 -w0 "{{out_dir}}/linux/id_ed25519")"
     OUTBOUND_OUT="$(
       ssh \
@@ -939,13 +938,16 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
         -o LogLevel=ERROR \
         -p "${SSH_PORT}" \
         root@127.0.0.1 \
-        "echo '${OUT_KEY_B64}' | base64 -d > /tmp/id_openssh && \
+        "nslookup example.com && \
+         ping -c 1 -W 3 example.com && \
+         echo '${OUT_KEY_B64}' | base64 -d > /tmp/id_openssh && \
          chmod 600 /tmp/id_openssh && \
          dropbearconvert openssh dropbear /tmp/id_openssh /tmp/id_dropbear && \
          ping -c 2 -W 2 10.0.2.2 && \
          ssh -y -i /tmp/id_dropbear -p ${SSH_PORT} root@10.0.2.2 'echo OUTBOUND_SSH_OK && uname -r && hostname'"
     )"
     printf '%s\n' "$OUTBOUND_OUT"
+    grep -q "Name:.*example.com" <<<"$OUTBOUND_OUT"
     grep -q "2 packets received" <<<"$OUTBOUND_OUT"
     grep -q "OUTBOUND_SSH_OK" <<<"$OUTBOUND_OUT"
     grep -q "6.1.102" <<<"$OUTBOUND_OUT"

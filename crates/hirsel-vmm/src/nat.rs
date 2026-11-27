@@ -13,6 +13,7 @@ pub const NAT_PORT_MAX: u16 = 59_999;
 
 const ETH_HDR_LEN: usize = 14;
 const ETH_TYPE_IPV4: u16 = 0x0800;
+const ETH_TYPE_ARP: u16 = 0x0806;
 const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
@@ -29,8 +30,9 @@ struct NatEntry {
 /// Stateful IPv4 NAPT (NAT/MASQUERADE) table shared across all running MicroVMs.
 pub struct NatEngine {
     outer_ip: [u8; 4],
+    outer_gw_ip: [u8; 4],
     outer_mac: [u8; 6],
-    outer_gw_mac: Option<[u8; 6]>,
+    outer_arp: HashMap<[u8; 4], [u8; 6]>,
     vm_gw_mac: [u8; 6],
     next_port: u16,
     tick: u64,
@@ -42,11 +44,20 @@ pub struct NatEngine {
 
 impl NatEngine {
     pub fn new(outer_ip: [u8; 4], outer_mac: [u8; 6], vm_gw_mac: [u8; 6]) -> Self {
+        let outer_gw_ip = [outer_ip[0], outer_ip[1], outer_ip[2], 2];
+        let mut outer_arp = HashMap::new();
+        // Pre-seed QEMU SLIRP gateway (10.0.2.2) & DNS resolver (10.0.2.3) MACs;
+        // dynamically updated from any incoming ARP/IPv4 frames on the outer subnet.
+        outer_arp.insert(outer_gw_ip, [0x52, 0x55, outer_ip[0], outer_ip[1], outer_ip[2], 2]);
+        outer_arp.insert(
+            [outer_ip[0], outer_ip[1], outer_ip[2], 3],
+            [0x52, 0x55, outer_ip[0], outer_ip[1], outer_ip[2], 3],
+        );
         Self {
             outer_ip,
+            outer_gw_ip,
             outer_mac,
-            // Default QEMU SLIRP gateway MAC (52:55:0a:00:02:02); overridden automatically on first RX.
-            outer_gw_mac: Some([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
+            outer_arp,
             vm_gw_mac,
             next_port: NAT_PORT_MIN,
             tick: 0,
@@ -55,16 +66,41 @@ impl NatEngine {
         }
     }
 
-    /// Learns the upstream router / QEMU SLIRP MAC address from incoming outer Ethernet frames.
+    /// Learns L2 MAC addresses for peers on the outer subnet (e.g. gateway `10.0.2.2`
+    /// and SLIRP DNS `10.0.2.3`) from incoming ARP and IPv4 frames.
     pub fn learn_outer_gw(&mut self, frame: &[u8]) {
         if frame.len() < ETH_HDR_LEN {
             return;
         }
-        let src: [u8; 6] = frame[6..12].try_into().unwrap();
-        // Ignore broadcast/multicast/zero/self source MACs.
-        if (src[0] & 1) == 0 && src != [0; 6] && src != self.outer_mac {
-            self.outer_gw_mac = Some(src);
+        let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        if (src_mac[0] & 1) != 0 || src_mac == [0; 6] || src_mac == self.outer_mac {
+            return;
         }
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        let sender_ip: Option<[u8; 4]> = if ethertype == ETH_TYPE_IPV4 && frame.len() >= ETH_HDR_LEN + 20 {
+            Some(frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].try_into().unwrap())
+        } else if ethertype == ETH_TYPE_ARP && frame.len() >= ETH_HDR_LEN + 28 {
+            Some(frame[ETH_HDR_LEN + 14..ETH_HDR_LEN + 18].try_into().unwrap())
+        } else {
+            None
+        };
+        if let Some(ip) = sender_ip {
+            // Only cache on-link /24 neighbors so off-subnet routed replies map to outer_gw_ip.
+            if ip[0..3] == self.outer_ip[0..3] {
+                self.outer_arp.insert(ip, src_mac);
+            } else {
+                self.outer_arp.insert(self.outer_gw_ip, src_mac);
+            }
+        }
+    }
+
+    fn resolve_outer_dst_mac(&self, dst_ip: [u8; 4]) -> Option<[u8; 6]> {
+        if dst_ip[0..3] == self.outer_ip[0..3] {
+            if let Some(&mac) = self.outer_arp.get(&dst_ip) {
+                return Some(mac);
+            }
+        }
+        self.outer_arp.get(&self.outer_gw_ip).copied()
     }
 
     pub fn remove_vm(&mut self, vm_id: &str) {
@@ -173,7 +209,8 @@ impl NatEngine {
         if !Self::should_nat_outbound(frame, vm_gw_ip) {
             return None;
         }
-        let gw_mac = self.outer_gw_mac?;
+        let dst_ip: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+        let dst_mac = self.resolve_outer_dst_mac(dst_ip)?;
         let ihl = ((frame[ETH_HDR_LEN] & 0x0F) as usize) * 4;
         if ihl < 20 || frame.len() < ETH_HDR_LEN + ihl {
             return None;
@@ -234,7 +271,7 @@ impl NatEngine {
         }
 
         // Rewrite outer Ethernet header.
-        out[0..6].copy_from_slice(&gw_mac);
+        out[0..6].copy_from_slice(&dst_mac);
         out[6..12].copy_from_slice(&self.outer_mac);
         Some(out)
     }
