@@ -1,0 +1,5 @@
+# Hirsel-OS Desktop product definition (Zircon + Native Fuchsia Flatland + Native Chromium 160 + Pure-Hirsel WM).
+
+bazel_product_bundle_prefix = "//products/hirsel_desktop:hirsel_desktop"
+
+fxfs_blob = true

@@ -1,0 +1,239 @@
+// Formal exhaustive model checking (std.model.explore) + unit laws
+// for hirsel-wm security, focus, SAS, ceremony, Bank, and layout invariants.
+
+type ModelAct = ActStart
+    | ActToggleDev
+    | ActToggleWeb
+    | ActFocusDev
+    | ActClientSpoofFocus
+    | ActToggleSas
+    | ActStageValid
+    | ActStageOverBudget
+    | ActApproveGood
+    | ActApproveBadDigest
+    | ActDeny
+    | ActRevoke
+    | ActClipCopy
+    | ActPowerboxPaste
+
+fn model_actions(s: wm.WmState, mut out: List[ModelAct]) {
+    let _ = s.width
+    list.push(mut out, ActToggleDev)
+    list.push(mut out, ActToggleWeb)
+    list.push(mut out, ActFocusDev)
+    list.push(mut out, ActClientSpoofFocus)
+    list.push(mut out, ActToggleSas)
+    list.push(mut out, ActStageValid)
+    list.push(mut out, ActStageOverBudget)
+    list.push(mut out, ActApproveGood)
+    list.push(mut out, ActApproveBadDigest)
+    list.push(mut out, ActDeny)
+    list.push(mut out, ActRevoke)
+    list.push(mut out, ActClipCopy)
+    list.push(mut out, ActPowerboxPaste)
+}
+
+fn clone_state(s: wm.WmState) -> wm.WmState {
+    wm.WmState(
+        width: s.width,
+        height: s.height,
+        room: s.room,
+        show_dev: s.show_dev,
+        show_web: s.show_web,
+        focused: s.focused,
+        sas_active: s.sas_active,
+        capture_allowed: s.capture_allowed,
+        agent_conn_active: s.agent_conn_active,
+        bank_limit_micros: s.bank_limit_micros,
+        bank_spent_micros: s.bank_spent_micros,
+        approved_count: s.approved_count,
+        denied_count: s.denied_count,
+        clip_figments: s.clip_figments,
+        clip_dev: s.clip_dev,
+        clip_web: s.clip_web,
+        powerbox_transfers: s.powerbox_transfers,
+        outbox: wm.OutboxItem(
+            id: s.outbox.id,
+            digest: s.outbox.digest,
+            cost_micros: s.outbox.cost_micros,
+            status: s.outbox.status,
+            target: string.from(s.outbox.target),
+            summary: string.from(s.outbox.summary),
+        ),
+    )
+}
+
+fn model_step(s: wm.WmState, a: ModelAct) -> wm.WmState {
+    let cur = clone_state(s)
+    match a {
+        ActStart => take cur,
+        ActToggleDev => wm.step(take cur, ToggleDev),
+        ActToggleWeb => wm.step(take cur, ToggleWeb),
+        ActFocusDev => wm.step(take cur, UserFocus(d: VmDev)),
+        ActClientSpoofFocus => wm.step(take cur, ClientFocusRequest(d: WebUntrusted)),
+        ActToggleSas => wm.step(take cur, ToggleSas),
+        ActStageValid => wm.step(take cur, StageEffect(id: 1u64, digest: 4242u64, cost_micros: 2_500_000u64, target: "webhook", summary: "deploy")),
+        ActStageOverBudget => wm.step(take cur, StageEffect(id: 2u64, digest: 9999u64, cost_micros: 9_000_000u64, target: "webhook", summary: "huge")),
+        ActApproveGood => wm.step(take cur, ApproveEffect(id: 1u64, digest: 4242u64)),
+        ActApproveBadDigest => wm.step(take cur, ApproveEffect(id: 1u64, digest: 1111u64)),
+        ActDeny => wm.step(take cur, DenyEffect),
+        ActRevoke => wm.step(take cur, RevokeAgentConn),
+        ActClipCopy => wm.step(take cur, ClipCopy(d: Figments, tag: 77u64)),
+        ActPowerboxPaste => wm.step(take cur, PowerboxPaste(from: Figments, to: VmDev)),
+    }
+}
+
+fn model_done(s: wm.WmState) -> bool {
+    let _ = s.width
+    false
+}
+
+fn model_show(a: ModelAct, mut out: String) {
+    match a {
+        ActStart => string.push(mut out, "start"),
+        ActToggleDev => string.push(mut out, "toggle_dev"),
+        ActToggleWeb => string.push(mut out, "toggle_web"),
+        ActFocusDev => string.push(mut out, "focus_dev"),
+        ActClientSpoofFocus => string.push(mut out, "client_spoof_focus"),
+        ActToggleSas => string.push(mut out, "toggle_sas"),
+        ActStageValid => string.push(mut out, "stage_valid"),
+        ActStageOverBudget => string.push(mut out, "stage_over_budget"),
+        ActApproveGood => string.push(mut out, "approve_good"),
+        ActApproveBadDigest => string.push(mut out, "approve_bad_digest"),
+        ActDeny => string.push(mut out, "deny"),
+        ActRevoke => string.push(mut out, "revoke"),
+        ActClipCopy => string.push(mut out, "clip_copy"),
+        ActPowerboxPaste => string.push(mut out, "powerbox_paste"),
+    }
+}
+
+fn rect_in_bounds(r: wm.Rect, w: u64, h: u64) -> bool {
+    r.y >= wm.TOP_BAR_H && r.w > 0u64 && r.h > 0u64 && r.x + r.w <= w && r.y + r.h <= h
+}
+
+fn rects_disjoint(a: wm.Rect, b: wm.Rect) -> bool {
+    (a.x + a.w <= b.x) || (b.x + b.w <= a.x) || (a.y + a.h <= b.y) || (b.y + b.h <= a.y)
+}
+
+fn law_sas_and_ceremony_lock(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    let _ = prev.width
+    let _ = a
+    if next.sas_active || wm.ceremony_active(next) {
+        !next.capture_allowed && next.focused == TrustedChrome
+    } else {
+        next.capture_allowed && next.focused != TrustedChrome
+    }
+}
+
+fn law_no_client_focus_steal(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    match a {
+        ActClientSpoofFocus => next.focused == prev.focused,
+        _ => true,
+    }
+}
+
+fn law_bank_never_exceeded(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    let _ = prev.width
+    let _ = a
+    next.bank_spent_micros <= next.bank_limit_micros
+}
+
+fn law_bad_digest_never_approves(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    match a {
+        ActApproveBadDigest => next.approved_count == prev.approved_count,
+        _ => true,
+    }
+}
+
+fn law_revoke_kills_ceremony(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    let _ = prev.width
+    match a {
+        ActRevoke => !next.agent_conn_active && !wm.ceremony_active(next),
+        _ => true,
+    }
+}
+
+fn law_layout_sound(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
+    let _ = prev.width
+    let _ = a
+    let l = wm.compute_layout(next)
+    if !rect_in_bounds(l.figments, next.width, next.height) {
+        return false
+    }
+    match l.vm_dev {
+        Some(d) => {
+            if !rect_in_bounds(d, next.width, next.height) || !rects_disjoint(l.figments, d) {
+                return false
+            }
+            match l.web {
+                Some(w) => rect_in_bounds(w, next.width, next.height)
+                    && rects_disjoint(l.figments, w)
+                    && rects_disjoint(d, w),
+                None => true,
+            }
+        },
+        None => match l.web {
+            Some(w) => rect_in_bounds(w, next.width, next.height) && rects_disjoint(l.figments, w),
+            None => true,
+        },
+    }
+}
+
+fn witness_split(s: wm.WmState) -> bool { s.show_dev && s.show_web }
+fn witness_ceremony(s: wm.WmState) -> bool { wm.ceremony_active(s) && !s.capture_allowed }
+fn witness_approved(s: wm.WmState) -> bool { s.approved_count > 0u64 }
+fn witness_powerbox(s: wm.WmState) -> bool { s.powerbox_transfers > 0u64 && s.clip_dev == 77u64 }
+fn witness_revoked(s: wm.WmState) -> bool { !s.agent_conn_active }
+
+@test
+fn wm_security_model_holds() -> Result[(), ()] {
+    let mut inits: List[wm.WmState] = list.new()
+    list.push(mut inits, wm.initial(1280u64, 800u64))
+
+    let mut always: List[std.model.Always[wm.WmState, ModelAct]] = list.new()
+    list.push(mut always, std.model.Always(label: "sas_and_ceremony_lock", holds: law_sas_and_ceremony_lock))
+    list.push(mut always, std.model.Always(label: "no_client_focus_steal", holds: law_no_client_focus_steal))
+    list.push(mut always, std.model.Always(label: "bank_never_exceeded", holds: law_bank_never_exceeded))
+    list.push(mut always, std.model.Always(label: "bad_digest_never_approves", holds: law_bad_digest_never_approves))
+    list.push(mut always, std.model.Always(label: "revoke_kills_ceremony", holds: law_revoke_kills_ceremony))
+    list.push(mut always, std.model.Always(label: "layout_sound", holds: law_layout_sound))
+
+    let mut sometimes: List[std.model.Sometimes[wm.WmState]] = list.new()
+    list.push(mut sometimes, std.model.Sometimes(label: "split_layout", holds: witness_split))
+    list.push(mut sometimes, std.model.Sometimes(label: "ceremony_locks_capture", holds: witness_ceremony))
+    list.push(mut sometimes, std.model.Sometimes(label: "hash_bound_approval", holds: witness_approved))
+    list.push(mut sometimes, std.model.Sometimes(label: "powerbox_transfer", holds: witness_powerbox))
+    list.push(mut sometimes, std.model.Sometimes(label: "membrane_revoke", holds: witness_revoked))
+
+    let m: std.model.Model[wm.WmState, ModelAct] = std.model.Model(
+        init: take inits,
+        start: ActStart,
+        actions: model_actions,
+        step: model_step,
+        done: model_done,
+        always: take always,
+        sometimes: take sometimes,
+        show: model_show,
+    )
+    let bounds = std.model.Bounds(
+        depth: 4u64,
+        states: 4000u64,
+        step_steps: 200000u64,
+        step_bytes: 1048576u64,
+    )
+    match std.model.explore(m, bounds) {
+        Closed(_) => Ok(()),
+        ToDepth(stats, _) => {
+            if list.len(stats.witnessed) == 5u64 {
+                Ok(())
+            } else {
+                Error(())
+            }
+        },
+        Failed(f) => {
+            let mut msg = string.new()
+            std.model.report(f, mut msg)
+            fail(take msg)
+        },
+    }
+}

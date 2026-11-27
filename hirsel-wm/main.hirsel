@@ -1,0 +1,148 @@
+// hirsel-wm daemon entrypoint: reads line-delimited control events from Stdin
+// and emits deterministic ScenePlan JSON lines to Stdout.
+//
+// Zero network, zero filesystem, zero Exec: runs inside a policy-locked
+// Tier-1 Zircon Job spawned by hirsel-shell.
+
+fn parse_domain(s: String) -> Option[wm.Domain] {
+    if s == "figments" { return Some(Figments) }
+    if s == "vm_dev" { return Some(VmDev) }
+    if s == "web_untrusted" { return Some(WebUntrusted) }
+    if s == "trusted_chrome" { return Some(TrustedChrome) }
+    None
+}
+
+fn parse_u64_or(s: String, fallback: u64) -> u64 {
+    match int.parse_uint(s, 10u32) {
+        Ok(n) => n,
+        Error(_) => fallback,
+    }
+}
+
+fn split_fields(line: String) -> List[String] {
+    let mut parts: List[String] = list.new()
+    let mut cur = string.from(line)
+    loop {
+        let mut next_cur: Option[String] = None
+        match string.split_once(cur, " ") {
+            Some((head, tail)) => {
+                let h = string.from(head)
+                if string.byte_len(h) > 0u64 {
+                    list.push(mut parts, take h)
+                }
+                next_cur = Some(string.from(tail))
+            },
+            None => {},
+        }
+        match take next_cur {
+            Some(take t) => { cur = take t },
+            None => {
+                if string.byte_len(cur) > 0u64 {
+                    list.push(mut parts, take cur)
+                }
+                break
+            },
+        }
+    }
+    take parts
+}
+
+fn parse_event(raw: String) -> Option[wm.Event] {
+    let trimmed = string.from(string.trim_ascii(raw))
+    if string.byte_len(trimmed) == 0u64 {
+        return None
+    }
+    let parts = split_fields(take trimmed)
+    if list.len(parts) == 0u64 {
+        return None
+    }
+    let cmd = string.from(parts[0u64])
+    if cmd == "RESIZE" && list.len(parts) >= 3u64 {
+        let w = parse_u64_or(string.from(parts[1u64]), 1280u64)
+        let h = parse_u64_or(string.from(parts[2u64]), 800u64)
+        return Some(Resize(w: w, h: h))
+    }
+    if cmd == "TOGGLE_DEV" { return Some(ToggleDev) }
+    if cmd == "TOGGLE_WEB" { return Some(ToggleWeb) }
+    if cmd == "TOGGLE_SAS" { return Some(ToggleSas) }
+    if cmd == "TOGGLE_ROOM" { return Some(ToggleRoom) }
+    if cmd == "DENY" { return Some(DenyEffect) }
+    if cmd == "REVOKE" { return Some(RevokeAgentConn) }
+    if cmd == "RESTORE" { return Some(RestoreAgentConn) }
+    if cmd == "FOCUS" && list.len(parts) >= 2u64 {
+        match parse_domain(string.from(parts[1u64])) {
+            Some(d) => return Some(UserFocus(d: d)),
+            None => return None,
+        }
+    }
+    if cmd == "CLIENT_FOCUS" && list.len(parts) >= 2u64 {
+        match parse_domain(string.from(parts[1u64])) {
+            Some(d) => return Some(ClientFocusRequest(d: d)),
+            None => return None,
+        }
+    }
+    if cmd == "STAGE" && list.len(parts) >= 6u64 {
+        let id = parse_u64_or(string.from(parts[1u64]), 1u64)
+        let digest = parse_u64_or(string.from(parts[2u64]), 0u64)
+        let cost = parse_u64_or(string.from(parts[3u64]), 0u64)
+        let target = string.from(parts[4u64])
+        let summary = string.from(parts[5u64])
+        return Some(StageEffect(id: id, digest: digest, cost_micros: cost, target: take target, summary: take summary))
+    }
+    if cmd == "APPROVE" && list.len(parts) >= 3u64 {
+        let id = parse_u64_or(string.from(parts[1u64]), 0u64)
+        let digest = parse_u64_or(string.from(parts[2u64]), 0u64)
+        return Some(ApproveEffect(id: id, digest: digest))
+    }
+    if cmd == "CLIP_COPY" && list.len(parts) >= 3u64 {
+        let tag = parse_u64_or(string.from(parts[2u64]), 0u64)
+        match parse_domain(string.from(parts[1u64])) {
+            Some(d) => return Some(ClipCopy(d: d, tag: tag)),
+            None => return None,
+        }
+    }
+    if cmd == "POWERBOX_PASTE" && list.len(parts) >= 3u64 {
+        match parse_domain(string.from(parts[1u64])) {
+            Some(src) => match parse_domain(string.from(parts[2u64])) {
+                Some(dst) => return Some(PowerboxPaste(from: src, to: dst)),
+                None => return None,
+            },
+            None => return None,
+        }
+    }
+    None
+}
+
+pub fn main(input: Stdin, out: Stdout) -> Result[(), Exit] waits {
+    let mut state = wm.initial(1280u64, 800u64)
+    let _ = stdout.write(out, wm.render_scene_json(state))
+
+    let mut reader = std.io.lines(Stdin(input), 16384u64)
+
+    let mut buf = string.new()
+    loop {
+        string.clear(mut buf)
+        match std.io.read_line(mut reader, mut buf) {
+            Ok(true) => {
+                match parse_event(string.from(buf)) {
+                    Some(take ev) => {
+                        let next_state = wm.step(take state, take ev)
+                        state = take next_state
+                        let _ = stdout.write(out, wm.render_scene_json(state))
+                    },
+                    None => {},
+                }
+            },
+            Ok(false) => {
+                let _ = stdout.write(out, "{\"wm_exit\":\"eof\"}\n")
+                break
+            },
+            Error(_) => {
+                let _ = stdout.write(out, "{\"wm_exit\":\"read_error\"}\n")
+                break
+            },
+        }
+    }
+
+    Ok(())
+}

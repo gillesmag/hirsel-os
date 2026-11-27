@@ -1013,6 +1013,105 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
 test:
     cargo test --workspace
 
+# Run pure-Hirsel std.model.explore formal security verification for hirsel-wm
+test-wm hirsel_dir="/workspace/hirsel":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
+      "{{hirsel_dir}}/target/debug/hirsel" test "{{root}}/hirsel-wm" \
+        --libraries "{{hirsel_dir}}/core" --source-core --source-std \
+        --cc /usr/bin/cc \
+        --runtime "{{hirsel_dir}}/target/release/libhirsel_core_rt.a"
+
+# Cross-compile pure-Hirsel hirsel-wm to native x86_64-unknown-fuchsia ELF and stage into hirsel_session
+build-wm hirsel_dir="/workspace/hirsel":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt"
+    PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
+      "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/hirsel-wm" \
+        --libraries "{{hirsel_dir}}/core" --source-core --source-std \
+        --release --backend llvm --target x86_64-unknown-fuchsia \
+        --cc "{{root}}/scripts/fuchsia-clang" \
+        --runtime "{{root}}/target/hirsel-rt-fuchsia/x86_64-unknown-fuchsia/release/libhirsel_core_rt.a" \
+        --grant Stdin --grant Stdout --limit 67108864 \
+        -o "{{out_dir}}/hirsel-wm"
+    "$STRIP" --strip-all "{{out_dir}}/hirsel-wm"
+    cp "{{out_dir}}/hirsel-wm" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-wm"
+    ls -lh "{{out_dir}}/hirsel-wm"
+
+# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + hirsel-wm)
+build-desktop: build-wm
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
+    mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src"
+    cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
+    cd "{{fuchsia}}"
+    if git apply --check "{{root}}/patches/fuchsia-hirsel-desktop.patch" 2>/dev/null; then
+      git apply "{{root}}/patches/fuchsia-hirsel-desktop.patch"
+    fi
+    if [[ ! -f "out/hirsel-desktop.x64/args.gn" ]]; then
+      ORIG_BUILD_DIR="$(cat .fx-build-dir 2>/dev/null || echo out/bringup.x64-balanced)"
+      PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.x64 set hirsel_desktop.x64 --rbe-mode=off
+      echo "$ORIG_BUILD_DIR" > .fx-build-dir
+    fi
+    PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.x64 build //products/hirsel_desktop:hirsel_desktop.x64
+    ls -lh out/hirsel-desktop.x64/obj/products/hirsel_desktop/hirsel_desktop.x64/product_bundle/system_a/
+
+# Boot Hirsel-OS Desktop interactively in QEMU/KVM (VNC on :0 / port 5900, control API on :7780, Figments UI on :7711)
+boot-desktop vnc=":0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PB_SYS="{{fuchsia}}/out/hirsel-desktop.x64/obj/products/hirsel_desktop/hirsel_desktop.x64/product_bundle/system_a"
+    QEMU="{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/bin/qemu-system-x86_64"
+    DISK="{{out_dir}}/desktop-live.blk"
+    mkdir -p "{{out_dir}}"
+    if [[ ! -f "$DISK" || "${PB_SYS}/fxfs.sparse.blk" -nt "$DISK" ]]; then
+      python3 "{{root}}/scripts/unsparse_fxfs.py" "${PB_SYS}/fxfs.sparse.blk" "$DISK"
+    fi
+    ENTROPY="$(head -c 32 /dev/urandom | sha256sum | awk '{print $1}')"
+    echo "=== Booting Hirsel-OS Desktop (VNC={{vnc}}, Control=http://127.0.0.1:7780/_hirsel/state, UI=http://127.0.0.1:7711/) ==="
+    QEMU_ARGS=(
+      -L "{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/share/qemu"
+      -machine q35,smbios-entry-point-type=32,i8042=off
+      -m 4096M
+      -smp 4,threads=2
+      -device isa-debug-exit,iobase=0xf4,iosize=0x04
+      -fw_cfg name=etc/sercon-port,string=0
+      -drive "file=${DISK},format=raw,if=none,id=vdisk,cache=unsafe"
+      -object iothread,id=iothread0
+      -device virtio-blk-pci,drive=vdisk,iothread=iothread0
+      -netdev "type=user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:7780-:7780,hostfwd=tcp:127.0.0.1:7711-:7711"
+      -device "virtio-net-pci,vectors=8,romfile=,netdev=net0,mac=52:54:00:63:5e:7a,addr=0x4"
+      -device virtio-gpu-pci,xres=1280,yres=800
+      -device virtio-keyboard-pci
+      -device virtio-mouse-pci
+      -vga none
+      -vnc "{{vnc}}"
+      -parallel none
+      -audiodev none,id=snd0
+      -serial mon:stdio
+      -kernel "${PB_SYS}/linux-x86-boot-shim.bin"
+      -initrd "${PB_SYS}/fuchsia.zbi"
+      -append "kernel.serial=legacy kernel.entropy-mixin=${ENTROPY} kernel.halt-on-panic=true kernel.lockup-detector.critical-section-fatal-threshold-ms=0 kernel.lockup-detector.heartbeat-age-fatal-threshold-ms=0 zircon.nodename=hirsel-desktop"
+    )
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      exec "$QEMU" -enable-kvm -cpu "host,migratable=no,+invtsc" "${QEMU_ARGS[@]}"
+    elif id -nG "$USER" | tr ' ' '\n' | grep -qx kvm; then
+      exec sg kvm -c "$(printf '%q ' "$QEMU" -enable-kvm -cpu "host,migratable=no,+invtsc" "${QEMU_ARGS[@]}")"
+    else
+      exec "$QEMU" -cpu "Haswell,+smap,-check,-fsgsbase" "${QEMU_ARGS[@]}"
+    fi
+
+# End-to-end automated QEMU/KVM desktop verification + framebuffer screenshot capture
+test-desktop:
+    python3 "{{root}}/scripts/test_desktop.py"
+
 # Inspect a ZBI container image
 zbi-list image:
     cargo run -p zbi -- list "{{image}}"

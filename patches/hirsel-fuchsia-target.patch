@@ -476,6 +476,625 @@ index 57887c525..92f97a1df 100644
              Self::Aarch64Linux => CAbi::Aapcs64,
              Self::Aarch64Darwin => CAbi::DarwinPcs,
          }
+diff --git a/crates/hirsel-core-net/src/host/mod.rs b/crates/hirsel-core-net/src/host/mod.rs
+index 46c50fe72..5aded3e81 100644
+--- a/crates/hirsel-core-net/src/host/mod.rs
++++ b/crates/hirsel-core-net/src/host/mod.rs
+@@ -3,10 +3,14 @@
+ //! compile time. Readiness has its own seam in `reactor`.
+ #[cfg(target_os = "macos")]
+ mod darwin;
++#[cfg(target_os = "fuchsia")]
++mod fuchsia;
+ #[cfg(target_os = "linux")]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ use darwin as provider;
++#[cfg(target_os = "fuchsia")]
++use fuchsia as provider;
+ #[cfg(target_os = "linux")]
+ use linux as provider;
+ 
+diff --git a/crates/hirsel-core-net/src/own_address/mod.rs b/crates/hirsel-core-net/src/own_address/mod.rs
+index 0a769f4be..6c3fc81c8 100644
+--- a/crates/hirsel-core-net/src/own_address/mod.rs
++++ b/crates/hirsel-core-net/src/own_address/mod.rs
+@@ -10,10 +10,14 @@ use std::sync::Mutex;
+ 
+ #[cfg(target_os = "macos")]
+ mod darwin;
++#[cfg(target_os = "fuchsia")]
++mod fuchsia;
+ #[cfg(target_os = "linux")]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ use darwin as source;
++#[cfg(target_os = "fuchsia")]
++use fuchsia as source;
+ #[cfg(target_os = "linux")]
+ use linux as source;
+ 
+diff --git a/crates/hirsel-core-net/src/reactor.rs b/crates/hirsel-core-net/src/reactor.rs
+index 4191239c0..fa9170c74 100644
+--- a/crates/hirsel-core-net/src/reactor.rs
++++ b/crates/hirsel-core-net/src/reactor.rs
+@@ -16,12 +16,16 @@ use std::{
+ };
+ #[cfg(target_os = "linux")]
+ pub(crate) mod epoll;
++#[cfg(target_os = "fuchsia")]
++pub(crate) mod fuchsia;
+ #[cfg(target_os = "macos")]
+ pub(crate) mod kqueue;
+ #[cfg(target_os = "linux")]
+ mod sendzc;
+ #[cfg(target_os = "linux")]
+ pub(crate) use epoll as sys;
++#[cfg(target_os = "fuchsia")]
++pub(crate) use fuchsia as sys;
+ #[cfg(target_os = "macos")]
+ pub(crate) use kqueue as sys;
+ mod plan;
+@@ -32,7 +36,7 @@ mod uring;
+ use crate::ready::{Event, Handle, Waker};
+ #[cfg(target_os = "linux")]
+ pub use sendzc::TxSlot;
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "fuchsia"))]
+ pub use sys::{FileEntry, TxSlot};
+ pub use udp_group::UdpMember;
+ #[cfg(target_os = "linux")]
+@@ -73,6 +77,8 @@ pub enum Reactor {
+     IoUring,
+     #[cfg(target_os = "macos")]
+     Kqueue,
++    #[cfg(target_os = "fuchsia")]
++    Fuchsia,
+ }
+ impl Reactor {
+     pub fn name(self) -> &'static str {
+@@ -83,6 +89,8 @@ impl Reactor {
+             Reactor::IoUring => "io_uring",
+             #[cfg(target_os = "macos")]
+             Reactor::Kqueue => "kqueue",
++            #[cfg(target_os = "fuchsia")]
++            Reactor::Fuchsia => "zircon-poll",
+         }
+     }
+     /// Whether its pollers are completion rings, which also complete a
+@@ -95,6 +103,8 @@ impl Reactor {
+             Reactor::IoUring => true,
+             #[cfg(target_os = "macos")]
+             Reactor::Kqueue => false,
++            #[cfg(target_os = "fuchsia")]
++            Reactor::Fuchsia => false,
+         }
+     }
+ }
+@@ -230,6 +240,11 @@ fn choose(_plan: ReactorPlan) -> Result<Reactor, String> {
+     }
+ }
+ 
++#[cfg(target_os = "fuchsia")]
++fn choose(_plan: ReactorPlan) -> Result<Reactor, String> {
++    Ok(Reactor::Fuchsia)
++}
++
+ #[cfg(target_os = "linux")]
+ fn choose(plan: ReactorPlan) -> Result<Reactor, String> {
+     {
+@@ -297,6 +312,9 @@ enum Backend {
+     /// The kqueue, whose wake is a user event in it.
+     #[cfg(target_os = "macos")]
+     Kqueue { kq: OwnedFd },
++    /// Fuchsia/Zircon poll+eventfd reactor.
++    #[cfg(target_os = "fuchsia")]
++    Fuchsia { selector: OwnedFd },
+ }
+ 
+ /// The backend's operations, installed by its constructor: a program that
+@@ -341,6 +359,8 @@ impl Poller {
+             Reactor::IoUring => Self::new_uring(),
+             #[cfg(target_os = "macos")]
+             Reactor::Kqueue => Self::new_readiness(),
++            #[cfg(target_os = "fuchsia")]
++            Reactor::Fuchsia => Self::new_readiness(),
+         }
+     }
+     #[cfg(target_os = "linux")]
+@@ -388,6 +408,8 @@ impl Poller {
+             Backend::Uring(_) => Reactor::IoUring,
+             #[cfg(target_os = "macos")]
+             Backend::Kqueue { .. } => Reactor::Kqueue,
++            #[cfg(target_os = "fuchsia")]
++            Backend::Fuchsia { .. } => Reactor::Fuchsia,
+         }
+     }
+     /// Watch `fd` for every direction under `tag`. epoll's interest takes
+@@ -476,6 +498,8 @@ impl Poller {
+             Backend::Uring(ring) => Handle(ring.ring.as_raw_fd()),
+             #[cfg(target_os = "macos")]
+             Backend::Kqueue { kq } => Handle(kq.as_raw_fd()),
++            #[cfg(target_os = "fuchsia")]
++            Backend::Fuchsia { selector } => Handle(selector.as_raw_fd()),
+         }
+     }
+     /// A descriptor-waited poller's wake, reported as a `WAKE` event; None
+@@ -488,6 +512,8 @@ impl Poller {
+             Backend::Uring(_) => None,
+             #[cfg(target_os = "macos")]
+             Backend::Kqueue { .. } => Some(Waker(self.waker_id())),
++            #[cfg(target_os = "fuchsia")]
++            Backend::Fuchsia { .. } => Some(Waker(self.waker_id())),
+         }
+     }
+     #[cfg(target_os = "linux")]
+diff --git a/crates/hirsel-core-net/src/udp/send.rs b/crates/hirsel-core-net/src/udp/send.rs
+index a845f1b12..01a314bfe 100644
+--- a/crates/hirsel-core-net/src/udp/send.rs
++++ b/crates/hirsel-core-net/src/udp/send.rs
+@@ -30,11 +30,11 @@ impl Control {
+         let length = header + data.len();
+         let padded = length.next_multiple_of(word);
+         assert!(offset + padded <= self.0.len());
+-        let cmsg = libc::cmsghdr {
+-            cmsg_len: length as _,
+-            cmsg_level: level,
+-            cmsg_type: kind,
+-        };
++        // SAFETY: `cmsghdr` is plain integer fields (with padding on musl/Fuchsia).
++        let mut cmsg: libc::cmsghdr = unsafe { std::mem::zeroed() };
++        cmsg.cmsg_len = length as _;
++        cmsg.cmsg_level = level;
++        cmsg.cmsg_type = kind;
+         // SAFETY: the checked control range holds a complete cmsg header.
+         unsafe {
+             self.0
+diff --git a/crates/hirsel-core-rt/src/fiber.rs b/crates/hirsel-core-rt/src/fiber.rs
+index f6c0c6991..41929e69a 100644
+--- a/crates/hirsel-core-rt/src/fiber.rs
++++ b/crates/hirsel-core-rt/src/fiber.rs
+@@ -26,6 +26,7 @@ pub(crate) fn commit_for_page(page: usize) -> usize {
+ const GROW: usize = 256 << 10;
+ /// Bytes kept at the top for the low-water word; a multiple of 16.
+ const HEADER: usize = 16;
++#[cfg(not(target_os = "fuchsia"))]
+ thread_local! {
+     static ALTERNATE: Alternate = Alternate::new();
+ }
+@@ -38,6 +39,7 @@ const FAULTS: [libc::c_int; 1] = [libc::SIGSEGV];
+ #[cfg(target_os = "macos")]
+ const FAULTS: [libc::c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
+ /// Each of `FAULTS`' handlers from before `arm`, in the same order.
++#[cfg(not(target_os = "fuchsia"))]
+ static PREVIOUS: OnceLock<[libc::sigaction; FAULTS.len()]> = OnceLock::new();
+ #[cfg(test)]
+ #[path = "fiber_stop_tests.rs"]
+@@ -92,6 +94,7 @@ pub(crate) fn room(bytes: usize) -> bool {
+         >= bytes
+         || end == 0
+ }
++#[cfg(not(target_os = "fuchsia"))]
+ pub(crate) fn arm() {
+     PREVIOUS.get_or_init(|| {
+         // SAFETY: initialized sigaction structures and a signal-compatible handler.
+@@ -111,6 +114,8 @@ pub(crate) fn arm() {
+     });
+     ALTERNATE.with(|_| ());
+ }
++#[cfg(target_os = "fuchsia")]
++pub(crate) fn arm() {}
+ fn page() -> usize {
+     // SAFETY: sysconf reads the kernel's immutable page size.
+     page_bytes(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+@@ -135,40 +140,75 @@ impl Stack {
+ 
+     pub(crate) fn new_with_reserve(reserve: usize) -> Self {
+         let page_bytes = page();
+-        let commit = commit_for_page(page_bytes);
+         let len = page_bytes + reserve;
+-        // SAFETY: fresh inaccessible private mapping, then enable only its top pages.
+-        unsafe {
+-            let raw = libc::mmap(
+-                std::ptr::null_mut(),
+-                len,
+-                libc::PROT_NONE,
+-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+-                -1,
+-                0,
+-            );
+-            if raw == libc::MAP_FAILED {
+-                crate::process::stop(b"HostMemory");
+-            }
+-            let top = raw.addr() + len;
+-            if libc::mprotect(
+-                raw.cast::<u8>().add(len - commit).cast(),
+-                commit,
+-                libc::PROT_READ | libc::PROT_WRITE,
+-            ) != 0
+-            {
+-                crate::process::stop(b"HostMemory");
++        #[cfg(target_os = "fuchsia")]
++        {
++            // Zircon demand-pages anonymous RW VMOs lazily without POSIX signals;
++            // keep only the bottom guard page PROT_NONE.
++            // SAFETY: fresh private anonymous mapping.
++            unsafe {
++                let raw = libc::mmap(
++                    std::ptr::null_mut(),
++                    len,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
++                    -1,
++                    0,
++                );
++                if raw == libc::MAP_FAILED {
++                    crate::process::stop(b"HostMemory");
++                }
++                if libc::mprotect(raw, page_bytes, libc::PROT_NONE) != 0 {
++                    crate::process::stop(b"HostMemory");
++                }
++                let guard_end = raw.addr() + page_bytes;
++                let top = raw.addr() + len;
++                low_word(top).write(guard_end);
++                return Self {
++                    base: NonNull::new_unchecked(raw.cast()),
++                    len,
++                    guard_end,
++                    #[cfg(any(test, feature = "memcheck"))]
++                    valgrind: 0,
++                };
+             }
+-            low_word(top).write(top - commit);
+-            Self {
+-                base: NonNull::new_unchecked(raw.cast()),
+-                len,
+-                guard_end: raw.addr() + page_bytes,
+-                #[cfg(any(test, feature = "memcheck"))]
+-                valgrind: hirsel_stack::stack_register(
+-                    raw.cast::<u8>().add(page_bytes),
+-                    raw.cast::<u8>().add(len),
+-                ),
++        }
++        #[cfg(not(target_os = "fuchsia"))]
++        {
++            let commit = commit_for_page(page_bytes);
++            // SAFETY: fresh inaccessible private mapping, then enable only its top pages.
++            unsafe {
++                let raw = libc::mmap(
++                    std::ptr::null_mut(),
++                    len,
++                    libc::PROT_NONE,
++                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
++                    -1,
++                    0,
++                );
++                if raw == libc::MAP_FAILED {
++                    crate::process::stop(b"HostMemory");
++                }
++                let top = raw.addr() + len;
++                if libc::mprotect(
++                    raw.cast::<u8>().add(len - commit).cast(),
++                    commit,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                ) != 0
++                {
++                    crate::process::stop(b"HostMemory");
++                }
++                low_word(top).write(top - commit);
++                Self {
++                    base: NonNull::new_unchecked(raw.cast()),
++                    len,
++                    guard_end: raw.addr() + page_bytes,
++                    #[cfg(any(test, feature = "memcheck"))]
++                    valgrind: hirsel_stack::stack_register(
++                        raw.cast::<u8>().add(page_bytes),
++                        raw.cast::<u8>().add(len),
++                    ),
++                }
+             }
+         }
+     }
+@@ -310,6 +350,7 @@ impl Stack {
+ /// `guard_end` and whose reservation ends at `top`, with one fresh inaccessible
+ /// mapping. Out of line, and given plain addresses, so recycling a shallow
+ /// stack stays inlined and keeps the stack in registers.
++#[cfg(not(target_os = "fuchsia"))]
+ #[cold]
+ #[inline(never)]
+ fn release(guard_end: usize, top: usize, committed: usize) {
+@@ -329,6 +370,15 @@ fn release(guard_end: usize, top: usize, committed: usize) {
+         *low_word(top) = committed;
+     }
+ }
++#[cfg(target_os = "fuchsia")]
++#[cold]
++#[inline(never)]
++fn release(guard_end: usize, _top: usize, committed: usize) {
++    if committed > guard_end {
++        // SAFETY: the stack is idle; decommit pages below `committed` while keeping RW mapping.
++        unsafe { crate::host::sys::discard(guard_end, committed - guard_end) };
++    }
++}
+ /// The low-water word of the stack whose reservation ends at `top`.
+ fn low_word(top: usize) -> *mut usize {
+     std::ptr::with_exposed_provenance_mut::<usize>(top - size_of::<usize>())
+@@ -444,10 +494,12 @@ impl Drop for Stock {
+     }
+ }
+ 
++#[cfg(not(target_os = "fuchsia"))]
+ struct Alternate {
+     stack: Stack,
+     previous: libc::stack_t,
+ }
++#[cfg(not(target_os = "fuchsia"))]
+ impl Alternate {
+     fn new() -> Self {
+         let commit = commit_for_page(page());
+@@ -467,6 +519,7 @@ impl Alternate {
+         }
+     }
+ }
++#[cfg(not(target_os = "fuchsia"))]
+ impl Drop for Alternate {
+     fn drop(&mut self) {
+         // SAFETY: thread-local teardown runs with no task/signal handler active.
+@@ -476,6 +529,7 @@ impl Drop for Alternate {
+         let _ = &self.stack;
+     }
+ }
++#[cfg(not(target_os = "fuchsia"))]
+ unsafe extern "C" fn fault(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+     // SAFETY: SA_SIGINFO receives a live kernel siginfo for this fault.
+     let address = unsafe { (*info).si_addr() as usize };
+diff --git a/crates/hirsel-core-rt/src/host/envelope.rs b/crates/hirsel-core-rt/src/host/envelope.rs
+index 23c6851ef..e62061e3a 100644
+--- a/crates/hirsel-core-rt/src/host/envelope.rs
++++ b/crates/hirsel-core-rt/src/host/envelope.rs
+@@ -21,29 +21,42 @@ impl HostEnvelope {
+             .ok()
+             .filter(|p| p.is_power_of_two() && (4096..=65536).contains(p))
+             .ok_or_else(|| io::Error::other(format!("unsupported host page size {page}")))?;
+-        let rlimit = |resource| {
+-            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+-            // SAFETY: getrlimit fills the structure on success.
+-            let limit = unsafe {
+-                if libc::getrlimit(resource, limit.as_mut_ptr()) != 0 {
+-                    return Err(io::Error::last_os_error());
+-                }
+-                limit.assume_init().rlim_cur
++        #[cfg(target_os = "fuchsia")]
++        let (address_space_limit, memory_limit, thread_limit, memlock_limit) =
++            (None, None, None, None);
++        #[cfg(not(target_os = "fuchsia"))]
++        let (address_space_limit, memory_limit, thread_limit, memlock_limit) = {
++            let rlimit = |resource| {
++                let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
++                // SAFETY: getrlimit fills the structure on success.
++                let limit = unsafe {
++                    if libc::getrlimit(resource, limit.as_mut_ptr()) != 0 {
++                        return Err(io::Error::last_os_error());
++                    }
++                    limit.assume_init().rlim_cur
++                };
++                Ok((limit != libc::RLIM_INFINITY).then_some(limit))
+             };
+-            Ok((limit != libc::RLIM_INFINITY).then_some(limit))
+-        };
+-        let address_space_limit = rlimit(libc::RLIMIT_AS)?;
+-        let mut memory_limit = min_limit(rlimit(libc::RLIMIT_DATA)?, address_space_limit);
+-        let mut thread_limit = rlimit(libc::RLIMIT_NPROC)?.and_then(|n| usize::try_from(n).ok());
+-        let memlock_limit = if cfg!(target_os = "linux") {
+-            rlimit(libc::RLIMIT_MEMLOCK)?
+-        } else {
+-            None
++            let address_space_limit = rlimit(libc::RLIMIT_AS)?;
++            let mut memory_limit = min_limit(rlimit(libc::RLIMIT_DATA)?, address_space_limit);
++            let mut thread_limit =
++                rlimit(libc::RLIMIT_NPROC)?.and_then(|n| usize::try_from(n).ok());
++            let memlock_limit = if cfg!(target_os = "linux") {
++                rlimit(libc::RLIMIT_MEMLOCK)?
++            } else {
++                None
++            };
++            if let Some(limits) = cgroup_limits() {
++                memory_limit = min_limit(memory_limit, limits.0);
++                thread_limit = min_limit(thread_limit, limits.1);
++            }
++            (
++                address_space_limit,
++                memory_limit,
++                thread_limit,
++                memlock_limit,
++            )
+         };
+-        if let Some(limits) = cgroup_limits() {
+-            memory_limit = min_limit(memory_limit, limits.0);
+-            thread_limit = min_limit(thread_limit, limits.1);
+-        }
+         Ok(Self {
+             page_bytes,
+             allowed_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+diff --git a/crates/hirsel-core-rt/src/host/mod.rs b/crates/hirsel-core-rt/src/host/mod.rs
+index 088292a64..4042b94e7 100644
+--- a/crates/hirsel-core-rt/src/host/mod.rs
++++ b/crates/hirsel-core-rt/src/host/mod.rs
+@@ -5,10 +5,14 @@
+ #[cfg(target_os = "macos")]
+ mod darwin;
+ pub(crate) mod envelope;
++#[cfg(target_os = "fuchsia")]
++mod fuchsia;
+ #[cfg(target_os = "linux")]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ use darwin as provider;
++#[cfg(target_os = "fuchsia")]
++use fuchsia as provider;
+ #[cfg(target_os = "linux")]
+ use linux as provider;
+ 
+@@ -18,6 +22,8 @@ pub use provider::exec;
+ #[cfg(feature = "prof")]
+ pub(crate) use provider::prof_sampler;
+ pub(crate) use provider::{clock, contained, file, path, stat::stat, sync, sys, unix};
++#[cfg(target_os = "fuchsia")]
++pub(crate) use fuchsia::zircon_dir;
+ 
+ /// A terminal's size as `cols | rows << 16` from `TIOCGWINSZ`, zero when the
+ /// descriptor answers no size or either dimension is zero. Linux and Darwin
+diff --git a/crates/hirsel-core-rt/src/os.rs b/crates/hirsel-core-rt/src/os.rs
+index 9b596ca38..c26c39cbe 100644
+--- a/crates/hirsel-core-rt/src/os.rs
++++ b/crates/hirsel-core-rt/src/os.rs
+@@ -117,6 +117,10 @@ impl OsProvider {
+     /// Only run configuration can acquire a root from an ambient host path.
+     #[cfg_attr(hirsel_runtime_size, optimize(size))]
+     pub fn grant(&mut self, path: &Path) -> io::Result<u64> {
++        #[cfg(target_os = "fuchsia")]
++        if let Some(fd) = crate::host::zircon_dir::try_open_root()? {
++            return Ok(self.insert_directory(fd));
++        }
+         let file = crate::units::off_slot(crate::units::HostCall::PeerWait, || {
+             let file = std::fs::File::open(path)?;
+             if !file.metadata()?.is_dir() {
+diff --git a/crates/hirsel-core-rt/src/os/metadata.rs b/crates/hirsel-core-rt/src/os/metadata.rs
+index ee3b20d16..17d5b86d6 100644
+--- a/crates/hirsel-core-rt/src/os/metadata.rs
++++ b/crates/hirsel-core-rt/src/os/metadata.rs
+@@ -9,6 +9,10 @@ use std::{
+ };
+ 
+ pub(crate) fn file_stat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
++    #[cfg(target_os = "fuchsia")]
++    if crate::host::zircon_dir::is_zircon_fd(fd.as_raw_fd()) {
++        return crate::host::zircon_dir::fstat(fd.as_raw_fd());
++    }
+     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+     // SAFETY: the caller retains fd and fstat writes the supplied stat.
+     syscall(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } as isize)?;
+diff --git a/crates/hirsel-core-rt/src/os_resolve.rs b/crates/hirsel-core-rt/src/os_resolve.rs
+index ff3ce2911..222a54153 100644
+--- a/crates/hirsel-core-rt/src/os_resolve.rs
++++ b/crates/hirsel-core-rt/src/os_resolve.rs
+@@ -205,7 +205,10 @@ fn getaddrinfo(name: &CStr, capacity: usize) -> Answer {
+     let code = unsafe { libc::getaddrinfo(name.as_ptr(), ptr::null(), &hints, &mut head) };
+     match code {
+         0 => {}
++        #[cfg(not(target_os = "fuchsia"))]
+         libc::EAI_NONAME | libc::EAI_NODATA => return Ok(Vec::new()),
++        #[cfg(target_os = "fuchsia")]
++        libc::EAI_NONAME => return Ok(Vec::new()),
+         code => return Err(code),
+     }
+     let list = AddrInfo(head);
+diff --git a/crates/hirsel-core-rt/src/process.rs b/crates/hirsel-core-rt/src/process.rs
+index d41f1860a..b1ae18933 100644
+--- a/crates/hirsel-core-rt/src/process.rs
++++ b/crates/hirsel-core-rt/src/process.rs
+@@ -600,39 +600,50 @@ static PIPE_STATE: std::sync::Mutex<PipeState> = std::sync::Mutex::new(PipeState
+ struct PipePolicy;
+ impl PipePolicy {
+     fn enter() -> Self {
+-        let mut state = PIPE_STATE.lock().unwrap();
+-        if state.users == 0 {
+-            // SAFETY: initialized actions, valid signal; kernel copies both structures.
+-            unsafe {
+-                let mut action: libc::sigaction = std::mem::zeroed();
+-                let mut previous: libc::sigaction = std::mem::zeroed();
+-                action.sa_sigaction = libc::SIG_IGN;
+-                libc::sigemptyset(&mut action.sa_mask);
+-                if libc::sigaction(libc::SIGPIPE, &action, &mut previous) != 0 {
+-                    stop(b"Signal");
++        #[cfg(target_os = "fuchsia")]
++        {
++            // Zircon has no POSIX signals and never raises SIGPIPE on socket writes.
++            return Self;
++        }
++        #[cfg(not(target_os = "fuchsia"))]
++        {
++            let mut state = PIPE_STATE.lock().unwrap();
++            if state.users == 0 {
++                // SAFETY: initialized actions, valid signal; kernel copies both structures.
++                unsafe {
++                    let mut action: libc::sigaction = std::mem::zeroed();
++                    let mut previous: libc::sigaction = std::mem::zeroed();
++                    action.sa_sigaction = libc::SIG_IGN;
++                    libc::sigemptyset(&mut action.sa_mask);
++                    if libc::sigaction(libc::SIGPIPE, &action, &mut previous) != 0 {
++                        stop(b"Signal");
++                    }
++                    state.previous = Some(previous);
+                 }
+-                state.previous = Some(previous);
+             }
++            state.users = state
++                .users
++                .checked_add(1)
++                .unwrap_or_else(|| stop(b"ActiveRuns"));
++            Self
+         }
+-        state.users = state
+-            .users
+-            .checked_add(1)
+-            .unwrap_or_else(|| stop(b"ActiveRuns"));
+-        Self
+     }
+ }
+ impl Drop for PipePolicy {
+     fn drop(&mut self) {
+-        let mut state = PIPE_STATE.lock().unwrap();
+-        state.users -= 1;
+-        if state.users == 0 {
+-            // SAFETY: the final run restores exactly the host action saved at entry.
+-            unsafe {
+-                libc::sigaction(
+-                    libc::SIGPIPE,
+-                    &state.previous.take().unwrap_or_else(|| stop(b"Signal")),
+-                    std::ptr::null_mut(),
+-                );
++        #[cfg(not(target_os = "fuchsia"))]
++        {
++            let mut state = PIPE_STATE.lock().unwrap();
++            state.users -= 1;
++            if state.users == 0 {
++                // SAFETY: the final run restores exactly the host action saved at entry.
++                unsafe {
++                    libc::sigaction(
++                        libc::SIGPIPE,
++                        &state.previous.take().unwrap_or_else(|| stop(b"Signal")),
++                        std::ptr::null_mut(),
++                    );
++                }
+             }
+         }
+     }
+diff --git a/crates/hirsel-core-rt/src/stop_signals.rs b/crates/hirsel-core-rt/src/stop_signals.rs
+index 7d4c57256..adf5cefcf 100644
+--- a/crates/hirsel-core-rt/src/stop_signals.rs
++++ b/crates/hirsel-core-rt/src/stop_signals.rs
+@@ -112,6 +112,7 @@ impl Relay {
+             users: 0,
+         };
+         SIGNAL_FD.store(fd, Ordering::Release);
++        #[cfg(not(target_os = "fuchsia"))]
+         for signal in SIGNALS {
+             // SAFETY: the actions have valid masks and a signal-safe handler.
+             unsafe {
+diff --git a/crates/hirsel-cranelift/src/core.rs b/crates/hirsel-cranelift/src/core.rs
+index 8d39ed98f..ef3fbddd4 100644
+--- a/crates/hirsel-cranelift/src/core.rs
++++ b/crates/hirsel-cranelift/src/core.rs
+@@ -161,7 +161,7 @@ pub(crate) fn isa(options: &Options<'_>) -> Result<cranelift_codegen::isa::Owned
+     let mut isa = cranelift_codegen::isa::lookup_by_name(options.target)
+         .map_err(|e| refuse(e.to_string()))?;
+     match target {
+-        hirsel_core_layout::Target::X86_64Linux => {
++        hirsel_core_layout::Target::X86_64Linux | hirsel_core_layout::Target::X86_64Fuchsia => {
+             for feature in hirsel_core_layout::isa::X86_64_BASE.cranelift_features() {
+                 isa.enable(feature).map_err(|e| refuse(e.to_string()))?;
+             }
 diff --git a/crates/hirsel-core-net/src/host/fuchsia/image.rs b/crates/hirsel-core-net/src/host/fuchsia/image.rs
 new file mode 100644
 index 000000000..3eaab13f3
@@ -641,25 +1260,6 @@ index 000000000..960640014
 +        "AF_UNIX pinned connect is not supported on Fuchsia",
 +    ))
 +}
-diff --git a/crates/hirsel-core-net/src/host/mod.rs b/crates/hirsel-core-net/src/host/mod.rs
-index 46c50fe72..5aded3e81 100644
---- a/crates/hirsel-core-net/src/host/mod.rs
-+++ b/crates/hirsel-core-net/src/host/mod.rs
-@@ -3,10 +3,14 @@
- //! compile time. Readiness has its own seam in `reactor`.
- #[cfg(target_os = "macos")]
- mod darwin;
-+#[cfg(target_os = "fuchsia")]
-+mod fuchsia;
- #[cfg(target_os = "linux")]
- mod linux;
- #[cfg(target_os = "macos")]
- use darwin as provider;
-+#[cfg(target_os = "fuchsia")]
-+use fuchsia as provider;
- #[cfg(target_os = "linux")]
- use linux as provider;
- 
 diff --git a/crates/hirsel-core-net/src/own_address/fuchsia.rs b/crates/hirsel-core-net/src/own_address/fuchsia.rs
 new file mode 100644
 index 000000000..e2de40a82
@@ -686,140 +1286,6 @@ index 000000000..e2de40a82
 +        Ok(false)
 +    }
 +}
-diff --git a/crates/hirsel-core-net/src/own_address/mod.rs b/crates/hirsel-core-net/src/own_address/mod.rs
-index 0a769f4be..6c3fc81c8 100644
---- a/crates/hirsel-core-net/src/own_address/mod.rs
-+++ b/crates/hirsel-core-net/src/own_address/mod.rs
-@@ -10,10 +10,14 @@ use std::sync::Mutex;
- 
- #[cfg(target_os = "macos")]
- mod darwin;
-+#[cfg(target_os = "fuchsia")]
-+mod fuchsia;
- #[cfg(target_os = "linux")]
- mod linux;
- #[cfg(target_os = "macos")]
- use darwin as source;
-+#[cfg(target_os = "fuchsia")]
-+use fuchsia as source;
- #[cfg(target_os = "linux")]
- use linux as source;
- 
-diff --git a/crates/hirsel-core-net/src/reactor.rs b/crates/hirsel-core-net/src/reactor.rs
-index 4191239c0..fa9170c74 100644
---- a/crates/hirsel-core-net/src/reactor.rs
-+++ b/crates/hirsel-core-net/src/reactor.rs
-@@ -16,12 +16,16 @@ use std::{
- };
- #[cfg(target_os = "linux")]
- pub(crate) mod epoll;
-+#[cfg(target_os = "fuchsia")]
-+pub(crate) mod fuchsia;
- #[cfg(target_os = "macos")]
- pub(crate) mod kqueue;
- #[cfg(target_os = "linux")]
- mod sendzc;
- #[cfg(target_os = "linux")]
- pub(crate) use epoll as sys;
-+#[cfg(target_os = "fuchsia")]
-+pub(crate) use fuchsia as sys;
- #[cfg(target_os = "macos")]
- pub(crate) use kqueue as sys;
- mod plan;
-@@ -32,7 +36,7 @@ mod uring;
- use crate::ready::{Event, Handle, Waker};
- #[cfg(target_os = "linux")]
- pub use sendzc::TxSlot;
--#[cfg(target_os = "macos")]
-+#[cfg(any(target_os = "macos", target_os = "fuchsia"))]
- pub use sys::{FileEntry, TxSlot};
- pub use udp_group::UdpMember;
- #[cfg(target_os = "linux")]
-@@ -73,6 +77,8 @@ pub enum Reactor {
-     IoUring,
-     #[cfg(target_os = "macos")]
-     Kqueue,
-+    #[cfg(target_os = "fuchsia")]
-+    Fuchsia,
- }
- impl Reactor {
-     pub fn name(self) -> &'static str {
-@@ -83,6 +89,8 @@ impl Reactor {
-             Reactor::IoUring => "io_uring",
-             #[cfg(target_os = "macos")]
-             Reactor::Kqueue => "kqueue",
-+            #[cfg(target_os = "fuchsia")]
-+            Reactor::Fuchsia => "zircon-poll",
-         }
-     }
-     /// Whether its pollers are completion rings, which also complete a
-@@ -95,6 +103,8 @@ impl Reactor {
-             Reactor::IoUring => true,
-             #[cfg(target_os = "macos")]
-             Reactor::Kqueue => false,
-+            #[cfg(target_os = "fuchsia")]
-+            Reactor::Fuchsia => false,
-         }
-     }
- }
-@@ -230,6 +240,11 @@ fn choose(_plan: ReactorPlan) -> Result<Reactor, String> {
-     }
- }
- 
-+#[cfg(target_os = "fuchsia")]
-+fn choose(_plan: ReactorPlan) -> Result<Reactor, String> {
-+    Ok(Reactor::Fuchsia)
-+}
-+
- #[cfg(target_os = "linux")]
- fn choose(plan: ReactorPlan) -> Result<Reactor, String> {
-     {
-@@ -297,6 +312,9 @@ enum Backend {
-     /// The kqueue, whose wake is a user event in it.
-     #[cfg(target_os = "macos")]
-     Kqueue { kq: OwnedFd },
-+    /// Fuchsia/Zircon poll+eventfd reactor.
-+    #[cfg(target_os = "fuchsia")]
-+    Fuchsia { selector: OwnedFd },
- }
- 
- /// The backend's operations, installed by its constructor: a program that
-@@ -341,6 +359,8 @@ impl Poller {
-             Reactor::IoUring => Self::new_uring(),
-             #[cfg(target_os = "macos")]
-             Reactor::Kqueue => Self::new_readiness(),
-+            #[cfg(target_os = "fuchsia")]
-+            Reactor::Fuchsia => Self::new_readiness(),
-         }
-     }
-     #[cfg(target_os = "linux")]
-@@ -388,6 +408,8 @@ impl Poller {
-             Backend::Uring(_) => Reactor::IoUring,
-             #[cfg(target_os = "macos")]
-             Backend::Kqueue { .. } => Reactor::Kqueue,
-+            #[cfg(target_os = "fuchsia")]
-+            Backend::Fuchsia { .. } => Reactor::Fuchsia,
-         }
-     }
-     /// Watch `fd` for every direction under `tag`. epoll's interest takes
-@@ -476,6 +498,8 @@ impl Poller {
-             Backend::Uring(ring) => Handle(ring.ring.as_raw_fd()),
-             #[cfg(target_os = "macos")]
-             Backend::Kqueue { kq } => Handle(kq.as_raw_fd()),
-+            #[cfg(target_os = "fuchsia")]
-+            Backend::Fuchsia { selector } => Handle(selector.as_raw_fd()),
-         }
-     }
-     /// A descriptor-waited poller's wake, reported as a `WAKE` event; None
-@@ -488,6 +512,8 @@ impl Poller {
-             Backend::Uring(_) => None,
-             #[cfg(target_os = "macos")]
-             Backend::Kqueue { .. } => Some(Waker(self.waker_id())),
-+            #[cfg(target_os = "fuchsia")]
-+            Backend::Fuchsia { .. } => Some(Waker(self.waker_id())),
-         }
-     }
-     #[cfg(target_os = "linux")]
 diff --git a/crates/hirsel-core-net/src/reactor/fuchsia.rs b/crates/hirsel-core-net/src/reactor/fuchsia.rs
 new file mode 100644
 index 000000000..afca35cef
@@ -1248,293 +1714,6 @@ index 000000000..afca35cef
 +        match *self {}
 +    }
 +}
-diff --git a/crates/hirsel-core-net/src/udp/send.rs b/crates/hirsel-core-net/src/udp/send.rs
-index a845f1b12..01a314bfe 100644
---- a/crates/hirsel-core-net/src/udp/send.rs
-+++ b/crates/hirsel-core-net/src/udp/send.rs
-@@ -30,11 +30,11 @@ impl Control {
-         let length = header + data.len();
-         let padded = length.next_multiple_of(word);
-         assert!(offset + padded <= self.0.len());
--        let cmsg = libc::cmsghdr {
--            cmsg_len: length as _,
--            cmsg_level: level,
--            cmsg_type: kind,
--        };
-+        // SAFETY: `cmsghdr` is plain integer fields (with padding on musl/Fuchsia).
-+        let mut cmsg: libc::cmsghdr = unsafe { std::mem::zeroed() };
-+        cmsg.cmsg_len = length as _;
-+        cmsg.cmsg_level = level;
-+        cmsg.cmsg_type = kind;
-         // SAFETY: the checked control range holds a complete cmsg header.
-         unsafe {
-             self.0
-diff --git a/crates/hirsel-core-rt/src/fiber.rs b/crates/hirsel-core-rt/src/fiber.rs
-index f6c0c6991..41929e69a 100644
---- a/crates/hirsel-core-rt/src/fiber.rs
-+++ b/crates/hirsel-core-rt/src/fiber.rs
-@@ -26,6 +26,7 @@ pub(crate) fn commit_for_page(page: usize) -> usize {
- const GROW: usize = 256 << 10;
- /// Bytes kept at the top for the low-water word; a multiple of 16.
- const HEADER: usize = 16;
-+#[cfg(not(target_os = "fuchsia"))]
- thread_local! {
-     static ALTERNATE: Alternate = Alternate::new();
- }
-@@ -38,6 +39,7 @@ const FAULTS: [libc::c_int; 1] = [libc::SIGSEGV];
- #[cfg(target_os = "macos")]
- const FAULTS: [libc::c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
- /// Each of `FAULTS`' handlers from before `arm`, in the same order.
-+#[cfg(not(target_os = "fuchsia"))]
- static PREVIOUS: OnceLock<[libc::sigaction; FAULTS.len()]> = OnceLock::new();
- #[cfg(test)]
- #[path = "fiber_stop_tests.rs"]
-@@ -92,6 +94,7 @@ pub(crate) fn room(bytes: usize) -> bool {
-         >= bytes
-         || end == 0
- }
-+#[cfg(not(target_os = "fuchsia"))]
- pub(crate) fn arm() {
-     PREVIOUS.get_or_init(|| {
-         // SAFETY: initialized sigaction structures and a signal-compatible handler.
-@@ -111,6 +114,8 @@ pub(crate) fn arm() {
-     });
-     ALTERNATE.with(|_| ());
- }
-+#[cfg(target_os = "fuchsia")]
-+pub(crate) fn arm() {}
- fn page() -> usize {
-     // SAFETY: sysconf reads the kernel's immutable page size.
-     page_bytes(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-@@ -135,40 +140,75 @@ impl Stack {
- 
-     pub(crate) fn new_with_reserve(reserve: usize) -> Self {
-         let page_bytes = page();
--        let commit = commit_for_page(page_bytes);
-         let len = page_bytes + reserve;
--        // SAFETY: fresh inaccessible private mapping, then enable only its top pages.
--        unsafe {
--            let raw = libc::mmap(
--                std::ptr::null_mut(),
--                len,
--                libc::PROT_NONE,
--                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
--                -1,
--                0,
--            );
--            if raw == libc::MAP_FAILED {
--                crate::process::stop(b"HostMemory");
--            }
--            let top = raw.addr() + len;
--            if libc::mprotect(
--                raw.cast::<u8>().add(len - commit).cast(),
--                commit,
--                libc::PROT_READ | libc::PROT_WRITE,
--            ) != 0
--            {
--                crate::process::stop(b"HostMemory");
-+        #[cfg(target_os = "fuchsia")]
-+        {
-+            // Zircon demand-pages anonymous RW VMOs lazily without POSIX signals;
-+            // keep only the bottom guard page PROT_NONE.
-+            // SAFETY: fresh private anonymous mapping.
-+            unsafe {
-+                let raw = libc::mmap(
-+                    std::ptr::null_mut(),
-+                    len,
-+                    libc::PROT_READ | libc::PROT_WRITE,
-+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-+                    -1,
-+                    0,
-+                );
-+                if raw == libc::MAP_FAILED {
-+                    crate::process::stop(b"HostMemory");
-+                }
-+                if libc::mprotect(raw, page_bytes, libc::PROT_NONE) != 0 {
-+                    crate::process::stop(b"HostMemory");
-+                }
-+                let guard_end = raw.addr() + page_bytes;
-+                let top = raw.addr() + len;
-+                low_word(top).write(guard_end);
-+                return Self {
-+                    base: NonNull::new_unchecked(raw.cast()),
-+                    len,
-+                    guard_end,
-+                    #[cfg(any(test, feature = "memcheck"))]
-+                    valgrind: 0,
-+                };
-             }
--            low_word(top).write(top - commit);
--            Self {
--                base: NonNull::new_unchecked(raw.cast()),
--                len,
--                guard_end: raw.addr() + page_bytes,
--                #[cfg(any(test, feature = "memcheck"))]
--                valgrind: hirsel_stack::stack_register(
--                    raw.cast::<u8>().add(page_bytes),
--                    raw.cast::<u8>().add(len),
--                ),
-+        }
-+        #[cfg(not(target_os = "fuchsia"))]
-+        {
-+            let commit = commit_for_page(page_bytes);
-+            // SAFETY: fresh inaccessible private mapping, then enable only its top pages.
-+            unsafe {
-+                let raw = libc::mmap(
-+                    std::ptr::null_mut(),
-+                    len,
-+                    libc::PROT_NONE,
-+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-+                    -1,
-+                    0,
-+                );
-+                if raw == libc::MAP_FAILED {
-+                    crate::process::stop(b"HostMemory");
-+                }
-+                let top = raw.addr() + len;
-+                if libc::mprotect(
-+                    raw.cast::<u8>().add(len - commit).cast(),
-+                    commit,
-+                    libc::PROT_READ | libc::PROT_WRITE,
-+                ) != 0
-+                {
-+                    crate::process::stop(b"HostMemory");
-+                }
-+                low_word(top).write(top - commit);
-+                Self {
-+                    base: NonNull::new_unchecked(raw.cast()),
-+                    len,
-+                    guard_end: raw.addr() + page_bytes,
-+                    #[cfg(any(test, feature = "memcheck"))]
-+                    valgrind: hirsel_stack::stack_register(
-+                        raw.cast::<u8>().add(page_bytes),
-+                        raw.cast::<u8>().add(len),
-+                    ),
-+                }
-             }
-         }
-     }
-@@ -310,6 +350,7 @@ impl Stack {
- /// `guard_end` and whose reservation ends at `top`, with one fresh inaccessible
- /// mapping. Out of line, and given plain addresses, so recycling a shallow
- /// stack stays inlined and keeps the stack in registers.
-+#[cfg(not(target_os = "fuchsia"))]
- #[cold]
- #[inline(never)]
- fn release(guard_end: usize, top: usize, committed: usize) {
-@@ -329,6 +370,15 @@ fn release(guard_end: usize, top: usize, committed: usize) {
-         *low_word(top) = committed;
-     }
- }
-+#[cfg(target_os = "fuchsia")]
-+#[cold]
-+#[inline(never)]
-+fn release(guard_end: usize, _top: usize, committed: usize) {
-+    if committed > guard_end {
-+        // SAFETY: the stack is idle; decommit pages below `committed` while keeping RW mapping.
-+        unsafe { crate::host::sys::discard(guard_end, committed - guard_end) };
-+    }
-+}
- /// The low-water word of the stack whose reservation ends at `top`.
- fn low_word(top: usize) -> *mut usize {
-     std::ptr::with_exposed_provenance_mut::<usize>(top - size_of::<usize>())
-@@ -444,10 +494,12 @@ impl Drop for Stock {
-     }
- }
- 
-+#[cfg(not(target_os = "fuchsia"))]
- struct Alternate {
-     stack: Stack,
-     previous: libc::stack_t,
- }
-+#[cfg(not(target_os = "fuchsia"))]
- impl Alternate {
-     fn new() -> Self {
-         let commit = commit_for_page(page());
-@@ -467,6 +519,7 @@ impl Alternate {
-         }
-     }
- }
-+#[cfg(not(target_os = "fuchsia"))]
- impl Drop for Alternate {
-     fn drop(&mut self) {
-         // SAFETY: thread-local teardown runs with no task/signal handler active.
-@@ -476,6 +529,7 @@ impl Drop for Alternate {
-         let _ = &self.stack;
-     }
- }
-+#[cfg(not(target_os = "fuchsia"))]
- unsafe extern "C" fn fault(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
-     // SAFETY: SA_SIGINFO receives a live kernel siginfo for this fault.
-     let address = unsafe { (*info).si_addr() as usize };
-diff --git a/crates/hirsel-core-rt/src/host/envelope.rs b/crates/hirsel-core-rt/src/host/envelope.rs
-index 23c6851ef..e62061e3a 100644
---- a/crates/hirsel-core-rt/src/host/envelope.rs
-+++ b/crates/hirsel-core-rt/src/host/envelope.rs
-@@ -21,29 +21,42 @@ impl HostEnvelope {
-             .ok()
-             .filter(|p| p.is_power_of_two() && (4096..=65536).contains(p))
-             .ok_or_else(|| io::Error::other(format!("unsupported host page size {page}")))?;
--        let rlimit = |resource| {
--            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
--            // SAFETY: getrlimit fills the structure on success.
--            let limit = unsafe {
--                if libc::getrlimit(resource, limit.as_mut_ptr()) != 0 {
--                    return Err(io::Error::last_os_error());
--                }
--                limit.assume_init().rlim_cur
-+        #[cfg(target_os = "fuchsia")]
-+        let (address_space_limit, memory_limit, thread_limit, memlock_limit) =
-+            (None, None, None, None);
-+        #[cfg(not(target_os = "fuchsia"))]
-+        let (address_space_limit, memory_limit, thread_limit, memlock_limit) = {
-+            let rlimit = |resource| {
-+                let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-+                // SAFETY: getrlimit fills the structure on success.
-+                let limit = unsafe {
-+                    if libc::getrlimit(resource, limit.as_mut_ptr()) != 0 {
-+                        return Err(io::Error::last_os_error());
-+                    }
-+                    limit.assume_init().rlim_cur
-+                };
-+                Ok((limit != libc::RLIM_INFINITY).then_some(limit))
-             };
--            Ok((limit != libc::RLIM_INFINITY).then_some(limit))
--        };
--        let address_space_limit = rlimit(libc::RLIMIT_AS)?;
--        let mut memory_limit = min_limit(rlimit(libc::RLIMIT_DATA)?, address_space_limit);
--        let mut thread_limit = rlimit(libc::RLIMIT_NPROC)?.and_then(|n| usize::try_from(n).ok());
--        let memlock_limit = if cfg!(target_os = "linux") {
--            rlimit(libc::RLIMIT_MEMLOCK)?
--        } else {
--            None
-+            let address_space_limit = rlimit(libc::RLIMIT_AS)?;
-+            let mut memory_limit = min_limit(rlimit(libc::RLIMIT_DATA)?, address_space_limit);
-+            let mut thread_limit =
-+                rlimit(libc::RLIMIT_NPROC)?.and_then(|n| usize::try_from(n).ok());
-+            let memlock_limit = if cfg!(target_os = "linux") {
-+                rlimit(libc::RLIMIT_MEMLOCK)?
-+            } else {
-+                None
-+            };
-+            if let Some(limits) = cgroup_limits() {
-+                memory_limit = min_limit(memory_limit, limits.0);
-+                thread_limit = min_limit(thread_limit, limits.1);
-+            }
-+            (
-+                address_space_limit,
-+                memory_limit,
-+                thread_limit,
-+                memlock_limit,
-+            )
-         };
--        if let Some(limits) = cgroup_limits() {
--            memory_limit = min_limit(memory_limit, limits.0);
--            thread_limit = min_limit(thread_limit, limits.1);
--        }
-         Ok(Self {
-             page_bytes,
-             allowed_cpus: std::thread::available_parallelism().map_or(1, usize::from),
 diff --git a/crates/hirsel-core-rt/src/host/fuchsia/clock.rs b/crates/hirsel-core-rt/src/host/fuchsia/clock.rs
 new file mode 100644
 index 000000000..c8325d638
@@ -2011,10 +2190,10 @@ index 000000000..b22ce44f7
 +}
 diff --git a/crates/hirsel-core-rt/src/host/fuchsia/sys.rs b/crates/hirsel-core-rt/src/host/fuchsia/sys.rs
 new file mode 100644
-index 000000000..6e92cee6d
+index 000000000..b4a16a520
 --- /dev/null
 +++ b/crates/hirsel-core-rt/src/host/fuchsia/sys.rs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,228 @@
 +//! Low-level host primitives on Fuchsia/Zircon.
 +use std::{
 +    io,
@@ -2048,7 +2227,9 @@ index 000000000..6e92cee6d
 +
 +impl Notice {
 +    pub(crate) fn new(nonblocking: bool) -> io::Result<Self> {
-+        let flags = libc::EFD_CLOEXEC | if nonblocking { libc::EFD_NONBLOCK } else { 0 };
++        // Upstream Rust `libc::EFD_CLOEXEC` is mistakenly Linux's 0x80000 on Fuchsia;
++        // Fuchsia's <sys/eventfd.h> defines EFD_CLOEXEC = O_CLOEXEC (0x100).
++        let flags = libc::O_CLOEXEC | if nonblocking { libc::O_NONBLOCK } else { 0 };
 +        // SAFETY: creates a fresh eventfd.
 +        let fd = owned(unsafe { libc::eventfd(0, flags) })?;
 +        Ok(Self { fd })
@@ -2540,182 +2721,3 @@ index 000000000..216c27fac
 +    let _ = rpc_call(OP_MKDIR, 0, 0, 0, name.to_bytes())?;
 +    Ok(())
 +}
-diff --git a/crates/hirsel-core-rt/src/host/mod.rs b/crates/hirsel-core-rt/src/host/mod.rs
-index 088292a64..4042b94e7 100644
---- a/crates/hirsel-core-rt/src/host/mod.rs
-+++ b/crates/hirsel-core-rt/src/host/mod.rs
-@@ -5,10 +5,14 @@
- #[cfg(target_os = "macos")]
- mod darwin;
- pub(crate) mod envelope;
-+#[cfg(target_os = "fuchsia")]
-+mod fuchsia;
- #[cfg(target_os = "linux")]
- mod linux;
- #[cfg(target_os = "macos")]
- use darwin as provider;
-+#[cfg(target_os = "fuchsia")]
-+use fuchsia as provider;
- #[cfg(target_os = "linux")]
- use linux as provider;
- 
-@@ -18,6 +22,8 @@ pub use provider::exec;
- #[cfg(feature = "prof")]
- pub(crate) use provider::prof_sampler;
- pub(crate) use provider::{clock, contained, file, path, stat::stat, sync, sys, unix};
-+#[cfg(target_os = "fuchsia")]
-+pub(crate) use fuchsia::zircon_dir;
- 
- /// A terminal's size as `cols | rows << 16` from `TIOCGWINSZ`, zero when the
- /// descriptor answers no size or either dimension is zero. Linux and Darwin
-diff --git a/crates/hirsel-core-rt/src/os.rs b/crates/hirsel-core-rt/src/os.rs
-index 9b596ca38..c26c39cbe 100644
---- a/crates/hirsel-core-rt/src/os.rs
-+++ b/crates/hirsel-core-rt/src/os.rs
-@@ -117,6 +117,10 @@ impl OsProvider {
-     /// Only run configuration can acquire a root from an ambient host path.
-     #[cfg_attr(hirsel_runtime_size, optimize(size))]
-     pub fn grant(&mut self, path: &Path) -> io::Result<u64> {
-+        #[cfg(target_os = "fuchsia")]
-+        if let Some(fd) = crate::host::zircon_dir::try_open_root()? {
-+            return Ok(self.insert_directory(fd));
-+        }
-         let file = crate::units::off_slot(crate::units::HostCall::PeerWait, || {
-             let file = std::fs::File::open(path)?;
-             if !file.metadata()?.is_dir() {
-diff --git a/crates/hirsel-core-rt/src/os/metadata.rs b/crates/hirsel-core-rt/src/os/metadata.rs
-index ee3b20d16..17d5b86d6 100644
---- a/crates/hirsel-core-rt/src/os/metadata.rs
-+++ b/crates/hirsel-core-rt/src/os/metadata.rs
-@@ -9,6 +9,10 @@ use std::{
- };
- 
- pub(crate) fn file_stat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
-+    #[cfg(target_os = "fuchsia")]
-+    if crate::host::zircon_dir::is_zircon_fd(fd.as_raw_fd()) {
-+        return crate::host::zircon_dir::fstat(fd.as_raw_fd());
-+    }
-     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-     // SAFETY: the caller retains fd and fstat writes the supplied stat.
-     syscall(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } as isize)?;
-diff --git a/crates/hirsel-core-rt/src/os_resolve.rs b/crates/hirsel-core-rt/src/os_resolve.rs
-index ff3ce2911..222a54153 100644
---- a/crates/hirsel-core-rt/src/os_resolve.rs
-+++ b/crates/hirsel-core-rt/src/os_resolve.rs
-@@ -205,7 +205,10 @@ fn getaddrinfo(name: &CStr, capacity: usize) -> Answer {
-     let code = unsafe { libc::getaddrinfo(name.as_ptr(), ptr::null(), &hints, &mut head) };
-     match code {
-         0 => {}
-+        #[cfg(not(target_os = "fuchsia"))]
-         libc::EAI_NONAME | libc::EAI_NODATA => return Ok(Vec::new()),
-+        #[cfg(target_os = "fuchsia")]
-+        libc::EAI_NONAME => return Ok(Vec::new()),
-         code => return Err(code),
-     }
-     let list = AddrInfo(head);
-diff --git a/crates/hirsel-core-rt/src/process.rs b/crates/hirsel-core-rt/src/process.rs
-index d41f1860a..b1ae18933 100644
---- a/crates/hirsel-core-rt/src/process.rs
-+++ b/crates/hirsel-core-rt/src/process.rs
-@@ -600,39 +600,50 @@ static PIPE_STATE: std::sync::Mutex<PipeState> = std::sync::Mutex::new(PipeState
- struct PipePolicy;
- impl PipePolicy {
-     fn enter() -> Self {
--        let mut state = PIPE_STATE.lock().unwrap();
--        if state.users == 0 {
--            // SAFETY: initialized actions, valid signal; kernel copies both structures.
--            unsafe {
--                let mut action: libc::sigaction = std::mem::zeroed();
--                let mut previous: libc::sigaction = std::mem::zeroed();
--                action.sa_sigaction = libc::SIG_IGN;
--                libc::sigemptyset(&mut action.sa_mask);
--                if libc::sigaction(libc::SIGPIPE, &action, &mut previous) != 0 {
--                    stop(b"Signal");
-+        #[cfg(target_os = "fuchsia")]
-+        {
-+            // Zircon has no POSIX signals and never raises SIGPIPE on socket writes.
-+            return Self;
-+        }
-+        #[cfg(not(target_os = "fuchsia"))]
-+        {
-+            let mut state = PIPE_STATE.lock().unwrap();
-+            if state.users == 0 {
-+                // SAFETY: initialized actions, valid signal; kernel copies both structures.
-+                unsafe {
-+                    let mut action: libc::sigaction = std::mem::zeroed();
-+                    let mut previous: libc::sigaction = std::mem::zeroed();
-+                    action.sa_sigaction = libc::SIG_IGN;
-+                    libc::sigemptyset(&mut action.sa_mask);
-+                    if libc::sigaction(libc::SIGPIPE, &action, &mut previous) != 0 {
-+                        stop(b"Signal");
-+                    }
-+                    state.previous = Some(previous);
-                 }
--                state.previous = Some(previous);
-             }
-+            state.users = state
-+                .users
-+                .checked_add(1)
-+                .unwrap_or_else(|| stop(b"ActiveRuns"));
-+            Self
-         }
--        state.users = state
--            .users
--            .checked_add(1)
--            .unwrap_or_else(|| stop(b"ActiveRuns"));
--        Self
-     }
- }
- impl Drop for PipePolicy {
-     fn drop(&mut self) {
--        let mut state = PIPE_STATE.lock().unwrap();
--        state.users -= 1;
--        if state.users == 0 {
--            // SAFETY: the final run restores exactly the host action saved at entry.
--            unsafe {
--                libc::sigaction(
--                    libc::SIGPIPE,
--                    &state.previous.take().unwrap_or_else(|| stop(b"Signal")),
--                    std::ptr::null_mut(),
--                );
-+        #[cfg(not(target_os = "fuchsia"))]
-+        {
-+            let mut state = PIPE_STATE.lock().unwrap();
-+            state.users -= 1;
-+            if state.users == 0 {
-+                // SAFETY: the final run restores exactly the host action saved at entry.
-+                unsafe {
-+                    libc::sigaction(
-+                        libc::SIGPIPE,
-+                        &state.previous.take().unwrap_or_else(|| stop(b"Signal")),
-+                        std::ptr::null_mut(),
-+                    );
-+                }
-             }
-         }
-     }
-diff --git a/crates/hirsel-core-rt/src/stop_signals.rs b/crates/hirsel-core-rt/src/stop_signals.rs
-index 7d4c57256..adf5cefcf 100644
---- a/crates/hirsel-core-rt/src/stop_signals.rs
-+++ b/crates/hirsel-core-rt/src/stop_signals.rs
-@@ -112,6 +112,7 @@ impl Relay {
-             users: 0,
-         };
-         SIGNAL_FD.store(fd, Ordering::Release);
-+        #[cfg(not(target_os = "fuchsia"))]
-         for signal in SIGNALS {
-             // SAFETY: the actions have valid masks and a signal-safe handler.
-             unsafe {
-diff --git a/crates/hirsel-cranelift/src/core.rs b/crates/hirsel-cranelift/src/core.rs
-index 8d39ed98f..ef3fbddd4 100644
---- a/crates/hirsel-cranelift/src/core.rs
-+++ b/crates/hirsel-cranelift/src/core.rs
-@@ -161,7 +161,7 @@ pub(crate) fn isa(options: &Options<'_>) -> Result<cranelift_codegen::isa::Owned
-     let mut isa = cranelift_codegen::isa::lookup_by_name(options.target)
-         .map_err(|e| refuse(e.to_string()))?;
-     match target {
--        hirsel_core_layout::Target::X86_64Linux => {
-+        hirsel_core_layout::Target::X86_64Linux | hirsel_core_layout::Target::X86_64Fuchsia => {
-             for feature in hirsel_core_layout::isa::X86_64_BASE.cranelift_features() {
-                 isa.enable(feature).map_err(|e| refuse(e.to_string()))?;
-             }

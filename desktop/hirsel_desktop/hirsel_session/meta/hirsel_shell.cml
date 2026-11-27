@@ -1,0 +1,61 @@
+// hirsel_shell: Thin Rust Flatland Presenter + Chromium 160 Launcher + Trusted Chrome Painter.
+// Spawns pure-Hirsel /pkg/bin/hirsel-wm with zero ambient directory/svc handles.
+{
+    include: [
+        "//sdk/lib/inspect/client.shard.cml",
+        "syslog/client.shard.cml",
+    ],
+    program: {
+        runner: "elf",
+        binary: "bin/hirsel_shell",
+    },
+    use: [
+        // Required for Flatland root presentation + input + WebEngine views
+        {
+            protocol: [
+                "fuchsia.accessibility.semantics.SemanticsManager",
+                "fuchsia.buildinfo.Provider",
+                "fuchsia.device.NameProvider",
+                "fuchsia.fonts.Provider",
+                "fuchsia.hwinfo.Product",
+                "fuchsia.intl.PropertyProvider",
+                "fuchsia.kernel.VmexResource",
+                "fuchsia.memorypressure.Provider",
+                "fuchsia.net.interfaces.State",
+                "fuchsia.net.name.Lookup",
+                "fuchsia.posix.socket.Provider",
+                "fuchsia.process.Launcher",
+                "fuchsia.session.scene.Manager",
+                "fuchsia.sysmem.Allocator",
+                "fuchsia.sysmem2.Allocator",
+                "fuchsia.ui.composition.Allocator",
+                "fuchsia.ui.composition.Flatland",
+                "fuchsia.ui.input3.Keyboard",
+                "fuchsia.web.ContextProvider",
+            ],
+        },
+        {
+            protocol: [
+                "fuchsia.media.Audio",
+                "fuchsia.media.AudioDeviceEnumerator",
+                "fuchsia.media.ProfileProvider",
+                "fuchsia.scheduler.RoleManager",
+                "fuchsia.tracing.perfetto.ProducerConnector",
+                "fuchsia.tracing.provider.Registry",
+                "fuchsia.ui.display.singleton.Info",
+                "fuchsia.vulkan.loader.Loader",
+            ],
+            availability: "optional",
+        },
+        {
+            storage: "data",
+            path: "/data",
+            availability: "optional",
+        },
+        {
+            storage: "tmp",
+            path: "/tmp",
+            availability: "optional",
+        },
+    ],
+}

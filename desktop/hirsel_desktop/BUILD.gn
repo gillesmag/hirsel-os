@@ -1,0 +1,36 @@
+# Hirsel-OS Desktop GN -> Bazel product bundle bridge.
+
+import("//build/bazel/assembly/bazel_product_bundle.gni")
+
+group("products") {
+  testonly = true
+  deps = []
+  if (current_cpu == "x64") {
+    deps += [ ":hirsel_desktop.x64_product_config" ]
+  }
+}
+
+group("hirsel_desktop") {
+  testonly = true
+  if (current_cpu == "x64") {
+    deps = [ ":hirsel_desktop.x64" ]
+  }
+}
+
+if (current_cpu == "x64") {
+  bazel_product_bundle("hirsel_desktop.x64") {
+    testonly = true
+    product_bundle_name = target_name
+
+    bazel_product_bundle_target = "//products/hirsel_desktop:product_bundle.x64"
+    bazel_product_image_target = "//products/hirsel_desktop:assembly.x64"
+    bazel_product_config_target = ":assembly_config"
+    bazel_product_config_name = "hirsel_desktop"
+    bazel_recovery_image_target = "//products/zedboot:x64"
+    bazel_elf_sizes_target = "//products/hirsel_desktop:elf_sizes.x64"
+    bazel_inputs_from_gn = [
+      "//boards/x64:x64.bazel_input",
+      "//products/hirsel_desktop/hirsel_session:hirsel_session_bazel_inputs",
+    ]
+  }
+}

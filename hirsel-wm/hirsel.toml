@@ -1,0 +1,21 @@
+[package]
+name = "hirsel_wm"
+major = 1
+charge = "charge-v1"
+
+[dependencies]
+std = { major = 1 }
+
+[sources]
+"wm.hirsel" = "wm"
+"main.hirsel" = "main"
+
+[program]
+module = "main"
+
+[tests]
+limit = 67108864
+grants = ["Stdout"]
+
+[tests.sources]
+"tests.hirsel" = "tests"

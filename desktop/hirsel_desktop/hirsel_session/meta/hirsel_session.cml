@@ -1,0 +1,116 @@
+// Hirsel-OS Desktop Session Realm:
+//   - Launches hirsel_shell (eagerly) as root Flatland presenter & pure-Hirsel WM host
+//   - Hosts Native Chromium 160 web_engine#meta/context_provider.cm directly inside the session
+{
+    include: [
+        "//sdk/lib/inspect/client.shard.cml",
+        "inspect/offer.shard.cml",
+        "syslog/client.shard.cml",
+    ],
+    children: [
+        {
+            name: "hirsel_shell",
+            url: "#meta/hirsel_shell.cm",
+            startup: "eager",
+        },
+        {
+            name: "context_provider",
+            url: "fuchsia-pkg://fuchsia.com/web_engine#meta/context_provider.cm",
+        },
+    ],
+    offer: [
+        // Diagnostics to both children
+        {
+            protocol: [ "fuchsia.logger.LogSink" ],
+            from: "parent/diagnostics",
+            to: [
+                "#hirsel_shell",
+                "#context_provider",
+            ],
+        },
+
+        // Capabilities required by web_engine's context_provider.cm
+        {
+            protocol: [
+                "fuchsia.feedback.ComponentDataRegister",
+                "fuchsia.feedback.CrashReportingProductRegister",
+            ],
+            from: "parent",
+            to: "#context_provider",
+            availability: "same_as_target",
+        },
+        {
+            directory: [
+                "root-ssl-certificates",
+                "tzdata-icu",
+            ],
+            from: "parent",
+            to: "#context_provider",
+            availability: "same_as_target",
+        },
+        {
+            directory: "config-data-for-web-instance",
+            from: "void",
+            to: "#context_provider",
+            availability: "optional",
+        },
+
+        // Offer WebEngine ContextProvider to hirsel_shell
+        {
+            protocol: [ "fuchsia.web.ContextProvider" ],
+            from: "#context_provider",
+            to: "#hirsel_shell",
+        },
+
+        // Flatland, Scene Manager, Input, Fonts, Sysmem, Networking, Process Launcher -> hirsel_shell
+        {
+            protocol: [
+                "fuchsia.accessibility.semantics.SemanticsManager",
+                "fuchsia.buildinfo.Provider",
+                "fuchsia.device.NameProvider",
+                "fuchsia.fonts.Provider",
+                "fuchsia.hwinfo.Product",
+                "fuchsia.intl.PropertyProvider",
+                "fuchsia.kernel.VmexResource",
+                "fuchsia.media.Audio",
+                "fuchsia.media.AudioDeviceEnumerator",
+                "fuchsia.media.ProfileProvider",
+                "fuchsia.memorypressure.Provider",
+                "fuchsia.net.interfaces.State",
+                "fuchsia.net.name.Lookup",
+                "fuchsia.posix.socket.Provider",
+                "fuchsia.process.Launcher",
+                "fuchsia.scheduler.RoleManager",
+                "fuchsia.session.scene.Manager",
+                "fuchsia.sysmem.Allocator",
+                "fuchsia.sysmem2.Allocator",
+                "fuchsia.tracing.perfetto.ProducerConnector",
+                "fuchsia.tracing.provider.Registry",
+                "fuchsia.ui.composition.Allocator",
+                "fuchsia.ui.composition.Flatland",
+                "fuchsia.ui.composition.FlatlandFactory",
+                "fuchsia.ui.display.singleton.Info",
+                "fuchsia.ui.input3.Keyboard",
+                "fuchsia.vulkan.loader.Loader",
+            ],
+            from: "parent",
+            to: "#hirsel_shell",
+            availability: "same_as_target",
+        },
+        {
+            storage: [
+                "data",
+                "tmp",
+            ],
+            from: "parent",
+            to: "#hirsel_shell",
+            availability: "same_as_target",
+        },
+    ],
+    expose: [
+        {
+            protocol: "fuchsia.component.Binder",
+            from: "framework",
+        },
+    ],
+}

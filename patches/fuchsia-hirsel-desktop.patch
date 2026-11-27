@@ -1,0 +1,62 @@
+diff --git a/build/BUILD.gn b/build/BUILD.gn
+index 846aa1dc25c..d3cd2083787 100644
+--- a/build/BUILD.gn
++++ b/build/BUILD.gn
+@@ -451,6 +451,7 @@ group("non_hermetic_deps") {
+ 
+   # Products which use Bazel-based assembly have non-hermetic outputs
+   visibility += [
++    "//products/hirsel_desktop:*",
+     "//products/microfuchsia:*",
+     "//products/minimal:*",
+     "//products/terminal:*",
+diff --git a/products/BUILD.gn b/products/BUILD.gn
+index 135cb5b6ff7..4839a101048 100644
+--- a/products/BUILD.gn
++++ b/products/BUILD.gn
+@@ -5,6 +5,7 @@
+ group("products") {
+   testonly = true
+   deps = [
++    "//products/hirsel_desktop:products",
+     "//products/microfuchsia:products",
+     "//products/minimal:products",
+     "//products/terminal:products",
+@@ -17,6 +18,7 @@ group("product_bundles") {
+   deps = [
+     "//products/bringup",
+     "//products/core",
++    "//products/hirsel_desktop",
+     "//products/microfuchsia",
+     "//products/minimal",
+     "//products/terminal",
+diff --git a/src/fonts/asset_providers/BUILD.bazel b/src/fonts/asset_providers/BUILD.bazel
+index b4b0732d31b..c1ffd59cd4f 100644
+--- a/src/fonts/asset_providers/BUILD.bazel
++++ b/src/fonts/asset_providers/BUILD.bazel
+@@ -29,7 +29,10 @@ font_asset_provider(
+ 
+ font_asset_provider(
+     name = "small-open-fonts-collection",
+-    visibility = ["//products/core:__pkg__"],
++    visibility = [
++        "//products/core:__pkg__",
++        "//products/hirsel_desktop:__pkg__",
++    ],
+     deps = ["//src/fonts/collections:small-open-fonts-collection"],
+ )
+ # LINT.ThenChange(BUILD.gn)
+diff --git a/src/security/policy/component_manager_policy_eng.json5 b/src/security/policy/component_manager_policy_eng.json5
+index 3af14dec218..852d1b56d24 100644
+--- a/src/security/policy/component_manager_policy_eng.json5
++++ b/src/security/policy/component_manager_policy_eng.json5
+@@ -238,6 +238,9 @@
+ 
+                     // This protocol is used by console-launcher to run tests in bringup builds.
+                     "/bootstrap/console-launcher",
++
++                    // Hirsel-OS Desktop hosts Native Chromium 160 WebEngine (V8 JIT / Wasm).
++                    "/core/session-manager/session:session/hirsel_shell",
+                 ],
+             },
+             {

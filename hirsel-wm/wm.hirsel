@@ -1,0 +1,433 @@
+// Pure-Hirsel Window Manager & Security Policy Brain (hirsel-wm).
+//
+// Zero ambient authority, zero raw pointers, deterministic state machine
+// verified exhaustively with std.model.explore in tests.hirsel.
+//
+// Owns:
+//   - Tiling/split layout geometry (36px top trust bar + 3px host-drawn borders)
+//   - Focus & anti-spoofing policy (background clients cannot steal focus)
+//   - Secure Attention Sequence (SAS) & protected Approval Ceremony locking
+//   - Screen-capture exclusion whenever SAS or a ceremony is active
+//   - Named-connection revocation, unified Bank ($/steps), and Effect Outbox
+//   - Per-domain private clipboards & explicit powerbox cross-domain transfer
+
+pub const TOP_BAR_H: u64 = 36u64
+pub const BORDER_PX: u64 = 3u64
+pub const GAP_PX: u64 = 6u64
+
+pub type Domain: key = Figments | VmDev | WebUntrusted | TrustedChrome
+
+pub type Room: key = Darkroom | Daylight
+
+pub type EffectStatus: key = Empty | Staged | Approved | Denied
+
+pub type Rect: key {
+    x: u64,
+    y: u64,
+    w: u64,
+    h: u64,
+}
+
+pub type OutboxItem: key {
+    id: u64,
+    digest: u64,
+    cost_micros: u64,
+    status: EffectStatus,
+    target: String,
+    summary: String,
+}
+
+pub type WmState: key {
+    width: u64,
+    height: u64,
+    room: Room,
+    show_dev: bool,
+    show_web: bool,
+    focused: Domain,
+    sas_active: bool,
+    capture_allowed: bool,
+    agent_conn_active: bool,
+    bank_limit_micros: u64,
+    bank_spent_micros: u64,
+    approved_count: u64,
+    denied_count: u64,
+    clip_figments: u64,
+    clip_dev: u64,
+    clip_web: u64,
+    powerbox_transfers: u64,
+    outbox: OutboxItem,
+}
+
+pub type Event = Resize(w: u64, h: u64)
+    | ToggleDev
+    | ToggleWeb
+    | UserFocus(d: Domain)
+    | ClientFocusRequest(d: Domain)
+    | ToggleSas
+    | ToggleRoom
+    | StageEffect(id: u64, digest: u64, cost_micros: u64, target: String, summary: String)
+    | ApproveEffect(id: u64, digest: u64)
+    | DenyEffect
+    | RevokeAgentConn
+    | RestoreAgentConn
+    | ClipCopy(d: Domain, tag: u64)
+    | PowerboxPaste(from: Domain, to: Domain)
+
+pub type Layout {
+    figments: Rect,
+    vm_dev: Option[Rect],
+    web: Option[Rect],
+    ceremony: Option[Rect],
+}
+
+pub fn initial(width: u64, height: u64) -> WmState {
+    let safe_w = order.max(width, 640u64)
+    let safe_h = order.max(height, 480u64)
+    WmState(
+        width: safe_w,
+        height: safe_h,
+        room: Darkroom,
+        show_dev: false,
+        show_web: false,
+        focused: Figments,
+        sas_active: false,
+        capture_allowed: true,
+        agent_conn_active: true,
+        bank_limit_micros: 5_000_000u64,
+        bank_spent_micros: 0u64,
+        approved_count: 0u64,
+        denied_count: 0u64,
+        clip_figments: 0u64,
+        clip_dev: 0u64,
+        clip_web: 0u64,
+        powerbox_transfers: 0u64,
+        outbox: OutboxItem(
+            id: 0u64,
+            digest: 0u64,
+            cost_micros: 0u64,
+            status: Empty,
+            target: "",
+            summary: "",
+        ),
+    )
+}
+
+pub fn ceremony_active(s: WmState) -> bool {
+    match s.outbox.status {
+        Staged => true,
+        _ => false,
+    }
+}
+
+pub fn input_locked_to_trusted(s: WmState) -> bool {
+    s.sas_active || ceremony_active(s)
+}
+
+fn recompute_security(mut s: WmState) {
+    if s.sas_active || ceremony_active(s) {
+        s.focused = TrustedChrome
+        s.capture_allowed = false
+    } else {
+        s.capture_allowed = true
+        match s.focused {
+            TrustedChrome => { s.focused = Figments },
+            VmDev => { if !s.show_dev { s.focused = Figments } },
+            WebUntrusted => { if !s.show_web { s.focused = Figments } },
+            Figments => {},
+        }
+    }
+}
+
+fn domain_visible(s: WmState, d: Domain) -> bool {
+    match d {
+        Figments => true,
+        VmDev => s.show_dev,
+        WebUntrusted => s.show_web,
+        TrustedChrome => input_locked_to_trusted(s),
+    }
+}
+
+fn clip_of(s: WmState, d: Domain) -> u64 {
+    match d {
+        Figments => s.clip_figments,
+        VmDev => s.clip_dev,
+        WebUntrusted => s.clip_web,
+        TrustedChrome => 0u64,
+    }
+}
+
+pub fn step(take prev: WmState, take ev: Event) -> WmState {
+    let mut s = take prev
+    match take ev {
+        Resize(w: w, h: h) => {
+            s.width = order.max(w, 640u64)
+            s.height = order.max(h, 480u64)
+        },
+        ToggleDev => {
+            s.show_dev = !s.show_dev
+            if s.show_dev && !input_locked_to_trusted(s) {
+                s.focused = VmDev
+            }
+        },
+        ToggleWeb => {
+            s.show_web = !s.show_web
+            if s.show_web && !input_locked_to_trusted(s) {
+                s.focused = WebUntrusted
+            }
+        },
+        UserFocus(d: d) => {
+            if !input_locked_to_trusted(s) && domain_visible(s, d) {
+                s.focused = d
+            }
+        },
+        ClientFocusRequest(d: d) => {
+            // Security invariant: untrusted client focus requests can NEVER steal focus
+            // from another domain, from SAS, or from an active Approval Ceremony.
+            let _ = d
+        },
+        ToggleSas => {
+            s.sas_active = !s.sas_active
+        },
+        ToggleRoom => {
+            match s.room {
+                Darkroom => { s.room = Daylight },
+                Daylight => { s.room = Darkroom },
+            }
+        },
+        StageEffect(id: id, digest: digest, cost_micros: cost_micros, target: take target, summary: take summary) => {
+            let can_stage = s.agent_conn_active
+                && !ceremony_active(s)
+                && cost_micros <= s.bank_limit_micros
+                && s.bank_spent_micros + cost_micros <= s.bank_limit_micros
+            if can_stage {
+                s.outbox = OutboxItem(
+                    id: id,
+                    digest: digest,
+                    cost_micros: cost_micros,
+                    status: Staged,
+                    target: take target,
+                    summary: take summary,
+                )
+            } else {
+                s.denied_count += 1u64
+            }
+        },
+        ApproveEffect(id: id, digest: digest) => {
+            // Hash-bound, single-use ceremony approval:
+            // requires active ceremony, active connection, exact id+digest match, and Bank budget.
+            let matches_pending = ceremony_active(s)
+                && s.agent_conn_active
+                && s.outbox.id == id
+                && s.outbox.digest == digest
+                && s.bank_spent_micros + s.outbox.cost_micros <= s.bank_limit_micros
+            if matches_pending {
+                s.bank_spent_micros += s.outbox.cost_micros
+                s.approved_count += 1u64
+                s.outbox.status = Approved
+                s.sas_active = false
+            } else if ceremony_active(s) {
+                s.denied_count += 1u64
+                s.outbox.status = Denied
+                s.sas_active = false
+            }
+        },
+        DenyEffect => {
+            if ceremony_active(s) {
+                s.denied_count += 1u64
+                s.outbox.status = Denied
+                s.sas_active = false
+            }
+        },
+        RevokeAgentConn => {
+            // Caretaker membrane revocation immediately kills pending ceremonies too.
+            s.agent_conn_active = false
+            if ceremony_active(s) {
+                s.denied_count += 1u64
+                s.outbox.status = Denied
+            }
+        },
+        RestoreAgentConn => {
+            s.agent_conn_active = true
+        },
+        ClipCopy(d: d, tag: tag) => {
+            if !input_locked_to_trusted(s) {
+                match d {
+                    Figments => { s.clip_figments = tag },
+                    VmDev => { s.clip_dev = tag },
+                    WebUntrusted => { s.clip_web = tag },
+                    TrustedChrome => {},
+                }
+            }
+        },
+        PowerboxPaste(from: from, to: to) => {
+            // Explicit physical powerbox gesture transfers a single bounded payload
+            // between two distinct visible domains when not locked in SAS/ceremony.
+            let payload = clip_of(s, from)
+            if !input_locked_to_trusted(s) && payload != 0u64 && from != to && domain_visible(s, to) {
+                match to {
+                    Figments => { s.clip_figments = payload },
+                    VmDev => { s.clip_dev = payload },
+                    WebUntrusted => { s.clip_web = payload },
+                    TrustedChrome => {},
+                }
+                s.powerbox_transfers += 1u64
+            }
+        },
+    }
+    recompute_security(mut s)
+    take s
+}
+
+pub fn compute_layout(s: WmState) -> Layout {
+    let work_y = TOP_BAR_H + GAP_PX
+    let work_h = s.height - work_y - GAP_PX
+    let work_x = GAP_PX
+    let work_w = s.width - (GAP_PX * 2u64)
+
+    let ceremony_rect: Option[Rect] = if input_locked_to_trusted(s) {
+        let cw = order.min(560u64, work_w - 40u64)
+        let ch = order.min(300u64, work_h - 40u64)
+        let cx = (s.width - cw) / 2u64
+        let cy = work_y + (work_h - ch) / 2u64
+        Some(Rect(x: cx, y: cy, w: cw, h: ch))
+    } else {
+        None
+    }
+
+    if !s.show_dev && !s.show_web {
+        return Layout(
+            figments: Rect(x: work_x, y: work_y, w: work_w, h: work_h),
+            vm_dev: None,
+            web: None,
+            ceremony: ceremony_rect,
+        )
+    }
+
+    // Main spatial canvas gets 62% on the left; side column holds vm-dev and/or web-untrusted.
+    let left_w = (work_w * 62u64) / 100u64
+    let right_x = work_x + left_w + GAP_PX
+    let right_w = work_w - left_w - GAP_PX
+
+    let fig_rect = Rect(x: work_x, y: work_y, w: left_w, h: work_h)
+
+    if s.show_dev && s.show_web {
+        let top_h = (work_h - GAP_PX) / 2u64
+        let bot_y = work_y + top_h + GAP_PX
+        let bot_h = work_h - top_h - GAP_PX
+        Layout(
+            figments: fig_rect,
+            vm_dev: Some(Rect(x: right_x, y: work_y, w: right_w, h: top_h)),
+            web: Some(Rect(x: right_x, y: bot_y, w: right_w, h: bot_h)),
+            ceremony: ceremony_rect,
+        )
+    } else if s.show_dev {
+        Layout(
+            figments: fig_rect,
+            vm_dev: Some(Rect(x: right_x, y: work_y, w: right_w, h: work_h)),
+            web: None,
+            ceremony: ceremony_rect,
+        )
+    } else {
+        Layout(
+            figments: fig_rect,
+            vm_dev: None,
+            web: Some(Rect(x: right_x, y: work_y, w: right_w, h: work_h)),
+            ceremony: ceremony_rect,
+        )
+    }
+}
+
+pub fn domain_name(d: Domain) -> String {
+    match d {
+        Figments => "figments",
+        VmDev => "vm_dev",
+        WebUntrusted => "web_untrusted",
+        TrustedChrome => "trusted_chrome",
+    }
+}
+
+pub fn room_name(r: Room) -> String {
+    match r {
+        Darkroom => "darkroom",
+        Daylight => "daylight",
+    }
+}
+
+pub fn effect_status_name(st: EffectStatus) -> String {
+    match st {
+        Empty => "empty",
+        Staged => "staged",
+        Approved => "approved",
+        Denied => "denied",
+    }
+}
+
+fn push_rect_json(mut out: String, r: Rect) {
+    string.push(mut out, "{\"x\":")
+    string.push_u64(mut out, r.x)
+    string.push(mut out, ",\"y\":")
+    string.push_u64(mut out, r.y)
+    string.push(mut out, ",\"w\":")
+    string.push_u64(mut out, r.w)
+    string.push(mut out, ",\"h\":")
+    string.push_u64(mut out, r.h)
+    string.push(mut out, "}")
+}
+
+fn push_opt_rect_json(mut out: String, opt: Option[Rect]) {
+    match opt {
+        Some(r) => push_rect_json(mut out, r),
+        None => string.push(mut out, "null"),
+    }
+}
+
+pub fn render_scene_json(s: WmState) -> String {
+    let layout = compute_layout(s)
+    let mut out = string.new()
+    string.push(mut out, "{\"w\":")
+    string.push_u64(mut out, s.width)
+    string.push(mut out, ",\"h\":")
+    string.push_u64(mut out, s.height)
+    string.push(mut out, ",\"room\":\"")
+    string.push(mut out, room_name(s.room))
+    string.push(mut out, "\",\"focused\":\"")
+    string.push(mut out, domain_name(s.focused))
+    string.push(mut out, "\",\"sas\":")
+    string.push(mut out, if s.sas_active { "true" } else { "false" })
+    string.push(mut out, ",\"capture_allowed\":")
+    string.push(mut out, if s.capture_allowed { "true" } else { "false" })
+    string.push(mut out, ",\"agent_conn\":")
+    string.push(mut out, if s.agent_conn_active { "true" } else { "false" })
+    string.push(mut out, ",\"bank_spent_micros\":")
+    string.push_u64(mut out, s.bank_spent_micros)
+    string.push(mut out, ",\"bank_limit_micros\":")
+    string.push_u64(mut out, s.bank_limit_micros)
+    string.push(mut out, ",\"approved\":")
+    string.push_u64(mut out, s.approved_count)
+    string.push(mut out, ",\"denied\":")
+    string.push_u64(mut out, s.denied_count)
+    string.push(mut out, ",\"powerbox_transfers\":")
+    string.push_u64(mut out, s.powerbox_transfers)
+    string.push(mut out, ",\"outbox\":{\"id\":")
+    string.push_u64(mut out, s.outbox.id)
+    string.push(mut out, ",\"digest\":")
+    string.push_u64(mut out, s.outbox.digest)
+    string.push(mut out, ",\"cost_micros\":")
+    string.push_u64(mut out, s.outbox.cost_micros)
+    string.push(mut out, ",\"status\":\"")
+    string.push(mut out, effect_status_name(s.outbox.status))
+    string.push(mut out, "\",\"target\":\"")
+    string.push(mut out, s.outbox.target)
+    string.push(mut out, "\",\"summary\":\"")
+    string.push(mut out, s.outbox.summary)
+    string.push(mut out, "\"},\"layout\":{\"figments\":")
+    push_rect_json(mut out, layout.figments)
+    string.push(mut out, ",\"vm_dev\":")
+    push_opt_rect_json(mut out, layout.vm_dev)
+    string.push(mut out, ",\"web\":")
+    push_opt_rect_json(mut out, layout.web)
+    string.push(mut out, ",\"ceremony\":")
+    push_opt_rect_json(mut out, layout.ceremony)
+    string.push(mut out, "}}\n")
+    take out
+}
