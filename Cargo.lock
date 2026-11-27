@@ -111,6 +111,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hirsel-vm-host"
+version = "0.1.0"
+dependencies = [
+ "hirsel-vmm",
+ "zx-sys",
+]
+
+[[package]]
 name = "hirsel-vmm"
 version = "0.1.0"
 dependencies = [

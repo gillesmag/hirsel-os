@@ -338,33 +338,46 @@ pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan) {
     c.draw_text(rx, 14, &bank_txt, 1, muted);
 }
 
-pub fn paint_dev_pane(c: &mut Canvas<'_>, plan: &ScenePlan, lines: &[String]) {
+pub fn paint_dev_pane(c: &mut Canvas<'_>, plan: &ScenePlan, lines: &[String], input_buf: &str, vm_ready: bool) {
     c.fill_rect(0, 0, c.width, c.height, [10, 17, 24, 255]);
     c.fill_rect(0, 0, c.width, 30, [16, 78, 59, 255]);
-    c.draw_text(12, 11, "VM-DEV // TIER-2 LINUX MICROVM & POWERBOX CONSOLE", 1, [236, 253, 245, 255]);
+    let header = if vm_ready {
+        "VM-DEV // LINUX 6.1.102 AMD-SVM MICROVM (LIVE /dev/hvc0 + /mnt/data)"
+    } else {
+        "VM-DEV // BOOTING LINUX 6.1.102 AMD-SVM MICROVM..."
+    };
+    c.draw_text(12, 11, header, 1, [236, 253, 245, 255]);
 
     let status = format!(
-        "Zircon AMD-SVM: READY | Powerbox transfers: {} | Outbox: {}",
+        "VM:{} | Powerbox:{} | Outbox:{}",
+        if vm_ready { "READY" } else { "BOOTING" },
         plan.powerbox_transfers,
         plan.outbox.status.to_uppercase()
     );
-    c.draw_text(12, 42, &status, 1, [110, 231, 183, 255]);
-    c.fill_rect(12, 56, c.width.saturating_sub(24), 1, [30, 64, 55, 255]);
+    c.draw_text(12, 40, &status, 1, [110, 231, 183, 255]);
+    c.fill_rect(12, 54, c.width.saturating_sub(24), 1, [30, 64, 55, 255]);
 
-    let mut y = 68usize;
-    let max_lines = (c.height.saturating_sub(90)) / 14;
+    let mut y = 64usize;
+    let max_lines = (c.height.saturating_sub(114)) / 14;
     let start = lines.len().saturating_sub(max_lines);
     for line in &lines[start..] {
         c.draw_text(12, y, line, 1, [209, 250, 229, 255]);
         y += 14;
     }
 
-    let footer_y = c.height.saturating_sub(22);
-    c.fill_rect(0, footer_y.saturating_sub(4), c.width, 26, [15, 28, 38, 255]);
+    // Live interactive prompt line when vm-dev is focused
+    let prompt_y = c.height.saturating_sub(44);
+    c.fill_rect(8, prompt_y.saturating_sub(4), c.width.saturating_sub(16), 20, [14, 34, 42, 255]);
+    let cursor = if plan.focused == "vm_dev" { "_" } else { "" };
+    let prompt = format!("vm-dev# {input_buf}{cursor}");
+    c.draw_text(14, prompt_y + 2, &prompt, 1, [167, 243, 208, 255]);
+
+    let footer_y = c.height.saturating_sub(20);
+    c.fill_rect(0, footer_y.saturating_sub(4), c.width, 24, [15, 28, 38, 255]);
     c.draw_text(
         12,
         footer_y + 4,
-        "F2:Toggle Dev  F3:Toggle Web  F4:Room  F5:Stage Effect  F6:SAS  F7:Revoke",
+        "F1:Figments F2:Dev F3:Web F4:Room F5:Stage F6:SAS F7:Revoke",
         1,
         [148, 163, 184, 255],
     );

@@ -1,0 +1,14 @@
+[package]
+name = "hirsel_js"
+major = 1
+charge = "charge-v1"
+
+[dependencies]
+std = { major = 1 }
+js = { major = 1, root = "sha256:68b5e0fdc9453ecb07863a2b4e3eae05922959b223ff15a3828ea24c0a9657c6", archive = "js-1.hpkg" }
+
+[sources]
+"main.hirsel" = "main"
+
+[program]
+module = "main"

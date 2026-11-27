@@ -1041,16 +1041,57 @@ build-wm hirsel_dir="/workspace/hirsel":
     cp "{{out_dir}}/hirsel-wm" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-wm"
     ls -lh "{{out_dir}}/hirsel-wm"
 
-# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + hirsel-wm)
-build-desktop: build-wm
+# Cross-compile pure-Hirsel Figments js@1 sandbox (hirsel-js) to native x86_64-unknown-fuchsia ELF
+build-js hirsel_dir="/workspace/hirsel":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt"
+    PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
+      "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/hirsel-js" \
+        --libraries "{{hirsel_dir}}/core" --source-core --source-std \
+        --release --backend llvm --target x86_64-unknown-fuchsia \
+        --cc "{{root}}/scripts/fuchsia-clang" \
+        --runtime "{{root}}/target/hirsel-rt-fuchsia/x86_64-unknown-fuchsia/release/libhirsel_core_rt.a" \
+        --grant Stdin --grant Stdout --limit 134217728 \
+        -o "{{out_dir}}/hirsel-js"
+    "$STRIP" --strip-all "{{out_dir}}/hirsel-js"
+    cp "{{out_dir}}/hirsel-js" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-js"
+    ls -lh "{{out_dir}}/hirsel-js"
+
+# Cross-compile Rust Tier-2 Linux 6.1.102 AMD-SVM MicroVM host (hirsel-vm-host) for x86_64-unknown-fuchsia
+build-vm-host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILD_DIR="{{fuchsia}}/$(cat "{{fuchsia}}/.fx-build-dir")"
+    SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+    RUSTC="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/rustc"
+    CLANG="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/clang"
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    CARGO_BIN="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/cargo"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt"
+    RUSTC="$RUSTC" \
+    CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_LINKER="$CLANG" \
+    CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--target=x86_64-unknown-fuchsia -C link-arg=--sysroot=${SYSROOT} -C link-arg=-fuse-ld=lld -C link-arg=-L${SYSROOT}/lib -C link-arg=-L${BUILD_DIR}/user.basic_x64-shared -C link-arg=-L${BUILD_DIR}/user.libc_x64/link_stub -C link-arg=-L${BUILD_DIR}/x64-shared/link_stub -C link-arg=-L{{fuchsia}}/prebuilt/third_party/clang/linux-x64/lib/x86_64-unknown-fuchsia -C link-arg=-Wl,--no-as-needed -C link-arg=-lfdio -C link-arg=-Wl,--as-needed -C panic=abort" \
+      "$CARGO_BIN" build --manifest-path "{{root}}/Cargo.toml" -p hirsel-vm-host --target x86_64-unknown-fuchsia --release
+    "$STRIP" --strip-all "{{root}}/target/x86_64-unknown-fuchsia/release/hirsel-vm-host" -o "{{out_dir}}/hirsel-vm-host"
+    cp "{{out_dir}}/hirsel-vm-host" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-vm-host"
+    ls -lh "{{out_dir}}/hirsel-vm-host"
+
+# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + hirsel-wm + hirsel-js + Linux 6.1.102 vm-dev)
+build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ssh-initrd
     #!/usr/bin/env bash
     set -euo pipefail
     cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
-    mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src"
+    mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm"
     cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
+    cp "{{out_dir}}/linux/vmlinux.stripped" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/vmlinux.stripped"
+    cp "{{out_dir}}/linux/initramfs-ssh.cpio" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/initramfs-ssh.cpio"
     cd "{{fuchsia}}"
     if git apply --check "{{root}}/patches/fuchsia-hirsel-desktop.patch" 2>/dev/null; then
       git apply "{{root}}/patches/fuchsia-hirsel-desktop.patch"
@@ -1083,7 +1124,7 @@ boot-desktop vnc=":0":
       -smp 4,threads=2
       -device isa-debug-exit,iobase=0xf4,iosize=0x04
       -fw_cfg name=etc/sercon-port,string=0
-      -drive "file=${DISK},format=raw,if=none,id=vdisk,cache=unsafe"
+      -drive "file=${DISK},format=raw,if=none,id=vdisk,cache=writeback"
       -object iothread,id=iothread0
       -device virtio-blk-pci,drive=vdisk,iothread=iothread0
       -netdev "type=user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:7780-:7780,hostfwd=tcp:127.0.0.1:7711-:7711"

@@ -1,0 +1,9 @@
+[package]
+name = "hirsel-vm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hirsel-vmm = { path = "../hirsel-vmm" }
+zx-sys = { path = "../zx-sys" }

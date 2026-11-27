@@ -2,6 +2,8 @@
 #   - hirsel_session.cm: root session realm hosting hirsel_shell + web_engine context_provider
 #   - hirsel_shell: thin Rust Flatland presenter, Chromium 160 launcher, trusted chrome painter, egress-gw
 #   - bin/hirsel-wm: prebuilt pure-Hirsel deterministic window manager & security policy brain
+#   - bin/hirsel-js: prebuilt pure-Hirsel Figments js@1 deterministic JS sandbox Place
+#   - bin/hirsel-vm-host + data/vm/*: real Tier-2 Linux 6.1.102 AMD-SVM MicroVM host for vm-dev
 
 import("//build/bazel/bazel_inputs.gni")
 import("//build/components.gni")
@@ -15,14 +17,38 @@ resource("hirsel_wm_bin") {
   allow_binary_output_dir = true
 }
 
+resource("hirsel_js_bin") {
+  sources = [ "prebuilt/hirsel-js" ]
+  outputs = [ "bin/hirsel-js" ]
+  allow_binary_output_dir = true
+}
+
+resource("hirsel_vm_host_bin") {
+  sources = [ "prebuilt/hirsel-vm-host" ]
+  outputs = [ "bin/hirsel-vm-host" ]
+  allow_binary_output_dir = true
+}
+
+resource("vm_linux_kernel") {
+  sources = [ "prebuilt/vm/vmlinux.stripped" ]
+  outputs = [ "data/vm/vmlinux.stripped" ]
+}
+
+resource("vm_linux_initrd") {
+  sources = [ "prebuilt/vm/initramfs-ssh.cpio" ]
+  outputs = [ "data/vm/initramfs-ssh.cpio" ]
+}
+
 rustc_binary("hirsel_shell_bin") {
   output_name = "hirsel_shell"
   edition = "2024"
   source_root = "src/main.rs"
   sources = [
     "src/font8x16.rs",
+    "src/js_client.rs",
     "src/main.rs",
     "src/painter.rs",
+    "src/vm_client.rs",
     "src/web_content.rs",
     "src/wm_client.rs",
   ]
@@ -30,11 +56,13 @@ rustc_binary("hirsel_shell_bin") {
     "//sdk/fidl/fuchsia.images2:fuchsia.images2_rust",
     "//sdk/fidl/fuchsia.input:fuchsia.input_rust",
     "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_rust",
     "//sdk/fidl/fuchsia.math:fuchsia.math_rust",
     "//sdk/fidl/fuchsia.session.scene:fuchsia.session.scene_rust",
     "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_rust",
     "//sdk/fidl/fuchsia.ui.composition:fuchsia.ui.composition_rust",
     "//sdk/fidl/fuchsia.ui.input3:fuchsia.ui.input3_rust",
+    "//sdk/fidl/fuchsia.ui.pointer:fuchsia.ui.pointer_rust",
     "//sdk/fidl/fuchsia.ui.views:fuchsia.ui.views_rust",
     "//sdk/fidl/fuchsia.web:fuchsia.web_rust",
     "//sdk/rust/zx",
@@ -70,8 +98,12 @@ fuchsia_component_manifest("hirsel_shell_manifest") {
 fuchsia_component("hirsel_shell_component") {
   cm_label = ":hirsel_shell_manifest"
   deps = [
+    ":hirsel_js_bin",
     ":hirsel_shell_bin",
+    ":hirsel_vm_host_bin",
     ":hirsel_wm_bin",
+    ":vm_linux_initrd",
+    ":vm_linux_kernel",
   ]
 }
 

@@ -71,6 +71,7 @@
                 "fuchsia.fonts.Provider",
                 "fuchsia.hwinfo.Product",
                 "fuchsia.intl.PropertyProvider",
+                "fuchsia.kernel.HypervisorResource",
                 "fuchsia.kernel.VmexResource",
                 "fuchsia.media.Audio",
                 "fuchsia.media.AudioDeviceEnumerator",

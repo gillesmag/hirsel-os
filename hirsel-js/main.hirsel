@@ -1,0 +1,118 @@
+// Pure-Hirsel Figments JS Sandbox Place (hirsel-js).
+//
+// Uses the exact `js@1` deterministic JS engine from figments-hirsel/codemode.
+// Runs in a zero-ambient Zircon Job with ONLY Stdin and Stdout pipes:
+// reads one JS snippet per line from Stdin, runs it under strict fuel (5M) &
+// heap (16 MiB) limits, and emits a JSON result line to Stdout.
+
+fn escape_json(s: String) -> String {
+    let mut out = string.new()
+    let raw_bytes = string.as_bytes(s)
+    let n = list.len(raw_bytes)
+    let mut i = 0u64
+    while i < n {
+        let b = raw_bytes[i]
+        if b == 34u8 {
+            string.push(mut out, "\\\"")
+        } else if b == 92u8 {
+            string.push(mut out, "\\\\")
+        } else if b == 10u8 {
+            string.push(mut out, "\\n")
+        } else if b == 13u8 {
+            string.push(mut out, "\\r")
+        } else if b == 9u8 {
+            string.push(mut out, "\\t")
+        } else if b >= 32u8 && b < 127u8 {
+            let mut one: Bytes = list.new()
+            list.push(mut one, b)
+            match string.from_utf8(take one) {
+                Ok(take ch) => string.push(mut out, ch),
+                Error(_) => {},
+            }
+        }
+        i += 1u64
+    }
+    take out
+}
+
+fn eval_line(src: String) -> String {
+    let names: List[String] = list.new()
+    let prog = match js.compile(src, names) {
+        Ok(take p) => take p,
+        Error(take d) => {
+            let mut out = string.new()
+            string.push(mut out, "{\"ok\":false,\"kind\":\"")
+            string.push(mut out, escape_json(d.kind))
+            string.push(mut out, "\",\"error\":\"")
+            string.push(mut out, escape_json(d.message))
+            string.push(mut out, "\"}\n")
+            return take out
+        },
+    }
+    let lim = js.val.Limits(
+        fuel: 5_000_000u64,
+        heap_bytes: 16_777_216u64,
+        max_depth: 128u32,
+        max_output_bytes: 65_536u64,
+    )
+    let mut vm = js.start(take prog, lim, 42u64, 1700000000000u64)
+    match js.run(mut vm) {
+        Done(take outcome) => match take outcome {
+            OkValue(take raw, take logs) => {
+                let val_str = match string.from_utf8(take raw) {
+                    Ok(take s) => take s,
+                    Error(_) => "<bytes>",
+                }
+                let mut log_joined = string.new()
+                let mut first = true
+                for entry in logs {
+                    if !first {
+                        string.push(mut log_joined, " | ")
+                    }
+                    first = false
+                    string.push(mut log_joined, entry.text)
+                }
+                let mut out = string.new()
+                string.push(mut out, "{\"ok\":true,\"value\":\"")
+                string.push(mut out, escape_json(take val_str))
+                string.push(mut out, "\",\"logs\":\"")
+                string.push(mut out, escape_json(take log_joined))
+                string.push(mut out, "\"}\n")
+                take out
+            },
+            OkBlob(_, _) => "{\"ok\":true,\"value\":\"<blob>\",\"logs\":\"\"}\n",
+            Failed(take d, take logs) => {
+                let _ = logs
+                let mut out = string.new()
+                string.push(mut out, "{\"ok\":false,\"kind\":\"")
+                string.push(mut out, escape_json(d.kind))
+                string.push(mut out, "\",\"error\":\"")
+                string.push(mut out, escape_json(d.message))
+                string.push(mut out, "\"}\n")
+                take out
+            },
+        },
+        _ => "{\"ok\":false,\"kind\":\"HostCall\",\"error\":\"host calls disabled in pure eval mode\"}\n",
+    }
+}
+
+pub fn main(input: Stdin, out: Stdout) -> Result[(), Exit] waits {
+    let _ = stdout.write(out, "{\"ready\":true,\"engine\":\"figments-hirsel-js@1\"}\n")
+    let mut reader = std.io.lines(Stdin(input), 65536u64)
+    let mut buf = string.new()
+    loop {
+        string.clear(mut buf)
+        match std.io.read_line(mut reader, mut buf) {
+            Ok(true) => {
+                let trimmed = string.from(string.trim_ascii(buf))
+                if string.byte_len(trimmed) > 0u64 {
+                    let res = eval_line(take trimmed)
+                    let _ = stdout.write(out, res)
+                }
+            },
+            Ok(false) => { break },
+            Error(_) => { break },
+        }
+    }
+    Ok(())
+}
