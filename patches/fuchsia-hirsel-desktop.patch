@@ -10,6 +10,18 @@ index 846aa1dc25c..d3cd2083787 100644
      "//products/microfuchsia:*",
      "//products/minimal:*",
      "//products/terminal:*",
+diff --git a/build/config/rust/lints/BUILD.gn b/build/config/rust/lints/BUILD.gn
+index b30f128e821..634a20e6a00 100644
+--- a/build/config/rust/lints/BUILD.gn
++++ b/build/config/rust/lints/BUILD.gn
+@@ -63,6 +63,7 @@ config("allow_unused_crate_dependencies") {
+   # Please do not add to this list.
+   visibility = [
+     "//examples/*",
++    "//products/hirsel_desktop/*",
+     "//sdk/*",
+     "//src/*",
+     "//tools/*",
 diff --git a/products/BUILD.gn b/products/BUILD.gn
 index 135cb5b6ff7..4839a101048 100644
 --- a/products/BUILD.gn

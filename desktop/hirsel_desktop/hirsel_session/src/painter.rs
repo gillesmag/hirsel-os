@@ -432,7 +432,13 @@ pub fn paint_dev_pane(c: &mut Canvas<'_>, plan: &ScenePlan, lines: &[String], in
     );
 }
 
-pub fn paint_ceremony_card(c: &mut Canvas<'_>, plan: &ScenePlan) {
+pub fn paint_ceremony_card(
+    c: &mut Canvas<'_>,
+    plan: &ScenePlan,
+    sas_host: &str,
+    sas_secret_len: usize,
+    sas_status: &str,
+) {
     let is_outbox = plan.outbox.status == "staged";
     c.fill_rect(0, 0, c.width, c.height, [20, 14, 22, 255]);
     c.stroke_rect(0, 0, c.width, c.height, 4, [239, 68, 68, 255]);
@@ -442,7 +448,7 @@ pub fn paint_ceremony_card(c: &mut Canvas<'_>, plan: &ScenePlan) {
     let title = if is_outbox {
         "PROTECTED EFFECT OUTBOX APPROVAL CEREMONY"
     } else {
-        "SECURE ATTENTION SEQUENCE (SAS) LOCKDOWN"
+        "SECURE ATTENTION SEQUENCE (SAS) // SEALED VAULT"
     };
     c.draw_text(18, 18, title, 1, [255, 255, 255, 255]);
 
@@ -480,20 +486,40 @@ pub fn paint_ceremony_card(c: &mut Canvas<'_>, plan: &ScenePlan) {
         c.fill_rect(276, by, 240, 40, [185, 28, 28, 255]);
         c.draw_text(308, by + 16, "[ESC] DENY EFFECT", 1, [255, 255, 255, 255]);
     } else {
-        c.draw_text(18, 102, "UNTRUSTED APPS CANNOT RECEIVE INPUT OR READ PIXELS.", 1, [248, 250, 252, 255]);
-        let l2 = format!(
-            "APPROVED: {}   DENIED: {}   POWERBOX: {}",
-            plan.approved, plan.denied, plan.powerbox_transfers
+        c.draw_text(
+            18,
+            92,
+            "DIRECT KEYBOARD ENTRY -> ISOLATED egress_gw.cm (FIDL)",
+            1,
+            [248, 250, 252, 255],
         );
-        let l3 = format!(
-            "CARETAKER AGENT CONNECTION: {}",
-            if plan.agent_conn { "ACTIVE (F7 TO REVOKE)" } else { "REVOKED (F7 TO RESTORE)" }
-        );
-        c.draw_text(18, 134, &l2, 1, [167, 243, 208, 255]);
-        c.draw_text(18, 162, &l3, 1, [253, 224, 71, 255]);
+        let host_line = format!("HOST [TAB] : {sas_host}");
+        c.draw_text(18, 116, &host_line, 1, [147, 197, 253, 255]);
+
+        // Masked secret input field (never displays plaintext!)
+        c.fill_rect(18, 138, c.width.saturating_sub(36), 28, [34, 20, 38, 255]);
+        c.stroke_rect(18, 138, c.width.saturating_sub(36), 28, 1, [239, 68, 68, 255]);
+        let stars: String = "*".repeat(sas_secret_len.min(36));
+        let mask_line = format!("API KEY    : {stars}_");
+        c.draw_text(26, 146, &mask_line, 1, [167, 243, 208, 255]);
+
+        let status_line = if sas_status.is_empty() {
+            format!(
+                "CARETAKER: {} | APPROVED:{} POWERBOX:{}",
+                if plan.agent_conn { "ACTIVE" } else { "REVOKED" },
+                plan.approved,
+                plan.powerbox_transfers
+            )
+        } else {
+            sas_status.to_string()
+        };
+        c.draw_text(18, 180, &status_line, 1, [253, 224, 71, 255]);
 
         let by = c.height.saturating_sub(62);
-        c.fill_rect(18, by, 280, 40, [37, 99, 235, 255]);
-        c.draw_text(38, by + 16, "[F6 / ESC] EXIT SAS LOCK", 1, [255, 255, 255, 255]);
+        c.fill_rect(18, by, 250, 40, [22, 163, 74, 255]);
+        c.draw_text(30, by + 16, "[ENTER] SEAL API KEY", 1, [255, 255, 255, 255]);
+
+        c.fill_rect(280, by, 240, 40, [37, 99, 235, 255]);
+        c.draw_text(300, by + 16, "[F6 / ESC] EXIT SAS", 1, [255, 255, 255, 255]);
     }
 }

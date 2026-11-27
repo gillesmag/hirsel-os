@@ -27,6 +27,7 @@ use fidl_fuchsia_ui_input3 as finput3;
 use fidl_fuchsia_ui_pointer as fptr;
 use fidl_fuchsia_ui_views as fviews;
 use fidl_fuchsia_web as fweb;
+use fidl_fuchsia_hirsel_egress as fegress;
 use fuchsia_async as fasync;
 use fuchsia_component::client::connect_to_protocol;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -37,6 +38,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vm_client::{VmClient, VmEvent, VmExecResult};
 use wm_client::{RectJson, ScenePlan, WmClient};
@@ -44,7 +46,14 @@ use wm_client::{RectJson, ScenePlan, WmClient};
 const TOP_BAR_H: u32 = 36;
 const BORDER_PX: i32 = 3;
 const STATE_PATH: &str = "/data/hirsel_state.json";
-const EGRESS_GW_PORT: u16 = 7781;
+const SAS_HOSTS: &[&str] = &["api.anthropic.com", "api.openai.com", "api.github.com", "example.com"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpRole {
+    HostControl,
+    Figments,
+    UntrustedWeb,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
@@ -165,6 +174,7 @@ enum ShellMsg {
     DevKeyChar(char),
     DevKeyBackspace,
     DevKeyEnter,
+    SasCycleHost,
     ChildViewRef {
         domain: &'static str,
         view_ref: fviews::ViewRef,
@@ -234,6 +244,11 @@ struct HirselShell {
     wm: WmClient,
     board: BoardClient,
     agent: Option<AgentClient>,
+    egress: fegress::GatewayProxy,
+    agent_conn_flag: Arc<AtomicBool>,
+    sas_host_idx: usize,
+    sas_secret_input: String,
+    sas_status: String,
     untrusted_origin: String,
     clipboards: HashMap<String, String>,
     next_effect_id: u64,
@@ -250,50 +265,98 @@ fn rgba_f(r: f32, g: f32, b: f32, a: f32) -> fland::ColorRgba {
     fland::ColorRgba { red: r, green: g, blue: b, alpha: a }
 }
 
-async fn call_egress_gw(
-    method: &str,
-    path: &str,
-    body: &str,
+fn generate_session_token() -> String {
+    let mut bytes = [0u8; 16];
+    zx::cprng_draw(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn egress_health(gw: &fegress::GatewayProxy) -> Result<serde_json::Value> {
+    let raw = gw.health().await.context("FIDL egress.Health")?;
+    Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"raw": raw})))
+}
+
+async fn egress_list_secrets(gw: &fegress::GatewayProxy) -> Result<serde_json::Value> {
+    let raw = gw.list_secrets().await.context("FIDL egress.ListSecrets")?;
+    Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"raw": raw})))
+}
+
+async fn egress_store_secret(
+    gw: &fegress::GatewayProxy,
+    host: &str,
+    value: &str,
     sas_authorized: bool,
 ) -> Result<(u16, serde_json::Value)> {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_GW_PORT);
-    let mut stream = fasync::net::TcpStream::connect(addr)
-        .context("egress_gw TCP connect init")?
+    let (status, raw) = gw
+        .store_secret(host, value, sas_authorized)
         .await
-        .context("egress_gw TCP connect")?;
-    let sas_hdr = if sas_authorized { "X-Hirsel-Sas-Authorized: true\r\n" } else { "" };
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{EGRESS_GW_PORT}\r\n{sas_hdr}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).await.context("write egress_gw request")?;
-    stream.flush().await.ok();
+        .context("FIDL egress.StoreSecret")?;
+    let val = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"raw": raw}));
+    Ok((status, val))
+}
 
-    let mut resp = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 1024];
-    loop {
-        match stream.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                resp.extend_from_slice(&chunk[..n]);
-                if resp.len() >= 65536 {
-                    break;
-                }
+async fn egress_proxy(gw: &fegress::GatewayProxy, req_json: &str) -> Result<(u16, serde_json::Value)> {
+    let (status, raw) = gw.proxy_(req_json).await.context("FIDL egress.Proxy")?;
+    let val = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"raw": raw}));
+    Ok((status, val))
+}
+
+async fn try_live_llm_plan(gw: &fegress::GatewayProxy, goal: &str) -> Option<(String, String)> {
+    let meta = egress_list_secrets(gw).await.ok()?;
+    let secrets = meta["secrets"].as_array()?;
+    let has_anthropic = secrets
+        .iter()
+        .any(|s| s["host"].as_str() == Some("api.anthropic.com") && s["live"].as_bool() == Some(true));
+    let has_openai = secrets
+        .iter()
+        .any(|s| s["host"].as_str() == Some("api.openai.com") && s["live"].as_bool() == Some(true));
+
+    if has_anthropic {
+        let req_body = serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": format!("In 1 short sentence, summarize plan for Hirsel-OS workstation goal: {goal}")}]
+        })
+        .to_string();
+        let proxy_req = serde_json::json!({
+            "host": "api.anthropic.com",
+            "port": 443,
+            "scheme": "https",
+            "method": "POST",
+            "path": "/v1/messages",
+            "body": req_body
+        })
+        .to_string();
+        if let Ok((200, resp)) = egress_proxy(gw, &proxy_req).await {
+            if resp["http_status"].as_u64() == Some(200) {
+                let text = resp["body"].as_str().unwrap_or("").chars().take(120).collect();
+                return Some(("live_https_anthropic".to_string(), text));
             }
-            Err(_) => break,
+        }
+    } else if has_openai {
+        let req_body = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "max_tokens": 96,
+            "messages": [{"role": "user", "content": format!("In 1 short sentence, summarize plan for Hirsel-OS workstation goal: {goal}")}]
+        })
+        .to_string();
+        let proxy_req = serde_json::json!({
+            "host": "api.openai.com",
+            "port": 443,
+            "scheme": "https",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "body": req_body
+        })
+        .to_string();
+        if let Ok((200, resp)) = egress_proxy(gw, &proxy_req).await {
+            if resp["http_status"].as_u64() == Some(200) {
+                let text = resp["body"].as_str().unwrap_or("").chars().take(120).collect();
+                return Some(("live_https_openai".to_string(), text));
+            }
         }
     }
-    let text = String::from_utf8_lossy(&resp);
-    let status = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(502);
-    let resp_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
-    let val = serde_json::from_str::<serde_json::Value>(resp_body)
-        .unwrap_or_else(|_| serde_json::json!({ "raw": resp_body }));
-    Ok((status, val))
+    None
 }
 
 fn extract_origin(url: &str) -> String {
@@ -307,7 +370,11 @@ fn extract_origin(url: &str) -> String {
 }
 
 impl HirselShell {
-    async fn new(tx: UnboundedSender<ShellMsg>, diag: Arc<Mutex<Vec<String>>>) -> Result<Self> {
+    async fn new(
+        tx: UnboundedSender<ShellMsg>,
+        diag: Arc<Mutex<Vec<String>>>,
+        egress: fegress::GatewayProxy,
+    ) -> Result<Self> {
         // 1. Spawn pure-Hirsel hirsel-wm + hirsel-board + hirsel-agent first (all zero-ambient Zircon Jobs!)
         let mut wm = WmClient::spawn().await.context("spawn pure-Hirsel hirsel-wm")?;
         let board = BoardClient::spawn().await.context("spawn pure-Hirsel hirsel-board")?;
@@ -357,21 +424,21 @@ impl HirselShell {
         };
 
         // 3. Spawn real Tier-2 Linux 6.1.102 AMD-SVM MicroVM host in background!
+        // Handle VmEvent::EgressReq concurrently in this task so Linux virtio-net -> FIDL egress_gw
+        // NEVER deadlocks while DevExec is awaiting a guest command!
         let (vm_ev_tx, mut vm_ev_rx) = unbounded::<VmEvent>();
-        let shell_tx_vm = tx.clone();
-        fasync::Task::local(async move {
-            while let Some(ev) = vm_ev_rx.next().await {
-                let _ = shell_tx_vm.unbounded_send(ShellMsg::VmIncoming(ev));
-            }
-        })
-        .detach();
-
+        let agent_conn_flag = Arc::new(AtomicBool::new(wm.latest.agent_conn));
+        let vm_holder: Arc<Mutex<Option<Arc<VmClient>>>> = Arc::new(Mutex::new(None));
         let vm_client = match VmClient::spawn(vm_ev_tx).await {
             Ok(v) => {
                 if let Ok(mut g) = diag.lock() {
                     g.push("hirsel-vm-host (Linux 6.1.102 AMD-SVM) spawned OK".to_string());
                 }
-                Some(Arc::new(v))
+                let arc_v = Arc::new(v);
+                if let Ok(mut h) = vm_holder.lock() {
+                    *h = Some(Arc::clone(&arc_v));
+                }
+                Some(arc_v)
             }
             Err(e) => {
                 warn!("hirsel-vm-host unavailable: {e:#}");
@@ -381,6 +448,61 @@ impl HirselShell {
                 None
             }
         };
+
+        let shell_tx_vm = tx.clone();
+        let egress_vm = egress.clone();
+        let conn_flag_vm = Arc::clone(&agent_conn_flag);
+        fasync::Task::local(async move {
+            while let Some(ev) = vm_ev_rx.next().await {
+                match ev {
+                    VmEvent::EgressReq { id, raw_http } => {
+                        let allowed_conn = conn_flag_vm.load(Ordering::Relaxed);
+                        let eg = egress_vm.clone();
+                        let vm_opt = vm_holder.lock().ok().and_then(|g| g.clone());
+                        fasync::Task::local(async move {
+                            let first = raw_http.lines().next().unwrap_or("");
+                            let mut parts = first.split_whitespace();
+                            let method = parts.next().unwrap_or("GET");
+                            let path = parts.next().unwrap_or("/");
+                            let body = raw_http.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+
+                            let (status_line, json_body): (&str, String) = if !allowed_conn {
+                                (
+                                    "403 Forbidden",
+                                    serde_json::json!({"allowed": false, "reason": "caretaker_connection_revoked"}).to_string(),
+                                )
+                            } else if method == "GET" && path == "/health" {
+                                match egress_health(&eg).await {
+                                    Ok(v) => ("200 OK", v.to_string()),
+                                    Err(e) => ("502 Bad Gateway", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                                }
+                            } else if method == "POST" && path == "/proxy" {
+                                match egress_proxy(&eg, body).await {
+                                    Ok((200, v)) => ("200 OK", v.to_string()),
+                                    Ok((403, v)) => ("403 Forbidden", v.to_string()),
+                                    Ok((_, v)) => ("502 Bad Gateway", v.to_string()),
+                                    Err(e) => ("502 Bad Gateway", serde_json::json!({"allowed": false, "error": format!("{e:#}")}).to_string()),
+                                }
+                            } else {
+                                ("404 Not Found", r#"{"error":"only /health and /proxy exposed to vm-dev"}"#.to_string())
+                            };
+                            let resp = format!(
+                                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+                                json_body.len()
+                            );
+                            if let Some(vm) = vm_opt {
+                                let _ = vm.send_egress_res(id, resp.as_bytes()).await;
+                            }
+                        })
+                        .detach();
+                    }
+                    other => {
+                        let _ = shell_tx_vm.unbounded_send(ShellMsg::VmIncoming(other));
+                    }
+                }
+            }
+        })
+        .detach();
 
         // 4. Connect to Scene Manager & Flatland root view.
         let scene_manager = connect_to_protocol::<scene::ManagerMarker>()
@@ -564,7 +686,12 @@ impl HirselShell {
             wm,
             board,
             agent,
-            untrusted_origin: "http://127.0.0.1:7711".to_string(),
+            egress,
+            agent_conn_flag,
+            sas_host_idx: 0,
+            sas_secret_input: String::new(),
+            sas_status: String::new(),
+            untrusted_origin: "http://127.0.0.1:7712".to_string(),
             clipboards: HashMap::new(),
             next_effect_id: 1,
             pending_effect: None,
@@ -763,10 +890,10 @@ impl HirselShell {
         let sw = plan.w as u32;
         let sh = plan.h as u32;
 
-        // Lazily spawn isolated Chromium Context #2 when web pane is toggled ON
+        // Lazily spawn isolated Chromium Context #2 when web pane is toggled ON (separate :7712 server!)
         if plan.layout.web.is_some() && self.untrusted_web.is_none() {
             if let Err(e) =
-                self.launch_web_context("web_untrusted", "http://127.0.0.1:7711/untrusted").await
+                self.launch_web_context("web_untrusted", "http://127.0.0.1:7712/untrusted").await
             {
                 error!("Failed to launch untrusted Chromium context: {e:?}");
             }
@@ -955,7 +1082,10 @@ impl HirselShell {
                 self.ceremony_surface = Some(surf);
             }
             if let Some(ref surf) = self.ceremony_surface {
-                surf.paint_with(|c| painter::paint_ceremony_card(c, &plan));
+                let host = SAS_HOSTS[self.sas_host_idx % SAS_HOSTS.len()];
+                let slen = self.sas_secret_input.len();
+                let stxt = self.sas_status.clone();
+                surf.paint_with(|c| painter::paint_ceremony_card(c, &plan, host, slen, &stxt));
             }
             self.flatland.set_solid_fill(
                 &self.dim_content,
@@ -1031,7 +1161,8 @@ impl HirselShell {
         match msg {
             ShellMsg::WmCommand { cmd, reply } => {
                 let res = self.wm.send(&cmd).await;
-                if res.is_ok() {
+                if let Ok(ref st) = res {
+                    self.agent_conn_flag.store(st.agent_conn, Ordering::Relaxed);
                     self.persist_state();
                     if let Err(e) = self.apply_scene().await {
                         error!("apply_scene error: {e:?}");
@@ -1095,6 +1226,10 @@ impl HirselShell {
                 //   hirsel-agent -> hirsel-js -> Linux vm-dev -> hirsel-board -> Protected Outbox Ceremony!
                 let mut trace = Vec::<serde_json::Value>::new();
                 let run_res: Result<serde_json::Value> = async {
+                    // Step 0: Check if a live LLM key is sealed in egress_gw.cm (real HTTPS TLS 1.3!)
+                    let llm_opt = try_live_llm_plan(&self.egress, &goal).await;
+                    let llm_mode = llm_opt.as_ref().map(|(m, _)| m.as_str()).unwrap_or("deterministic_offline").to_string();
+
                     let Some(ref mut agent) = self.agent else {
                         return Err(anyhow::anyhow!("hirsel-agent not running"));
                     };
@@ -1160,6 +1295,8 @@ impl HirselShell {
 
                     Ok(serde_json::json!({
                         "ok": true,
+                        "llm_mode": llm_mode,
+                        "llm_summary": llm_opt.map(|(_, t)| t),
                         "phase": step4["phase"],
                         "ceremony_staged": wm_st.outbox.status == "staged",
                         "js_result": js_out,
@@ -1228,6 +1365,7 @@ impl HirselShell {
                         let _ = self.apply_scene().await;
                     }
                 }
+                VmEvent::EgressReq { .. } => {}
             },
             ShellMsg::DevExec { cmd, reply } => {
                 let res = self.run_dev_exec(cmd).await;
@@ -1338,12 +1476,12 @@ impl HirselShell {
                                     "body": ""
                                 })
                                 .to_string();
-                                match call_egress_gw("POST", "/proxy", &proxy_req, false).await {
+                                match egress_proxy(&self.egress, &proxy_req).await {
                                     Ok((gw_status, gw_val)) => {
                                         let http_status = gw_val["http_status"].as_u64().unwrap_or(gw_status as u64);
                                         let body = gw_val["body"].as_str().unwrap_or("").to_string();
                                         let entry = format!(
-                                            "effect#{} APPROVED & EXECUTED via egress_gw.cm {} {}:{}{} -> HTTP {}",
+                                            "effect#{} APPROVED & EXECUTED via egress_gw.cm (FIDL) {} {}:{}{} -> HTTP {}",
                                             outbox.id, eff.method, eff.host, eff.port, eff.path, http_status
                                         );
                                         self.audit_log.push(entry);
@@ -1353,6 +1491,7 @@ impl HirselShell {
                                         exec_info = serde_json::json!({
                                             "executed": true,
                                             "gateway": "egress_gw.cm",
+                                            "transport": "fidl",
                                             "http_status": http_status,
                                             "secret_injected": gw_val["secret_injected"],
                                             "body": body,
@@ -1446,8 +1585,20 @@ impl HirselShell {
                     }
                 }
             }
+            ShellMsg::SasCycleHost => {
+                if self.wm.latest.sas && self.wm.latest.outbox.status != "staged" {
+                    self.sas_host_idx = (self.sas_host_idx + 1) % SAS_HOSTS.len();
+                    self.sas_status.clear();
+                    let _ = self.apply_scene().await;
+                }
+            }
             ShellMsg::DevKeyChar(ch) => {
-                if self.wm.latest.focused == "vm_dev" && self.dev_input.len() < 120 {
+                if self.wm.latest.sas && self.wm.latest.outbox.status != "staged" {
+                    if self.sas_secret_input.len() < 128 {
+                        self.sas_secret_input.push(ch);
+                        let _ = self.apply_scene().await;
+                    }
+                } else if self.wm.latest.focused == "vm_dev" && self.dev_input.len() < 120 {
                     self.dev_input.push(ch);
                     if self.dev_attached {
                         let _ = self.apply_scene().await;
@@ -1455,7 +1606,10 @@ impl HirselShell {
                 }
             }
             ShellMsg::DevKeyBackspace => {
-                if self.wm.latest.focused == "vm_dev" {
+                if self.wm.latest.sas && self.wm.latest.outbox.status != "staged" {
+                    self.sas_secret_input.pop();
+                    let _ = self.apply_scene().await;
+                } else if self.wm.latest.focused == "vm_dev" {
                     self.dev_input.pop();
                     if self.dev_attached {
                         let _ = self.apply_scene().await;
@@ -1465,6 +1619,21 @@ impl HirselShell {
             ShellMsg::DevKeyEnter => {
                 if self.wm.latest.outbox.status == "staged" {
                     let _ = self.tx.unbounded_send(ShellMsg::ApprovePending { reply: None });
+                } else if self.wm.latest.sas && !self.sas_secret_input.is_empty() {
+                    let host = SAS_HOSTS[self.sas_host_idx % SAS_HOSTS.len()];
+                    let secret = std::mem::take(&mut self.sas_secret_input);
+                    match egress_store_secret(&self.egress, host, &secret, true).await {
+                        Ok((200, _)) => {
+                            self.sas_status = format!("SEALED OK -> {host} (egress_gw.cm FIDL)");
+                        }
+                        Ok((code, _)) => {
+                            self.sas_status = format!("SEAL FAILED HTTP {code}");
+                        }
+                        Err(e) => {
+                            self.sas_status = format!("SEAL FIDL ERR: {e}");
+                        }
+                    }
+                    let _ = self.apply_scene().await;
                 } else if self.wm.latest.focused == "vm_dev" && !self.dev_input.trim().is_empty() {
                     let cmd = std::mem::take(&mut self.dev_input);
                     let _ = self.run_dev_exec(cmd).await;
@@ -1621,6 +1790,10 @@ fn spawn_keyboard_listener(view_ref: fviews::ViewRef, tx: UnboundedSender<ShellM
                         let _ = tx.unbounded_send(ShellMsg::DevKeyBackspace);
                         handled = finput3::KeyEventStatus::Handled;
                     }
+                    Some(finput::Key::Tab) => {
+                        let _ = tx.unbounded_send(ShellMsg::SasCycleHost);
+                        handled = finput3::KeyEventStatus::Handled;
+                    }
                     _ => {
                         if let Some(finput3::KeyMeaning::Codepoint(cp)) = event.key_meaning {
                             if let Some(ch) = char::from_u32(cp) {
@@ -1639,12 +1812,19 @@ fn spawn_keyboard_listener(view_ref: fviews::ViewRef, tx: UnboundedSender<ShellM
     .detach();
 }
 
-fn spawn_http_server(port: u16, tx: UnboundedSender<ShellMsg>, diag: Arc<Mutex<Vec<String>>>) {
+fn spawn_http_server(
+    port: u16,
+    role: HttpRole,
+    session_token: String,
+    egress: fegress::GatewayProxy,
+    tx: UnboundedSender<ShellMsg>,
+    diag: Arc<Mutex<Vec<String>>>,
+) {
     fasync::Task::local(async move {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let listener = match fasync::net::TcpListener::bind(&addr) {
             Ok(l) => {
-                info!("Hirsel-OS HTTP / egress-gw listening on 0.0.0.0:{port}");
+                info!("Hirsel-OS HTTP listener on 0.0.0.0:{port}");
                 l
             }
             Err(e) => {
@@ -1657,8 +1837,10 @@ fn spawn_http_server(port: u16, tx: UnboundedSender<ShellMsg>, diag: Arc<Mutex<V
             if let Ok((stream, _peer)) = conn {
                 let tx_conn = tx.clone();
                 let diag_conn = diag.clone();
+                let tok = session_token.clone();
+                let eg = egress.clone();
                 fasync::Task::local(async move {
-                    let _ = handle_http_conn(stream, tx_conn, diag_conn).await;
+                    let _ = handle_http_conn(stream, role, &tok, eg, tx_conn, diag_conn).await;
                 })
                 .detach();
             }
@@ -1669,6 +1851,9 @@ fn spawn_http_server(port: u16, tx: UnboundedSender<ShellMsg>, diag: Arc<Mutex<V
 
 async fn handle_http_conn(
     mut stream: fasync::net::TcpStream,
+    role: HttpRole,
+    session_token: &str,
+    egress: fegress::GatewayProxy,
     tx: UnboundedSender<ShellMsg>,
     diag: Arc<Mutex<Vec<String>>>,
 ) -> Result<()> {
@@ -1687,14 +1872,79 @@ async fn handle_http_conn(
     let raw_body = req.split("\r\n\r\n").nth(1).unwrap_or("");
     let body = raw_body.trim();
 
+    // Isolated Untrusted Web Server (:7712): ZERO privileged /_hirsel/* routes!
+    if role == HttpRole::UntrustedWeb {
+        let (status, content_type, payload) = match (method, path) {
+            ("GET", "/") | ("GET", "/untrusted") => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                web_content::UNTRUSTED_WEB_HTML.to_string(),
+            ),
+            ("POST", "/_untrusted/spoof-focus") => {
+                let (otx, orx) = oneshot::channel();
+                let _ = tx.unbounded_send(ShellMsg::WmCommand {
+                    cmd: "CLIENT_FOCUS web_untrusted".to_string(),
+                    reply: Some(otx),
+                });
+                match orx.await {
+                    Ok(Ok(st)) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::json!({
+                            "focused": st.focused,
+                            "capture_allowed": st.capture_allowed
+                        })
+                        .to_string(),
+                    ),
+                    _ => ("500 Internal Server Error", "application/json", r#"{"error":"spoof"}"#.into()),
+                }
+            }
+            _ => ("404 Not Found", "application/json", r#"{"error":"isolated_untrusted_origin"}"#.to_string()),
+        };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
+    // Figments Web Server (:7711): require per-boot 128-bit capability nonce on all POST /_hirsel/* mutations!
+    if role == HttpRole::Figments && method == "POST" && path.starts_with("/_hirsel/") {
+        let supplied = header_block
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("x-hirsel-token") {
+                    Some(v.trim())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("");
+        if supplied != session_token {
+            let err_body = r#"{"error":"missing_or_invalid_hirsel_token"}"#;
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
+                err_body.len()
+            );
+            stream.write_all(resp.as_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    }
+
     let (status, content_type, payload): (&str, &str, String) = match (method, path) {
         ("GET", "/_hirsel/diag") => {
             let log_lines = diag.lock().map(|g| g.clone()).unwrap_or_default();
             ("200 OK", "application/json", serde_json::json!({ "diag": log_lines }).to_string())
         }
-        ("GET", "/") | ("GET", "/index.html") => {
-            ("200 OK", "text/html; charset=utf-8", web_content::FIGMENTS_INDEX_HTML.to_string())
-        }
+        ("GET", "/") | ("GET", "/index.html") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            web_content::FIGMENTS_INDEX_HTML.replace("__HIRSEL_TOKEN__", session_token),
+        ),
         ("GET", "/untrusted") => {
             ("200 OK", "text/html; charset=utf-8", web_content::UNTRUSTED_WEB_HTML.to_string())
         }
@@ -1777,14 +2027,13 @@ async fn handle_http_conn(
             }
         }
         ("GET", "/_hirsel/egress-health") => {
-            match call_egress_gw("GET", "/health", "", false).await {
-                Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
-                Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
+            match egress_health(&egress).await {
+                Ok(val) => ("200 OK", "application/json", val.to_string()),
                 Err(e) => ("503 Service Unavailable", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
             }
         }
         ("GET", "/_hirsel/system") => {
-            let eg = call_egress_gw("GET", "/health", "", false).await.ok().map(|(_, v)| v);
+            let eg = egress_health(&egress).await.ok();
             let vulkan_present = std::path::Path::new("/svc/fuchsia.vulkan.loader.Loader").exists();
             let audio_present = std::path::Path::new("/svc/fuchsia.media.Audio").exists();
             let fxfs_present = std::path::Path::new("/data").exists();
@@ -1797,7 +2046,13 @@ async fn handle_http_conn(
                     "compositor": "Fuchsia Scenic Flatland + sysmem2",
                     "browser": "Native Chromium 160 (HTML-in-Canvas)",
                     "places": ["hirsel-wm", "hirsel-board", "hirsel-agent", "hirsel-js"],
-                    "microvm": { "name": "vm-dev", "guest": "Linux 6.1.102 SMP (2 vCPUs)", "net": "capability-gated virtio-net -> 10.0.3.1:7781 (egress_gw.cm)" },
+                    "isolation": {
+                        "egress_gw": "private FIDL hirsel.egress.Gateway (zero TCP ports)",
+                        "vm_host": "zero /svc pipe relay -> FIDL egress_gw.cm",
+                        "figments_api": "per-boot 128-bit X-Hirsel-Token nonce",
+                        "untrusted_web": "isolated port :7712 with zero /_hirsel/* routes"
+                    },
+                    "microvm": { "name": "vm-dev", "guest": "Linux 6.1.102 SMP (2 vCPUs)", "net": "zero-/svc virtio-net -> pipe -> FIDL egress_gw.cm" },
                     "hardware": { "vulkan_loader": vulkan_present, "audio_core": audio_present, "fxfs_data": fxfs_present },
                     "egress_gw": eg
                 })
@@ -1805,18 +2060,19 @@ async fn handle_http_conn(
             )
         }
         ("GET", "/_hirsel/secrets") => {
-            match call_egress_gw("GET", "/secrets", "", false).await {
-                Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
-                Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
+            match egress_list_secrets(&egress).await {
+                Ok(val) => ("200 OK", "application/json", val.to_string()),
                 Err(e) => ("503 Service Unavailable", "application/json", serde_json::json!({"error": format!("{e:#}")}).to_string()),
             }
         }
         ("POST", "/_hirsel/secrets") => {
-            // ONLY authorized when hirsel-wm is in SAS Trusted Chrome lockdown (capture_allowed == false)!
             let (otx, orx) = oneshot::channel();
             let _ = tx.unbounded_send(ShellMsg::GetState { reply: otx });
             let sas_ok = matches!(orx.await, Ok(st) if st.sas && !st.capture_allowed);
-            match call_egress_gw("POST", "/secrets", body, sas_ok).await {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let host = parsed["host"].as_str().unwrap_or("");
+            let value = parsed["value"].as_str().unwrap_or("");
+            match egress_store_secret(&egress, host, value, sas_ok).await {
                 Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
                 Ok((403, val)) => ("403 Forbidden", "application/json", val.to_string()),
                 Ok((_, val)) => ("400 Bad Request", "application/json", val.to_string()),
@@ -1852,7 +2108,9 @@ async fn handle_http_conn(
         }
         ("POST", "/_hirsel/type") => {
             for ch in raw_body.chars() {
-                if ch == '\n' || ch == '\r' {
+                if ch == '\t' {
+                    let _ = tx.unbounded_send(ShellMsg::SasCycleHost);
+                } else if ch == '\n' || ch == '\r' {
                     let _ = tx.unbounded_send(ShellMsg::DevKeyEnter);
                 } else if !ch.is_control() {
                     let _ = tx.unbounded_send(ShellMsg::DevKeyChar(ch));
@@ -1989,7 +2247,7 @@ async fn handle_http_conn(
                     })
                     .to_string(),
                 ),
-                Ok(_) => match call_egress_gw("POST", "/proxy", body, false).await {
+                Ok(_) => match egress_proxy(&egress, body).await {
                     Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
                     Ok((403, val)) => ("403 Forbidden", "application/json", val.to_string()),
                     Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
@@ -2016,14 +2274,18 @@ async fn handle_http_conn(
 
 #[fuchsia::main(logging = true)]
 async fn main() -> Result<()> {
-    info!("=== Hirsel-OS Desktop Shell starting (Flatland + Chromium 160 + Pure-Hirsel WM + js@1 + Linux 6.1.102 AMD-SVM) ===");
+    info!("=== Hirsel-OS Desktop Shell starting (Flatland + Chromium 160 + FIDL egress_gw + 4 Pure-Hirsel Places + Linux 6.1.102 AMD-SVM) ===");
     let (tx, mut rx) = unbounded::<ShellMsg>();
     let diag = Arc::new(Mutex::new(vec!["starting hirsel_shell".to_string()]));
+    let session_token = generate_session_token();
+    let egress = connect_to_protocol::<fegress::GatewayMarker>()
+        .context("connect private FIDL hirsel.egress.Gateway")?;
 
-    spawn_http_server(7711, tx.clone(), diag.clone());
-    spawn_http_server(7780, tx.clone(), diag.clone());
+    spawn_http_server(7711, HttpRole::Figments, session_token.clone(), egress.clone(), tx.clone(), diag.clone());
+    spawn_http_server(7712, HttpRole::UntrustedWeb, session_token.clone(), egress.clone(), tx.clone(), diag.clone());
+    spawn_http_server(7780, HttpRole::HostControl, session_token, egress.clone(), tx.clone(), diag.clone());
 
-    let mut shell = match HirselShell::new(tx, diag.clone()).await {
+    let mut shell = match HirselShell::new(tx, diag.clone(), egress).await {
         Ok(s) => {
             if let Ok(mut g) = diag.lock() {
                 g.push("HirselShell initialized OK".to_string());

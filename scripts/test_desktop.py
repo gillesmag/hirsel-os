@@ -31,6 +31,7 @@ SERIAL_LOG = f"{OUT}/serial.log"
 QMP_SOCK = f"{OUT}/qmp.sock"
 CTRL_PORT = 17780
 WEB_PORT = 17711
+UNTRUSTED_PORT = 17712
 
 
 def ppm_to_png(ppm_path: str, png_path: str) -> tuple[int, int]:
@@ -89,8 +90,8 @@ def qmp_screendump(png_path: str) -> tuple[int, int]:
     return w, h
 
 
-def http_req(method: str, path: str, body: str | None = None, timeout: float = 20.0) -> tuple[int, dict]:
-    url = f"http://127.0.0.1:{CTRL_PORT}{path}"
+def http_req(method: str, path: str, body: str | None = None, timeout: float = 20.0, port: int = CTRL_PORT) -> tuple[int, dict]:
+    url = f"http://127.0.0.1:{port}{path}"
     data = body.encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     try:
@@ -118,7 +119,7 @@ def start_qemu(log_path: str) -> subprocess.Popen:
         "-drive", f"file={DISK},format=raw,if=none,id=vdisk,cache=writeback",
         "-object", "iothread,id=iothread0",
         "-device", "virtio-blk-pci,drive=vdisk,iothread=iothread0",
-        "-netdev", f"type=user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:{CTRL_PORT}-:7780,hostfwd=tcp:127.0.0.1:{WEB_PORT}-:7711",
+        "-netdev", f"type=user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:{CTRL_PORT}-:7780,hostfwd=tcp:127.0.0.1:{WEB_PORT}-:7711,hostfwd=tcp:127.0.0.1:{UNTRUSTED_PORT}-:7712",
         "-device", "virtio-net-pci,vectors=8,romfile=,netdev=net0,mac=52:54:00:63:5e:7a,addr=0x4",
         "-device", "virtio-gpu-pci,xres=1280,yres=800",
         "-device", "virtio-keyboard-pci",
@@ -208,31 +209,42 @@ def main() -> int:
         assert st["room"] == "darkroom" and st["focused"] == "figments"
         wait_for_linux_vm("BOOT1")
 
-        print("=== 3. Verify Isolated egress_gw.cm Component (TLS 1.3 Roots + SAS-Only Secret Vault) ===")
+        print("=== 3. Verify Private FIDL egress_gw.cm (ZERO TCP ports!) + Interactive Masked SAS Secret Entry ===")
         for _ in range(20):
             hc, hval = http_req("GET", "/_hirsel/egress-health")
             if hc == 200 and hval.get("ok"):
                 break
             time.sleep(0.3)
-        print("  egress_gw.cm health:", hval)
-        assert hc == 200 and hval.get("component") == "egress_gw.cm" and hval.get("isolated_vault") is True, hval
+        print("  egress_gw.cm FIDL health:", hval)
+        assert hc == 200 and hval.get("component") == "egress_gw.cm" and hval.get("transport") == "fidl_only_zero_tcp", hval
         assert hval.get("tls_roots", 0) > 50, f"Expected Fuchsia TLS root certs, got {hval}"
+
+        # Track 1 Hardening checks:
+        #   a) Untrusted web server (:7712) MUST NOT expose /_hirsel/* privileged routes!
+        uc, uval = http_req("POST", "/_hirsel/dev-exec", "id", port=UNTRUSTED_PORT)
+        assert uc == 404, f"Untrusted port :7712 leaked /_hirsel/dev-exec: {uc} {uval}"
+        #   b) Figments server (:7711) MUST reject POST /_hirsel/* without valid X-Hirsel-Token nonce!
+        fc, fval = http_req("POST", "/_hirsel/dev-exec", "id", port=WEB_PORT)
+        assert fc == 403 and fval.get("error") == "missing_or_invalid_hirsel_token", (fc, fval)
 
         # Writing a secret outside SAS MUST be rejected with 403!
         sc, sval = http_req("POST", "/_hirsel/secrets", json.dumps({"host": "example.com", "value": "sealed-demo-key-99"}))
         assert sc == 403 and sval.get("reason") == "sas_trusted_chrome_required", (sc, sval)
 
-        # Enter SAS Trusted Chrome -> provision sealed secret -> exit SAS
+        # Track 3: Interactive Masked SAS Secret Entry via keyboard (Tab x3 -> example.com, type masked key, Enter!)
         _, _ = http_req("POST", "/_hirsel/cmd", "TOGGLE_SAS")
-        sc, sval = http_req("POST", "/_hirsel/secrets", json.dumps({"host": "example.com", "value": "sealed-demo-key-99"}))
-        print("  SAS secret store:", sval)
-        assert sc == 200 and sval.get("stored") is True, (sc, sval)
+        http_req("POST", "/_hirsel/type", "\t\t\tsealed-demo-key-99")
+        time.sleep(0.3)
+        qmp_screendump(f"{OUT}/desktop-sas-vault.png")
+        http_req("POST", "/_hirsel/type", "\n")
+        time.sleep(0.4)
         _, _ = http_req("POST", "/_hirsel/cmd", "TOGGLE_SAS")
 
         # Verify GET /_hirsel/secrets exposes metadata ONLY (never plaintext!)
         _, smeta = http_req("GET", "/_hirsel/secrets")
+        print("  SAS FIDL-sealed vault metadata:", smeta)
         assert "sealed-demo-key-99" not in json.dumps(smeta), smeta
-        assert any(x["host"] == "example.com" for x in smeta.get("secrets", [])), smeta
+        assert any(x["host"] == "example.com" and x["len"] == 18 for x in smeta.get("secrets", [])), smeta
 
         print("=== 4. Wait for Native Chromium 160 + Figments HTML-in-Canvas (drawElementImage LIVE) ===")
         time.sleep(6.0)
@@ -306,8 +318,8 @@ def main() -> int:
         _, st = http_req("POST", "/_hirsel/click", json.dumps({"x": 365, "y": 18}))
         assert st["layout"]["web"] is not None
 
-        # Multi-origin switch spawns a brand-new OS-isolated fuchsia.web.Context!
-        nc, nval = http_req("POST", "/_hirsel/web-navigate", json.dumps({"url": "http://localhost:7711/untrusted"}))
+        # Multi-origin switch spawns a brand-new OS-isolated fuchsia.web.Context on :7712!
+        nc, nval = http_req("POST", "/_hirsel/web-navigate", json.dumps({"url": "http://localhost:7712/untrusted"}))
         print("  multi-origin navigate:", nval)
         assert nc == 200 and nval.get("spawned_fresh_context") is True, nval
 

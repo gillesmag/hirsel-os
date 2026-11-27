@@ -82,6 +82,7 @@ pub struct VmExecResult {
 pub enum VmEvent {
     Log(String),
     Ready,
+    EgressReq { id: u64, raw_http: String },
 }
 
 pub struct VmClient {
@@ -150,14 +151,6 @@ impl VmClient {
                 ));
             }
         }
-        if let Ok(svc_dir) = fuchsia_fs::directory::open_in_namespace("/svc", fio::PERM_READABLE) {
-            if let Ok(svc_end) = svc_dir.into_client_end() {
-                actions.push(fdio::SpawnAction::add_namespace_entry(
-                    c"/svc",
-                    svc_end.into_channel().into_handle(),
-                ));
-            }
-        }
         if let Ok(utc) = fuchsia_runtime::duplicate_utc_clock_handle(zx::Rights::SAME_RIGHTS) {
             actions.push(fdio::SpawnAction::add_handle(
                 HandleInfo::new(HandleType::ClockUtc, 0),
@@ -204,6 +197,14 @@ impl VmClient {
                         } else if let Some(b64) = t.strip_prefix("LOG ") {
                             let msg = String::from_utf8_lossy(&b64_decode(b64)).to_string();
                             let _ = on_event.unbounded_send(VmEvent::Log(msg));
+                        } else if let Some(rest) = t.strip_prefix("EGRESS_REQ ") {
+                            let mut parts = rest.splitn(2, ' ');
+                            if let (Some(id_s), Some(b64)) = (parts.next(), parts.next()) {
+                                if let Ok(id) = id_s.parse::<u64>() {
+                                    let raw_http = String::from_utf8_lossy(&b64_decode(b64)).to_string();
+                                    let _ = on_event.unbounded_send(VmEvent::EgressReq { id, raw_http });
+                                }
+                            }
                         } else if let Some(rest) = t.strip_prefix("EXEC_RES ") {
                             let mut parts = rest.splitn(3, ' ');
                             let id = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
@@ -237,6 +238,14 @@ impl VmClient {
 
     pub fn is_ready(&self) -> bool {
         self.ready.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    pub async fn send_egress_res(&self, id: u64, raw_http: &[u8]) -> Result<()> {
+        let line = format!("EGRESS_RES {id} {}\n", b64_encode(raw_http));
+        let mut s = self.stdin.lock().await;
+        s.write_all(line.as_bytes()).await.context("write EGRESS_RES to hirsel-vm-host")?;
+        s.flush().await.ok();
+        Ok(())
     }
 
     pub async fn exec(&self, cmd: &str) -> Result<VmExecResult> {

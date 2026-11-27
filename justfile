@@ -1088,10 +1088,12 @@ build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ss
     set -euo pipefail
     cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
     mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm"
     cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/fidl/"*.fidl "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
     cp "{{out_dir}}/linux/vmlinux.stripped" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/vmlinux.stripped"

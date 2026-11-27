@@ -1,5 +1,6 @@
 // hirsel_shell: Thin Rust Flatland Presenter + Chromium 160 Launcher + Trusted Chrome Painter.
-// Spawns pure-Hirsel /pkg/bin/hirsel-wm with zero ambient directory/svc handles.
+// Spawns pure-Hirsel Places (hirsel-wm, hirsel-board, hirsel-agent, hirsel-js) with zero ambient handles,
+// and talks to isolated egress_gw.cm strictly over private FIDL protocol `hirsel.egress.Gateway`.
 {
     include: [
         "//sdk/lib/inspect/client.shard.cml",
@@ -10,7 +11,6 @@
         binary: "bin/hirsel_shell",
     },
     use: [
-        // Required for Flatland root presentation + input + WebEngine views
         {
             protocol: [
                 "fuchsia.accessibility.semantics.SemanticsManager",
@@ -33,6 +33,7 @@
                 "fuchsia.ui.composition.Flatland",
                 "fuchsia.ui.input3.Keyboard",
                 "fuchsia.web.ContextProvider",
+                "fuchsia.hirsel.egress.Gateway",
             ],
         },
         {

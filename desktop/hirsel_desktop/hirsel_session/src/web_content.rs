@@ -243,7 +243,7 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <div class="card">
         <h3>Isolated Web #2 Origin Switcher</h3>
-        <input id="web-url" value="http://127.0.0.1:7711/untrusted" />
+        <input id="web-url" value="http://127.0.0.1:7712/untrusted" />
         <button class="amber" onclick="navWeb()">Open in Fresh Isolated Context</button>
       </div>
       <div class="card">
@@ -254,6 +254,10 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
   </main>
 
 <script>
+const HIRSEL_TOKEN = "__HIRSEL_TOKEN__";
+function apiPost(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'X-Hirsel-Token': HIRSEL_TOKEN }, body });
+}
 document.getElementById('ua').textContent = navigator.userAgent;
 const canvas = document.getElementById('spatial');
 const ctx = canvas.getContext('2d');
@@ -281,9 +285,7 @@ function updateBadges() {
 updateBadges();
 
 function reportDiagNow() {
-  fetch('/_hirsel/client-diag', {
-    method: 'POST',
-    body: JSON.stringify({
+  apiPost('/_hirsel/client-diag', JSON.stringify({
       chromeVer,
       hasDrawElement,
       hasRequestPaint,
@@ -293,8 +295,7 @@ function reportDiagNow() {
       boardRev: boardSnap.rev,
       boardCards: boardSnap.cards.length,
       boardEdges: boardSnap.edges.length
-    })
-  }).catch(() => {});
+    })).catch(() => {});
 }
 
 function escapeHtml(s) {
@@ -489,11 +490,11 @@ window.addEventListener('pointermove', (e) => {
 window.addEventListener('pointerup', () => {
   if (dragCard) {
     const c = dragCard; dragCard = null;
-    fetch('/_hirsel/board', { method: 'POST', body: JSON.stringify({ op: 'move', id: c.id, x: c.x, y: c.y }) });
+    apiPost('/_hirsel/board', JSON.stringify({ op: 'move', id: c.id, x: c.x, y: c.y }));
   }
   if (panActive) {
     panActive = false;
-    fetch('/_hirsel/board', { method: 'POST', body: JSON.stringify({ op: 'camera', cx: boardSnap.camera.cx, cy: boardSnap.camera.cy, zoom_pct: boardSnap.camera.zoom_pct }) });
+    apiPost('/_hirsel/board', JSON.stringify({ op: 'camera', cx: boardSnap.camera.cx, cy: boardSnap.camera.cy, zoom_pct: boardSnap.camera.zoom_pct }));
   }
 });
 canvas.addEventListener('wheel', (e) => {
@@ -503,7 +504,7 @@ canvas.addEventListener('wheel', (e) => {
 
 async function zoomBy(delta) {
   const next = Math.max(50, Math.min(200, (boardSnap.camera.zoom_pct || 100) + delta));
-  const r = await fetch('/_hirsel/board', { method: 'POST', body: JSON.stringify({ op: 'camera', cx: boardSnap.camera.cx || 0, cy: boardSnap.camera.cy || 0, zoom_pct: next }) });
+  const r = await apiPost('/_hirsel/board', JSON.stringify({ op: 'camera', cx: boardSnap.camera.cx || 0, cy: boardSnap.camera.cy || 0, zoom_pct: next }));
   boardSnap = await r.json();
   updateBadges();
   triggerPaint();
@@ -511,10 +512,7 @@ async function zoomBy(delta) {
 
 async function addNote() {
   const id = 'note-' + (boardSnap.cards.length + 1);
-  const r = await fetch('/_hirsel/board', {
-    method: 'POST',
-    body: JSON.stringify({ op: 'put', id, kind: 'note', tone: 'ochre', title: 'Spatial Note #' + boardSnap.cards.length, body: 'Persisted via pure-Hirsel hirsel-board on Fxfs', x: 24, y: 300 })
-  });
+  const r = await apiPost('/_hirsel/board', JSON.stringify({ op: 'put', id, kind: 'note', tone: 'ochre', title: 'Spatial Note #' + boardSnap.cards.length, body: 'Persisted via pure-Hirsel hirsel-board on Fxfs', x: 24, y: 300 }));
   boardSnap = await r.json();
   updateBadges();
   triggerPaint();
@@ -536,25 +534,25 @@ async function pollState() {
 setInterval(pollState, 1000);
 pollState();
 
-async function cmd(c) { await fetch('/_hirsel/cmd', { method: 'POST', body: c }); pollState(); }
-async function stageEffect() { await fetch('/_hirsel/stage', { method: 'POST' }); pollState(); }
+async function cmd(c) { await apiPost('/_hirsel/cmd', c); pollState(); }
+async function stageEffect() { await apiPost('/_hirsel/stage', ''); pollState(); }
 async function runCodemode() {
-  const r = await fetch('/_hirsel/codemode', { method: 'POST', body: document.getElementById('js-in').value });
+  const r = await apiPost('/_hirsel/codemode', document.getElementById('js-in').value);
   document.getElementById('js-out').textContent = JSON.stringify(await r.json(), null, 2);
 }
 async function runAgent() {
   document.getElementById('agent-out').textContent = 'Running pure-Hirsel agent loop...';
-  const r = await fetch('/_hirsel/agent-run', { method: 'POST', body: document.getElementById('agent-in').value });
+  const r = await apiPost('/_hirsel/agent-run', document.getElementById('agent-in').value);
   document.getElementById('agent-out').textContent = JSON.stringify(await r.json(), null, 2);
   pollState();
 }
 async function navWeb() {
-  await fetch('/_hirsel/web-navigate', { method: 'POST', body: JSON.stringify({ url: document.getElementById('web-url').value }) });
+  await apiPost('/_hirsel/web-navigate', JSON.stringify({ url: document.getElementById('web-url').value }));
   pollState();
 }
 async function powerboxDemo() {
-  await fetch('/_hirsel/clipboard', { method: 'POST', body: JSON.stringify({ domain: 'figments', text: 'POWERBOX_SECRET_42_FROM_FIGMENTS' }) });
-  await fetch('/_hirsel/powerbox-paste', { method: 'POST', body: JSON.stringify({ from: 'figments', to: 'vm_dev' }) });
+  await apiPost('/_hirsel/clipboard', JSON.stringify({ domain: 'figments', text: 'POWERBOX_SECRET_42_FROM_FIGMENTS' }));
+  await apiPost('/_hirsel/powerbox-paste', JSON.stringify({ from: 'figments', to: 'vm_dev' }));
   pollState();
 }
 </script>
@@ -604,7 +602,7 @@ pub const UNTRUSTED_WEB_HTML: &str = r#"<!doctype html>
     document.getElementById('orig').textContent = 'ORIGIN: ' + location.origin + ' | PATH: ' + location.pathname;
     document.getElementById('out').textContent = 'User-Agent: ' + navigator.userAgent;
     async function trySteal() {
-      const r = await fetch('/_hirsel/spoof-focus', { method: 'POST', body: 'web_untrusted' });
+      const r = await fetch('/_untrusted/spoof-focus', { method: 'POST', body: 'web_untrusted' });
       const st = await r.json();
       document.getElementById('out').textContent =
         'Spoof attempt sent CLIENT_FOCUS web_untrusted.\n' +

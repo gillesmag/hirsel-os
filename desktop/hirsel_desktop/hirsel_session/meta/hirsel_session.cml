@@ -1,6 +1,6 @@
 // Hirsel-OS Desktop Session Realm:
 //   - Launches hirsel_shell (eagerly) as root Flatland presenter & pure-Hirsel WM/Board/Agent host
-//   - Launches egress_gw (eagerly) as an ISOLATED Fuchsia component owning the sealed Fxfs secret vault & TLS roots
+//   - Launches egress_gw as an ISOLATED Fuchsia component exposing ONLY private FIDL `hirsel.egress.Gateway`
 //   - Hosts Native Chromium 160 web_engine#meta/context_provider.cm directly inside the session
 {
     include: [
@@ -17,7 +17,6 @@
         {
             name: "egress_gw",
             url: "#meta/egress_gw.cm",
-            startup: "eager",
         },
         {
             name: "context_provider",
@@ -57,6 +56,13 @@
             from: "parent",
             to: "#egress_gw",
             availability: "same_as_target",
+        },
+
+        // Private FIDL capability route: ONLY hirsel_shell can talk to egress_gw (NEVER Chromium!)
+        {
+            protocol: [ "fuchsia.hirsel.egress.Gateway" ],
+            from: "#egress_gw",
+            to: "#hirsel_shell",
         },
 
         // Capabilities required by web_engine's context_provider.cm

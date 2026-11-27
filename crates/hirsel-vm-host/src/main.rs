@@ -17,13 +17,32 @@ mod fuchsia_impl {
     use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
     use smoltcp::time::Instant as SmolInstant;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-    use std::net::TcpStream;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use zx_sys::*;
+
+    fn http_request_complete(buf: &[u8]) -> bool {
+        let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let hdr_end = pos + 4;
+        let hdr = String::from_utf8_lossy(&buf[..pos]);
+        let content_len = hdr
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        buf.len() >= hdr_end + content_len
+    }
 
     struct BridgeNetDev {
         ch: Arc<VirtioNetChannel>,
@@ -61,7 +80,14 @@ mod fuchsia_impl {
         }
     }
 
-    fn spawn_egress_net_bridge(ch: Arc<VirtioNetChannel>, ctrl: Arc<ManagedVmControl>) {
+    /// Zero-/svc capability-gated virtio-net gateway (10.0.3.1:7781):
+    /// Relays Linux guest HTTP requests strictly over stdin/stdout pipe to hirsel_shell -> FIDL egress_gw.cm!
+    fn spawn_egress_net_bridge(
+        ch: Arc<VirtioNetChannel>,
+        ctrl: Arc<ManagedVmControl>,
+        out: Arc<Mutex<std::io::Stdout>>,
+        egress_replies: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
+    ) {
         thread::spawn(move || {
             let mut dev = BridgeNetDev { ch: Arc::clone(&ch), rx_buf: VecDeque::new() };
             let gw_mac = EthernetAddress([0x52, 0x54, 0x00, 0x48, 0x52, 0x00]);
@@ -82,9 +108,11 @@ mod fuchsia_impl {
             let _ = sock.listen(7781);
             let handle = sockets.add(sock);
 
-            let mut host_conn: Option<TcpStream> = None;
-            let mut to_host_buf = Vec::<u8>::new();
-            let mut to_guest_buf = Vec::<u8>::new();
+            let mut next_req_id = 1u64;
+            let mut in_flight_id: Option<u64> = None;
+            let mut req_buf = Vec::<u8>::new();
+            let mut resp_buf = Vec::<u8>::new();
+            let mut resp_ready = false;
             let mut tmp = [0u8; 4096];
 
             while !ctrl.is_stop_requested() {
@@ -93,73 +121,54 @@ mod fuchsia_impl {
                     dev.rx_buf.push_back(frame);
                     did_work = true;
                 }
-                let t = now_ms();
-                iface.poll(t, &mut dev, &mut sockets);
+                iface.poll(now_ms(), &mut dev, &mut sockets);
 
                 let sock = sockets.get_mut::<TcpSocket>(handle);
                 if sock.is_active() {
-                    if host_conn.is_none() {
-                        match TcpStream::connect("127.0.0.1:7781") {
-                            Ok(s) => {
-                                let _ = s.set_nonblocking(true);
-                                host_conn = Some(s);
-                                to_host_buf.clear();
-                                to_guest_buf.clear();
-                            }
-                            Err(_) => {
-                                sock.abort();
-                            }
-                        }
-                    }
-                    if sock.can_recv() {
+                    if in_flight_id.is_none() && !resp_ready && sock.can_recv() {
                         if let Ok(n) = sock.recv_slice(&mut tmp) {
                             if n > 0 {
-                                to_host_buf.extend_from_slice(&tmp[..n]);
+                                req_buf.extend_from_slice(&tmp[..n]);
+                                did_work = true;
+                            }
+                        }
+                        if http_request_complete(&req_buf) {
+                            let id = next_req_id;
+                            next_req_id += 1;
+                            let b64 = b64_encode(&req_buf);
+                            req_buf.clear();
+                            emit_line(&out, &format!("EGRESS_REQ {id} {b64}"));
+                            in_flight_id = Some(id);
+                            did_work = true;
+                        }
+                    }
+                    if let Some(id) = in_flight_id {
+                        if let Ok(mut map) = egress_replies.lock() {
+                            if let Some(bytes) = map.remove(&id) {
+                                resp_buf = bytes;
+                                resp_ready = true;
+                                in_flight_id = None;
                                 did_work = true;
                             }
                         }
                     }
-                    let mut host_eof = false;
-                    if let Some(ref mut hc) = host_conn {
-                        if !to_host_buf.is_empty() {
-                            match hc.write(&to_host_buf) {
-                                Ok(n) if n > 0 => {
-                                    to_host_buf.drain(..n);
-                                    did_work = true;
-                                }
-                                Ok(_) => {}
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                Err(_) => host_eof = true,
-                            }
-                        }
-                        if to_guest_buf.len() < 16384 {
-                            match hc.read(&mut tmp) {
-                                Ok(0) => host_eof = true,
-                                Ok(n) => {
-                                    to_guest_buf.extend_from_slice(&tmp[..n]);
-                                    did_work = true;
-                                }
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                Err(_) => host_eof = true,
-                            }
-                        }
-                    }
-                    if !to_guest_buf.is_empty() && sock.can_send() {
-                        if let Ok(n) = sock.send_slice(&to_guest_buf) {
+                    if resp_ready && !resp_buf.is_empty() && sock.can_send() {
+                        if let Ok(n) = sock.send_slice(&resp_buf) {
                             if n > 0 {
-                                to_guest_buf.drain(..n);
+                                resp_buf.drain(..n);
                                 did_work = true;
                             }
                         }
                     }
-                    if host_eof && to_guest_buf.is_empty() {
+                    if resp_ready && resp_buf.is_empty() {
                         sock.close();
-                        host_conn = None;
+                        resp_ready = false;
                     }
                 } else {
-                    host_conn = None;
-                    to_host_buf.clear();
-                    to_guest_buf.clear();
+                    in_flight_id = None;
+                    req_buf.clear();
+                    resp_buf.clear();
+                    resp_ready = false;
                     if !sock.is_listening() {
                         let _ = sock.listen(7781);
                     }
@@ -330,9 +339,15 @@ mod fuchsia_impl {
         ));
 
         let net_ch = VirtioNetChannel::new();
+        let egress_replies: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let ctrl = ManagedVmControl::new(Some(Arc::clone(&net_ch)));
-        spawn_egress_net_bridge(Arc::clone(&net_ch), Arc::clone(&ctrl));
-        emit_log("[hirsel-vm-host] attached capability-gated virtio-net eth0 (10.0.3.2 -> gw 10.0.3.1:7781 egress_gw.cm ONLY)");
+        spawn_egress_net_bridge(
+            Arc::clone(&net_ch),
+            Arc::clone(&ctrl),
+            Arc::clone(&out),
+            Arc::clone(&egress_replies),
+        );
+        emit_log("[hirsel-vm-host] attached zero-/svc capability-gated virtio-net eth0 (10.0.3.2 -> pipe -> FIDL egress_gw.cm)");
 
         // Background thread: stream guest COM1 console output to hirsel_shell and detect READY.
         let ctrl_log = Arc::clone(&ctrl);
@@ -373,6 +388,7 @@ mod fuchsia_impl {
         // Background thread: read commands from hirsel_shell on stdin.
         let ctrl_cmd = Arc::clone(&ctrl);
         let out_cmd = Arc::clone(&out);
+        let replies_cmd = Arc::clone(&egress_replies);
         thread::spawn(move || {
             let stdin = std::io::stdin();
             let reader = BufReader::new(stdin.lock());
@@ -383,6 +399,18 @@ mod fuchsia_impl {
                     ctrl_cmd.request_stop();
                     break;
                 }
+                if let Some(rest) = trimmed.strip_prefix("EGRESS_RES ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    if let (Some(id_s), Some(b64)) = (parts.next(), parts.next()) {
+                        if let Ok(id) = id_s.parse::<u64>() {
+                            let bytes = b64_decode(b64);
+                            if let Ok(mut map) = replies_cmd.lock() {
+                                map.insert(id, bytes);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(rest) = trimmed.strip_prefix("STDIN ") {
                     let bytes = b64_decode(rest);
                     if !bytes.is_empty() {
@@ -392,33 +420,37 @@ mod fuchsia_impl {
                 }
                 if let Some(rest) = trimmed.strip_prefix("EXEC ") {
                     let mut parts = rest.splitn(2, ' ');
-                    let id = parts.next().unwrap_or("0");
-                    let b64_cmd = parts.next().unwrap_or("");
-                    let ch = &ctrl_cmd.console_channel;
-                    ch.host_clear_rx();
-                    let req = format!("HREXEC {b64_cmd}\n");
-                    ch.host_write(req.as_bytes());
-                    let deadline = unsafe { zx_clock_get_monotonic() }.saturating_add(15_000_000_000);
-                    let mut replied = false;
-                    loop {
-                        if let Some(resp) = ch.host_try_read_line() {
-                            if let Some(done) = resp.strip_prefix("HRDONE ") {
-                                let (rc_s, b64_out) = done.split_once(' ').unwrap_or((done, ""));
-                                emit_line(&out_cmd, &format!("EXEC_RES {id} {} {}", rc_s.trim(), b64_out.trim()));
-                                replied = true;
+                    let id = parts.next().unwrap_or("0").to_string();
+                    let b64_cmd = parts.next().unwrap_or("").to_string();
+                    let ctrl_exec = Arc::clone(&ctrl_cmd);
+                    let out_exec = Arc::clone(&out_cmd);
+                    thread::spawn(move || {
+                        let ch = &ctrl_exec.console_channel;
+                        ch.host_clear_rx();
+                        let req = format!("HREXEC {b64_cmd}\n");
+                        ch.host_write(req.as_bytes());
+                        let deadline = unsafe { zx_clock_get_monotonic() }.saturating_add(15_000_000_000);
+                        let mut replied = false;
+                        loop {
+                            if let Some(resp) = ch.host_try_read_line() {
+                                if let Some(done) = resp.strip_prefix("HRDONE ") {
+                                    let (rc_s, b64_out) = done.split_once(' ').unwrap_or((done, ""));
+                                    emit_line(&out_exec, &format!("EXEC_RES {id} {} {}", rc_s.trim(), b64_out.trim()));
+                                    replied = true;
+                                    break;
+                                }
+                            }
+                            let now = unsafe { zx_clock_get_monotonic() };
+                            if now >= deadline || ctrl_exec.is_stop_requested() {
                                 break;
                             }
+                            unsafe { zx_nanosleep(now.saturating_add(5_000_000)) };
                         }
-                        let now = unsafe { zx_clock_get_monotonic() };
-                        if now >= deadline || ctrl_cmd.is_stop_requested() {
-                            break;
+                        if !replied {
+                            let msg = b64_encode(b"vm-dev exec timed out waiting for /dev/hvc0");
+                            emit_line(&out_exec, &format!("EXEC_RES {id} -1 {msg}"));
                         }
-                        unsafe { zx_nanosleep(now.saturating_add(5_000_000)) };
-                    }
-                    if !replied {
-                        let msg = b64_encode(b"vm-dev exec timed out waiting for /dev/hvc0");
-                        emit_line(&out_cmd, &format!("EXEC_RES {id} -1 {msg}"));
-                    }
+                    });
                 }
             }
         });

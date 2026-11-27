@@ -1,0 +1,35 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hirsel.egress;
+
+// Private capability-routed protocol between isolated `egress_gw.cm` and `hirsel_shell.cm`.
+// Untrusted Chromium contexts and Tier-2 Linux MicroVMs have NO direct access to this protocol
+// and `egress_gw.cm` listens on ZERO TCP ports.
+@discoverable
+closed protocol Gateway {
+    strict Health() -> (struct {
+        json string:65536;
+    });
+
+    strict ListSecrets() -> (struct {
+        json string:65536;
+    });
+
+    strict StoreSecret(struct {
+        host string:256;
+        value string:4096;
+        sas_authorized bool;
+    }) -> (struct {
+        status uint16;
+        json string:65536;
+    });
+
+    strict Proxy(struct {
+        request_json string:65536;
+    }) -> (struct {
+        status uint16;
+        json string:65536;
+    });
+};

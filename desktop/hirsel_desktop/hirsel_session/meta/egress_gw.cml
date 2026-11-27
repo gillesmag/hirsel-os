@@ -1,6 +1,6 @@
 // Isolated Egress Gateway & Sealed Secret Vault Component (egress_gw.cm).
+// Exposes ONLY the private FIDL protocol `hirsel.egress.Gateway` (ZERO TCP listening sockets!).
 // Owns its own isolated Fxfs /data secret store + root-ssl-certificates for TLS 1.3 HTTPS.
-// Neither Chromium, Linux vm-dev, nor hirsel_shell can access its secret vault directory.
 {
     include: [
         "//sdk/lib/inspect/client.shard.cml",
@@ -10,6 +10,9 @@
         runner: "elf",
         binary: "bin/egress_gw",
     },
+    capabilities: [
+        { protocol: "fuchsia.hirsel.egress.Gateway" },
+    ],
     use: [
         {
             protocol: [
@@ -27,6 +30,12 @@
             storage: "data",
             path: "/data",
             availability: "optional",
+        },
+    ],
+    expose: [
+        {
+            protocol: "fuchsia.hirsel.egress.Gateway",
+            from: "self",
         },
     ],
 }
