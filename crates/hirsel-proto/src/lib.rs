@@ -13,6 +13,7 @@
 //! ```
 
 pub mod crypto;
+pub mod x25519;
 
 use crate::crypto::SessionCipher;
 use std::io::{self, Read, Write};
@@ -47,6 +48,13 @@ const REQ_VM_LOGS: u8 = 0x13;
 const REQ_VM_CONSOLE_WRITE: u8 = 0x14;
 const REQ_VM_STOP: u8 = 0x15;
 const REQ_VM_REMOVE: u8 = 0x16;
+const REQ_VM_EXEC: u8 = 0x17;
+const REQ_VOL_CREATE: u8 = 0x18;
+const REQ_VOL_LIST: u8 = 0x19;
+const REQ_VOL_REMOVE: u8 = 0x1A;
+const REQ_UPGRADE_COMMIT: u8 = 0x1B;
+const REQ_UPGRADE_ROLLBACK: u8 = 0x1C;
+const REQ_NODE_REBOOT: u8 = 0x1D;
 
 // Response message types (0x81..0xFF)
 const RESP_PONG: u8 = 0x81;
@@ -62,6 +70,9 @@ const RESP_UPGRADE_INFO: u8 = 0x8A;
 const RESP_VM_INFO: u8 = 0x8B;
 const RESP_VM_LIST: u8 = 0x8C;
 const RESP_VM_LOGS: u8 = 0x8D;
+const RESP_VM_EXEC: u8 = 0x8E;
+const RESP_VOL_INFO: u8 = 0x8F;
+const RESP_VOL_LIST: u8 = 0x90;
 const RESP_ERROR: u8 = 0xFF;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,8 +117,26 @@ pub struct VmSpec {
     pub kernel: RunTarget,
     pub initrd: Option<RunTarget>,
     pub ram_mib: u32,
+    pub vcpus: u8,
     pub cmdline: String,
     pub net: Option<VmNetSpec>,
+    /// Optional persistent volume name (from `vol create`) attached at `/dev/vda`.
+    pub disk: Option<String>,
+    /// If true, persist spec in `HRSLFS01` and reconcile/auto-start on cold node boot.
+    pub autostart: bool,
+}
+
+impl VmSpec {
+    pub fn encode_bytes(&self) -> Vec<u8> {
+        let mut p = Vec::new();
+        put_vm_spec(&mut p, self);
+        p
+    }
+
+    pub fn decode_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut c = Cursor::new(buf);
+        c.vm_spec()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,18 +165,33 @@ pub struct VmSummary {
     pub exit_code: i32,
     pub error: String,
     pub ram_mib: u32,
+    pub vcpus: u8,
+    pub disk: String,
+    pub autostart: bool,
     pub uptime_ms: u64,
     pub io_exits: u64,
     pub mmio_exits: u64,
+    pub blk_reads: u64,
+    pub blk_writes: u64,
     pub net_rx_packets: u64,
     pub net_tx_packets: u64,
     pub net: Option<VmNetSpec>,
+}
+
+/// Persistent named block volume carved out of Hirsel-OS's `virtio-blk` store (`HRSLVOL1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub size_mib: u32,
+    pub sectors: u64,
+    pub start_sector: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     AuthHello {
         client_nonce: [u8; 32],
+        client_pubkey: [u8; 32],
     },
     AuthVerify {
         client_mac: [u8; 32],
@@ -201,6 +245,9 @@ pub enum Request {
         digest: [u8; 32],
     },
     UpgradeStatus,
+    UpgradeCommit,
+    UpgradeRollback,
+    NodeReboot,
     VmStart(VmSpec),
     VmList,
     VmInspect {
@@ -221,6 +268,20 @@ pub enum Request {
     VmRemove {
         id: String,
     },
+    VmExec {
+        id: String,
+        command: String,
+        timeout_ms: u64,
+    },
+    VolumeCreate {
+        name: String,
+        size_mib: u32,
+        initial_image: Option<RunTarget>,
+    },
+    VolumeList,
+    VolumeRemove {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +293,10 @@ pub struct NodeInfo {
     pub has_net: bool,
     pub has_blk: bool,
     pub auth_enabled: bool,
+    pub pfs_x25519: bool,
+    pub dhcp_active: bool,
+    pub ipv4: [u8; 4],
+    pub gateway_ip: [u8; 4],
     pub active_slot: u8,
     pub pending_slot: u8,
     pub disk_mib: u32,
@@ -273,6 +338,7 @@ pub struct RunResult {
 pub enum Response {
     AuthChallenge {
         server_nonce: [u8; 32],
+        server_pubkey: [u8; 32],
         server_mac: [u8; 32],
     },
     AuthOk,
@@ -299,6 +365,12 @@ pub enum Response {
         next_offset: u64,
         status: VmStatus,
     },
+    ExecResult {
+        exit_code: i32,
+        stdout: Vec<u8>,
+    },
+    VolumeInfo(VolumeInfo),
+    VolumeList(Vec<VolumeInfo>),
     Error {
         message: String,
     },
@@ -513,6 +585,44 @@ impl<'a> Cursor<'a> {
             other => Err(format!("unknown VmStatus {other}")),
         }
     }
+    fn vm_spec(&mut self) -> Result<VmSpec, String> {
+        let name = self.string()?;
+        let kernel = self.target()?;
+        let initrd = if self.u8()? != 0 {
+            Some(self.target()?)
+        } else {
+            None
+        };
+        let ram_mib = self.u32()?;
+        let vcpus = self.u8()?.max(1);
+        let cmdline = self.string()?;
+        let net = self.vm_net_spec()?;
+        let disk = if self.u8()? != 0 {
+            Some(self.string()?)
+        } else {
+            None
+        };
+        let autostart = self.u8()? != 0;
+        Ok(VmSpec {
+            name,
+            kernel,
+            initrd,
+            ram_mib,
+            vcpus,
+            cmdline,
+            net,
+            disk,
+            autostart,
+        })
+    }
+    fn volume_info(&mut self) -> Result<VolumeInfo, String> {
+        Ok(VolumeInfo {
+            name: self.string()?,
+            size_mib: self.u32()?,
+            sectors: self.u64()?,
+            start_sector: self.u64()?,
+        })
+    }
     fn vm_summary(&mut self) -> Result<VmSummary, String> {
         Ok(VmSummary {
             id: self.string()?,
@@ -521,14 +631,50 @@ impl<'a> Cursor<'a> {
             exit_code: self.i32()?,
             error: self.string()?,
             ram_mib: self.u32()?,
+            vcpus: self.u8()?,
+            disk: self.string()?,
+            autostart: self.u8()? != 0,
             uptime_ms: self.u64()?,
             io_exits: self.u64()?,
             mmio_exits: self.u64()?,
+            blk_reads: self.u64()?,
+            blk_writes: self.u64()?,
             net_rx_packets: self.u64()?,
             net_tx_packets: self.u64()?,
             net: self.vm_net_spec()?,
         })
     }
+}
+
+fn put_vm_spec(out: &mut Vec<u8>, spec: &VmSpec) {
+    put_string(out, &spec.name);
+    put_target(out, &spec.kernel);
+    match &spec.initrd {
+        Some(rd) => {
+            out.push(1);
+            put_target(out, rd);
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&spec.ram_mib.to_le_bytes());
+    out.push(spec.vcpus.max(1));
+    put_string(out, &spec.cmdline);
+    put_vm_net_spec(out, &spec.net);
+    match &spec.disk {
+        Some(d) => {
+            out.push(1);
+            put_string(out, d);
+        }
+        None => out.push(0),
+    }
+    out.push(u8::from(spec.autostart));
+}
+
+fn put_volume_info(out: &mut Vec<u8>, v: &VolumeInfo) {
+    put_string(out, &v.name);
+    out.extend_from_slice(&v.size_mib.to_le_bytes());
+    out.extend_from_slice(&v.sectors.to_le_bytes());
+    out.extend_from_slice(&v.start_sector.to_le_bytes());
 }
 
 fn put_vm_net_spec(out: &mut Vec<u8>, net: &Option<VmNetSpec>) {
@@ -556,9 +702,14 @@ fn put_vm_summary(out: &mut Vec<u8>, s: &VmSummary) {
     out.extend_from_slice(&s.exit_code.to_le_bytes());
     put_string(out, &s.error);
     out.extend_from_slice(&s.ram_mib.to_le_bytes());
+    out.push(s.vcpus);
+    put_string(out, &s.disk);
+    out.push(u8::from(s.autostart));
     out.extend_from_slice(&s.uptime_ms.to_le_bytes());
     out.extend_from_slice(&s.io_exits.to_le_bytes());
     out.extend_from_slice(&s.mmio_exits.to_le_bytes());
+    out.extend_from_slice(&s.blk_reads.to_le_bytes());
+    out.extend_from_slice(&s.blk_writes.to_le_bytes());
     out.extend_from_slice(&s.net_rx_packets.to_le_bytes());
     out.extend_from_slice(&s.net_tx_packets.to_le_bytes());
     put_vm_net_spec(out, &s.net);
@@ -631,8 +782,12 @@ impl Request {
     pub fn to_parts(&self) -> (u8, Vec<u8>) {
         let mut p = Vec::new();
         let ty = match self {
-            Request::AuthHello { client_nonce } => {
+            Request::AuthHello {
+                client_nonce,
+                client_pubkey,
+            } => {
                 p.extend_from_slice(client_nonce);
+                p.extend_from_slice(client_pubkey);
                 REQ_AUTH_HELLO
             }
             Request::AuthVerify { client_mac } => {
@@ -723,19 +878,11 @@ impl Request {
                 REQ_UPGRADE_FINISH
             }
             Request::UpgradeStatus => REQ_UPGRADE_STATUS,
+            Request::UpgradeCommit => REQ_UPGRADE_COMMIT,
+            Request::UpgradeRollback => REQ_UPGRADE_ROLLBACK,
+            Request::NodeReboot => REQ_NODE_REBOOT,
             Request::VmStart(spec) => {
-                put_string(&mut p, &spec.name);
-                put_target(&mut p, &spec.kernel);
-                match &spec.initrd {
-                    Some(rd) => {
-                        p.push(1);
-                        put_target(&mut p, rd);
-                    }
-                    None => p.push(0),
-                }
-                p.extend_from_slice(&spec.ram_mib.to_le_bytes());
-                put_string(&mut p, &spec.cmdline);
-                put_vm_net_spec(&mut p, &spec.net);
+                put_vm_spec(&mut p, spec);
                 REQ_VM_START
             }
             Request::VmList => REQ_VM_LIST,
@@ -766,6 +913,37 @@ impl Request {
                 put_string(&mut p, id);
                 REQ_VM_REMOVE
             }
+            Request::VmExec {
+                id,
+                command,
+                timeout_ms,
+            } => {
+                put_string(&mut p, id);
+                put_string(&mut p, command);
+                p.extend_from_slice(&timeout_ms.to_le_bytes());
+                REQ_VM_EXEC
+            }
+            Request::VolumeCreate {
+                name,
+                size_mib,
+                initial_image,
+            } => {
+                put_string(&mut p, name);
+                p.extend_from_slice(&size_mib.to_le_bytes());
+                match initial_image {
+                    Some(t) => {
+                        p.push(1);
+                        put_target(&mut p, t);
+                    }
+                    None => p.push(0),
+                }
+                REQ_VOL_CREATE
+            }
+            Request::VolumeList => REQ_VOL_LIST,
+            Request::VolumeRemove { name } => {
+                put_string(&mut p, name);
+                REQ_VOL_REMOVE
+            }
         };
         (ty, p)
     }
@@ -785,6 +963,7 @@ impl Request {
         match msg_type {
             REQ_AUTH_HELLO => Ok(Request::AuthHello {
                 client_nonce: c.digest()?,
+                client_pubkey: c.digest()?,
             }),
             REQ_AUTH_VERIFY => Ok(Request::AuthVerify {
                 client_mac: c.digest()?,
@@ -847,26 +1026,10 @@ impl Request {
             }),
             REQ_UPGRADE_FINISH => Ok(Request::UpgradeFinish { digest: c.digest()? }),
             REQ_UPGRADE_STATUS => Ok(Request::UpgradeStatus),
-            REQ_VM_START => {
-                let name = c.string()?;
-                let kernel = c.target()?;
-                let initrd = if c.u8()? != 0 {
-                    Some(c.target()?)
-                } else {
-                    None
-                };
-                let ram_mib = c.u32()?;
-                let cmdline = c.string()?;
-                let net = c.vm_net_spec()?;
-                Ok(Request::VmStart(VmSpec {
-                    name,
-                    kernel,
-                    initrd,
-                    ram_mib,
-                    cmdline,
-                    net,
-                }))
-            }
+            REQ_UPGRADE_COMMIT => Ok(Request::UpgradeCommit),
+            REQ_UPGRADE_ROLLBACK => Ok(Request::UpgradeRollback),
+            REQ_NODE_REBOOT => Ok(Request::NodeReboot),
+            REQ_VM_START => Ok(Request::VmStart(c.vm_spec()?)),
             REQ_VM_LIST => Ok(Request::VmList),
             REQ_VM_INSPECT => Ok(Request::VmInspect { id: c.string()? }),
             REQ_VM_LOGS => Ok(Request::VmLogs {
@@ -880,6 +1043,27 @@ impl Request {
             }),
             REQ_VM_STOP => Ok(Request::VmStop { id: c.string()? }),
             REQ_VM_REMOVE => Ok(Request::VmRemove { id: c.string()? }),
+            REQ_VM_EXEC => Ok(Request::VmExec {
+                id: c.string()?,
+                command: c.string()?,
+                timeout_ms: c.u64()?,
+            }),
+            REQ_VOL_CREATE => {
+                let name = c.string()?;
+                let size_mib = c.u32()?;
+                let initial_image = if c.u8()? != 0 {
+                    Some(c.target()?)
+                } else {
+                    None
+                };
+                Ok(Request::VolumeCreate {
+                    name,
+                    size_mib,
+                    initial_image,
+                })
+            }
+            REQ_VOL_LIST => Ok(Request::VolumeList),
+            REQ_VOL_REMOVE => Ok(Request::VolumeRemove { name: c.string()? }),
             other => Err(format!("unknown Request type {other:#x}")),
         }
     }
@@ -891,9 +1075,11 @@ impl Response {
         let ty = match self {
             Response::AuthChallenge {
                 server_nonce,
+                server_pubkey,
                 server_mac,
             } => {
                 p.extend_from_slice(server_nonce);
+                p.extend_from_slice(server_pubkey);
                 p.extend_from_slice(server_mac);
                 RESP_AUTH_CHALLENGE
             }
@@ -911,6 +1097,10 @@ impl Response {
                 p.push(u8::from(info.has_net));
                 p.push(u8::from(info.has_blk));
                 p.push(u8::from(info.auth_enabled));
+                p.push(u8::from(info.pfs_x25519));
+                p.push(u8::from(info.dhcp_active));
+                p.extend_from_slice(&info.ipv4);
+                p.extend_from_slice(&info.gateway_ip);
                 p.push(info.active_slot);
                 p.push(info.pending_slot);
                 p.extend_from_slice(&info.disk_mib.to_le_bytes());
@@ -979,6 +1169,22 @@ impl Response {
                 p.push(*status as u8);
                 RESP_VM_LOGS
             }
+            Response::ExecResult { exit_code, stdout } => {
+                p.extend_from_slice(&exit_code.to_le_bytes());
+                put_bytes(&mut p, stdout);
+                RESP_VM_EXEC
+            }
+            Response::VolumeInfo(v) => {
+                put_volume_info(&mut p, v);
+                RESP_VOL_INFO
+            }
+            Response::VolumeList(list) => {
+                p.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                for v in list {
+                    put_volume_info(&mut p, v);
+                }
+                RESP_VOL_LIST
+            }
             Response::Error { message } => {
                 put_string(&mut p, message);
                 RESP_ERROR
@@ -1002,6 +1208,7 @@ impl Response {
         match msg_type {
             RESP_AUTH_CHALLENGE => Ok(Response::AuthChallenge {
                 server_nonce: c.digest()?,
+                server_pubkey: c.digest()?,
                 server_mac: c.digest()?,
             }),
             RESP_AUTH_OK => Ok(Response::AuthOk),
@@ -1017,6 +1224,10 @@ impl Response {
                 has_net: c.u8()? != 0,
                 has_blk: c.u8()? != 0,
                 auth_enabled: c.u8()? != 0,
+                pfs_x25519: c.u8()? != 0,
+                dhcp_active: c.u8()? != 0,
+                ipv4: c.take(4)?.try_into().unwrap(),
+                gateway_ip: c.take(4)?.try_into().unwrap(),
                 active_slot: c.u8()?,
                 pending_slot: c.u8()?,
                 disk_mib: c.u32()?,
@@ -1074,6 +1285,19 @@ impl Response {
                 next_offset: c.u64()?,
                 status: c.vm_status()?,
             }),
+            RESP_VM_EXEC => Ok(Response::ExecResult {
+                exit_code: c.i32()?,
+                stdout: c.bytes()?,
+            }),
+            RESP_VOL_INFO => Ok(Response::VolumeInfo(c.volume_info()?)),
+            RESP_VOL_LIST => {
+                let count = c.u32()? as usize;
+                let mut list = Vec::with_capacity(count);
+                for _ in 0..count {
+                    list.push(c.volume_info()?);
+                }
+                Ok(Response::VolumeList(list))
+            }
             RESP_ERROR => Ok(Response::Error {
                 message: c.string()?,
             }),
@@ -1218,12 +1442,13 @@ mod tests {
         assert_eq!(dec.flags & FLAG_ENCRYPTED, FLAG_ENCRYPTED);
         assert_eq!(Request::decode_body(dec.msg_type, &dec.payload).unwrap(), req);
 
-        // Also verify managed VM spec + summary wire roundtrip.
-        let vm_req = Request::VmStart(VmSpec {
+        // Also verify managed VM spec + PFS handshake + volume/exec RPC wire roundtrip.
+        let vm_spec = VmSpec {
             name: "dev-1".into(),
             kernel: RunTarget::Digest(sha256(b"vmlinux")),
             initrd: Some(RunTarget::Digest(sha256(b"initrd"))),
             ram_mib: 128,
+            vcpus: 2,
             cmdline: "console=ttyS0".into(),
             net: Some(VmNetSpec {
                 guest_ip: [10, 0, 3, 2],
@@ -1235,10 +1460,36 @@ mod tests {
                     guest_port: 22,
                 }],
             }),
-        });
+            disk: Some("data-1".into()),
+            autostart: true,
+        };
+        assert_eq!(VmSpec::decode_bytes(&vm_spec.encode_bytes()).unwrap(), vm_spec);
+
+        let vm_req = Request::VmStart(vm_spec);
         let wire2 = vm_req.encode_encrypted(&mut cli).unwrap();
         let mut slice2 = wire2.as_slice();
         let dec2 = read_frame_with_cipher(&mut slice2, Some(&mut srv)).unwrap();
         assert_eq!(Request::decode_body(dec2.msg_type, &dec2.payload).unwrap(), vm_req);
+
+        // Verify X25519 PFS session key agreement & authenticated AEAD exchange.
+        let cli_sec = sha256(b"cli-ephemeral-secret");
+        let srv_sec = sha256(b"srv-ephemeral-secret");
+        let cli_pub = x25519::x25519_public_key(&cli_sec);
+        let srv_pub = x25519::x25519_public_key(&srv_sec);
+        let ss_cli = x25519::x25519(&cli_sec, &srv_pub);
+        let ss_srv = x25519::x25519(&srv_sec, &cli_pub);
+        assert_eq!(ss_cli, ss_srv);
+
+        let mut pfs_cli = SessionCipher::new_client_pfs(&key, &ss_cli, &cn, &sn);
+        let mut pfs_srv = SessionCipher::new_server_pfs(&key, &ss_srv, &cn, &sn);
+        let exec_req = Request::VmExec {
+            id: "airgap-1".into(),
+            command: "uname -r && nproc".into(),
+            timeout_ms: 5000,
+        };
+        let wire3 = exec_req.encode_encrypted(&mut pfs_cli).unwrap();
+        let mut slice3 = wire3.as_slice();
+        let dec3 = read_frame_with_cipher(&mut slice3, Some(&mut pfs_srv)).unwrap();
+        assert_eq!(Request::decode_body(dec3.msg_type, &dec3.payload).unwrap(), exec_req);
     }
 }

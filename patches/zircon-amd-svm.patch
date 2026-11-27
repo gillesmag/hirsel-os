@@ -745,10 +745,10 @@ index 00000000000..3452c0a43aa
 +}
 diff --git a/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
 new file mode 100644
-index 00000000000..278bced84c6
+index 00000000000..6ec6fc921cb
 --- /dev/null
 +++ b/zircon/kernel/arch/x86/hypervisor/svm_vmexit.rs
-@@ -0,0 +1,1200 @@
+@@ -0,0 +1,1289 @@
 +// Copyright 2026 The Hirsel-OS Authors
 +//
 +// Use of this source code is governed by a MIT-style
@@ -766,9 +766,13 @@ index 00000000000..278bced84c6
 +use zx_status::Status;
 +use zx_types::{
 +    ZX_GUEST_TRAP_BELL, ZX_GUEST_TRAP_IO, ZX_GUEST_TRAP_MEM, ZX_TIME_INFINITE, zx_gpaddr_t,
-+    zx_packet_guest_bell_t, zx_packet_guest_io_t, zx_packet_guest_mem_t, zx_packet_type_t,
-+    zx_paddr_t, zx_port_packet_t, zx_vaddr_t,
++    zx_packet_guest_bell_t, zx_packet_guest_io_t, zx_packet_guest_mem_t,
++    zx_packet_guest_vcpu_interrupt_t, zx_packet_guest_vcpu_startup_t, zx_packet_guest_vcpu_t,
++    zx_packet_guest_vcpu_type_t, zx_packet_guest_vcpu_union_t, zx_packet_type_t, zx_paddr_t,
++    zx_port_packet_t, zx_vaddr_t,
 +};
++
++use super::guest::MAX_GUEST_VCPUS;
 +
 +use super::pv::{
 +    PvClockState, pv_clock_populate_offset, pv_clock_reset_clock, pv_clock_stop_clock,
@@ -1473,8 +1477,8 @@ index 00000000000..278bced84c6
 +    if leaf == X86CpuidLeafNum::Base as u32 {
 +        eax = eax.min(MAX_SUPPORTED_CPUID);
 +    } else if leaf == X86CpuidLeafNum::ModelFeatures as u32 {
-+        // Set initial APIC ID and 1 logical processor.
-+        ebx = (ebx & 0x0000_ffff) | (1 << 16) | ((apic_id & 0xff) << 24);
++        // Override initial local APIC ID (bits 31:24); preserve logical processor count for SMP.
++        ebx = (ebx & 0x00ff_ffff) | ((apic_id & 0xff) << 24);
 +        ecx |= feature_mask(X86_FEATURE_HYPERVISOR)
 +            | feature_mask(X86_FEATURE_X2APIC)
 +            | feature_mask(X86_FEATURE_TSC_DEADLINE);
@@ -1605,6 +1609,7 @@ index 00000000000..278bced84c6
 +    vmcb: &mut Vmcb,
 +    guest_state: &GuestState,
 +    local_apic_state: &LocalApicState,
++    packet: &mut zx_port_packet_t,
 +) -> Result<(), Status> {
 +    let msr = guest_state.ecx();
 +    if guest_state.edx() != 0 && msr != X2APIC_ICR {
@@ -1668,16 +1673,99 @@ index 00000000000..278bced84c6
 +            local_apic_state.interrupt_tracker.interrupt(vector)
 +        }
 +        X2APIC_ICR => {
-+            // Single-VCPU: deliver self/fixed IPIs locally and ignore INIT/SIPI.
-+            advance_rip(vmcb, 2);
++            // Full x2APIC ICR virtualization (FIXED, NMI, INIT, STARTUP/SIPI) matching VMX `handle_ipi`.
 +            let lo = guest_state.eax();
++            let dest = guest_state.edx();
 +            let delivery = (lo >> 8) & 0x7;
++            let dest_logical = ((lo >> 11) & 1) != 0;
 +            let shorthand = (lo >> 18) & 0x3;
-+            let vector = lo & 0xff;
-+            if delivery == 0 && (shorthand == 1 || shorthand == 2 || guest_state.edx() == 0) {
-+                let _ = local_apic_state.interrupt_tracker.interrupt(vector);
++            let vector = (lo & 0xff) as u8;
++            let self_id = vmcb.control.guest_asid.saturating_sub(1);
++            let self_mask = if (self_id as usize) < MAX_GUEST_VCPUS {
++                1u64 << self_id
++            } else {
++                0
++            };
++
++            if dest_logical {
++                return Err(Status::NOT_SUPPORTED);
 +            }
-+            Ok(())
++
++            let target_mask = match shorthand {
++                0 => {
++                    if dest == u32::MAX {
++                        u64::MAX
++                    } else if (dest as usize) < MAX_GUEST_VCPUS {
++                        1u64 << dest
++                    } else {
++                        0
++                    }
++                }
++                1 => self_mask,
++                2 => u64::MAX,
++                3 => !self_mask,
++                _ => 0,
++            };
++
++            match delivery {
++                // FIXED
++                0 => {
++                    advance_rip(vmcb, 2);
++                    if target_mask == 0 {
++                        return Ok(());
++                    }
++                    if target_mask == self_mask {
++                        return local_apic_state.interrupt_tracker.interrupt(u32::from(vector));
++                    }
++                    let mut vcpu_pkt = zx_packet_guest_vcpu_t::default();
++                    vcpu_pkt.r#type = zx_packet_guest_vcpu_type_t::ZX_PKT_GUEST_VCPU_INTERRUPT;
++                    let mut interrupt = zx_packet_guest_vcpu_interrupt_t::default();
++                    interrupt.mask = target_mask;
++                    interrupt.vector = vector;
++                    vcpu_pkt.union = zx_packet_guest_vcpu_union_t { interrupt };
++                    *packet = zx_port_packet_t::default();
++                    packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_VCPU;
++                    set_packet(packet, vcpu_pkt);
++                    Err(Status::NEXT)
++                }
++                // NMI
++                4 => {
++                    advance_rip(vmcb, 2);
++                    let mut vcpu_pkt = zx_packet_guest_vcpu_t::default();
++                    vcpu_pkt.r#type = zx_packet_guest_vcpu_type_t::ZX_PKT_GUEST_VCPU_INTERRUPT;
++                    let mut interrupt = zx_packet_guest_vcpu_interrupt_t::default();
++                    interrupt.mask = target_mask & !self_mask;
++                    interrupt.vector = X86_INT_NMI.0;
++                    vcpu_pkt.union = zx_packet_guest_vcpu_union_t { interrupt };
++                    *packet = zx_port_packet_t::default();
++                    packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_VCPU;
++                    set_packet(packet, vcpu_pkt);
++                    Err(Status::NEXT)
++                }
++                // INIT (ignored; AP startup happens on SIPI)
++                5 => {
++                    advance_rip(vmcb, 2);
++                    Ok(())
++                }
++                // STARTUP (SIPI)
++                6 => {
++                    advance_rip(vmcb, 2);
++                    let mut vcpu_pkt = zx_packet_guest_vcpu_t::default();
++                    vcpu_pkt.r#type = zx_packet_guest_vcpu_type_t::ZX_PKT_GUEST_VCPU_STARTUP;
++                    vcpu_pkt.union = zx_packet_guest_vcpu_union_t {
++                        startup: zx_packet_guest_vcpu_startup_t {
++                            target: u64::from(dest),
++                            entry: zx_gpaddr_t::from(vector) << 12,
++                            context: 0,
++                        },
++                    };
++                    *packet = zx_port_packet_t::default();
++                    packet.packet_type = zx_packet_type_t::ZX_PKT_TYPE_GUEST_VCPU;
++                    set_packet(packet, vcpu_pkt);
++                    Err(Status::NEXT)
++                }
++                _ => Err(Status::NOT_SUPPORTED),
++            }
 +        }
 +        _ => {
 +            svm_issue_event(vmcb, X86_INT_GP_FAULT.0 as u32);
@@ -1693,6 +1781,7 @@ index 00000000000..278bced84c6
 +    local_apic_state: &LocalApicState,
 +    pv_clock: &mut PvClockState,
 +    gpa: &GuestPhysicalAspace,
++    packet: &mut zx_port_packet_t,
 +) -> Result<(), Status> {
 +    let is_write = vmcb.control.exit_info_1 != 0;
 +    let msr = guest_state.ecx();
@@ -1792,7 +1881,7 @@ index 00000000000..278bced84c6
 +                Ok(())
 +            }
 +            X2APIC_MSR_BASE..=X2APIC_MSR_MAX => {
-+                handle_x2apic_wrmsr(vmcb, guest_state, local_apic_state)
++                handle_x2apic_wrmsr(vmcb, guest_state, local_apic_state, packet)
 +            }
 +            KVM_SYSTEM_TIME_MSR_OLD | KVM_SYSTEM_TIME_MSR => {
 +                let guest_paddr = guest_state.edx_eax() as zx_paddr_t;
@@ -1916,7 +2005,7 @@ index 00000000000..278bced84c6
 +        }
 +        VMEXIT_MSR => {
 +            PerCpu::get_current().gstats.arch.wrmsr_instructions.fetch_add(1, Ordering::Relaxed);
-+            handle_msr(guard, vmcb, guest_state, local_apic_state, pv_clock_state, gpa)
++            handle_msr(guard, vmcb, guest_state, local_apic_state, pv_clock_state, gpa, packet)
 +        }
 +        VMEXIT_XSETBV => handle_xsetbv(vmcb, guest_state),
 +        VMEXIT_VMMCALL => handle_vmmcall(guard, vmcb, guest_state, gpa),
@@ -1950,7 +2039,7 @@ index 00000000000..278bced84c6
 +    result
 +}
 diff --git a/zircon/kernel/arch/x86/hypervisor/vcpu.rs b/zircon/kernel/arch/x86/hypervisor/vcpu.rs
-index 7b8e01b759e..ba42f566081 100644
+index 7b8e01b759e..d5332f7d149 100644
 --- a/zircon/kernel/arch/x86/hypervisor/vcpu.rs
 +++ b/zircon/kernel/arch/x86/hypervisor/vcpu.rs
 @@ -26,6 +26,16 @@ use zx_types::{
@@ -1990,7 +2079,7 @@ index 7b8e01b759e..ba42f566081 100644
  }
  
  /// Returns the CPU number and the address of the default TSS of the current CPU, from its
-@@ -695,6 +709,126 @@ unsafe fn vmcs_init(
+@@ -695,6 +709,133 @@ unsafe fn vmcs_init(
      Ok(())
  }
  
@@ -2045,13 +2134,15 @@ index 7b8e01b759e..ba42f566081 100644
 +        cr0 |= X86_CR0_PE | X86_CR0_PG;
 +    }
 +    let xsave = xsave_supported();
-+    let mut cr4 = X86_CR4_OSFXSR | X86_CR4_FSGSBASE;
-+    if xsave {
-+        cr4 |= X86_CR4_OSXSAVE;
-+    }
-+    if is_base_processor {
-+        cr4 |= X86_CR4_PAE | X86_CR4_PGE;
-+    }
++    let cr4 = if is_base_processor {
++        let mut c = X86_CR4_OSFXSR | X86_CR4_FSGSBASE | X86_CR4_PAE | X86_CR4_PGE;
++        if xsave {
++            c |= X86_CR4_OSXSAVE;
++        }
++        c
++    } else {
++        0
++    };
 +
 +    // SAFETY: CPL 0; IA32_PAT and IA32_EFER exist on all x86-64 CPUs.
 +    let (host_pat, host_efer) = unsafe { (read_msr(X86_MSR_IA32_PAT), read_msr(X86_MSR_IA32_EFER)) };
@@ -2085,7 +2176,12 @@ index 7b8e01b759e..ba42f566081 100644
 +        vmcb.save.rip = 0;
 +    }
 +
-+    let data_seg = VmcbSeg { selector: 0, attrib: SVM_SEG_ATTR_DATA, limit: 0xffff_ffff, base: 0 };
++    let data_seg = VmcbSeg {
++        selector: 0,
++        attrib: SVM_SEG_ATTR_DATA,
++        limit: if is_base_processor { 0xffff_ffff } else { 0xffff },
++        base: 0,
++    };
 +    vmcb.save.ds = data_seg;
 +    vmcb.save.es = data_seg;
 +    vmcb.save.ss = data_seg;
@@ -2117,7 +2213,7 @@ index 7b8e01b759e..ba42f566081 100644
  #[cold]
  #[inline(never)]
  fn log_invalid_interrupt_vector(vector: u32) {
-@@ -832,6 +966,7 @@ pub struct Vcpu {
+@@ -832,6 +973,7 @@ pub struct Vcpu {
      kicked: AtomicBool,
      entered: AtomicBool,
      in_use: AtomicBool,
@@ -2125,7 +2221,7 @@ index 7b8e01b759e..ba42f566081 100644
      /// `last_cpu` contains the CPU dedicated to holding the guest's VMCS state,
      /// or INVALID_CPU if there is no such VCPU. If this Vcpu is actively running,
      /// then `last_cpu` will point to that CPU.
-@@ -939,8 +1074,9 @@ impl Vcpu {
+@@ -939,8 +1081,9 @@ impl Vcpu {
          }
  
          let vpid = guest.try_alloc_vpid()?;
@@ -2136,7 +2232,7 @@ index 7b8e01b759e..ba42f566081 100644
              Ok(vcpu) => vcpu,
              Err(_) => {
                  let result = guest.free_vpid(vpid);
-@@ -952,8 +1088,6 @@ impl Vcpu {
+@@ -952,8 +1095,6 @@ impl Vcpu {
          // before `vmcs_page.alloc` (which can reschedule or migrate `thread`).
          unsafe { &*thread }.set_vcpu(true);
  
@@ -2145,7 +2241,7 @@ index 7b8e01b759e..ba42f566081 100644
          {
              let this = vcpu.as_mut().project();
  
-@@ -965,12 +1099,18 @@ impl Vcpu {
+@@ -965,12 +1106,18 @@ impl Vcpu {
                  x86_feature_test(X86_FEATURE_INVAR_TSC)
              });
  
@@ -2170,7 +2266,7 @@ index 7b8e01b759e..ba42f566081 100644
          }
  
          // SAFETY: Only the pointer to the VCPU moves, not the VCPU, and the `UniquePtr` is pinned
-@@ -983,32 +1123,48 @@ impl Vcpu {
+@@ -983,32 +1130,48 @@ impl Vcpu {
  
          let ept_pml4 = guest.physical_aspace().arch_aspace().arch_table_phys();
          let vmcs_address = vcpu.vmcs_page.physical_address();
@@ -2243,7 +2339,7 @@ index 7b8e01b759e..ba42f566081 100644
  
          let vcpu_cb_ptr = VcpuCallbackPtr(vcpu_ptr);
          let migrate_fn = MigrateFn::new(move |thread: &Thread, stage: MigrateStage| {
-@@ -1037,9 +1193,9 @@ impl Vcpu {
+@@ -1037,9 +1200,9 @@ impl Vcpu {
          });
          let (old_migrate, old_context_switch) = {
              ksync::lock!(let mut list_guard = Thread::get_list_lock().lock());
@@ -2256,7 +2352,7 @@ index 7b8e01b759e..ba42f566081 100644
              let thread_ref = unsafe { &*thread };
              single_chain_lock_guard_owned!(
                  thread_guard,
-@@ -1048,8 +1204,7 @@ impl Vcpu {
+@@ -1048,8 +1211,7 @@ impl Vcpu {
                  clt_tag!("Vcpu::Create")
              );
  
@@ -2266,7 +2362,7 @@ index 7b8e01b759e..ba42f566081 100644
              // SAFETY: `thread_lists_init` has completed, `thread_ref` is the live current thread
              // (not erased from thread lists), and no scheduler `queue_lock_` is held.
              let old_migrate = unsafe {
-@@ -1062,20 +1217,22 @@ impl Vcpu {
+@@ -1062,20 +1224,22 @@ impl Vcpu {
              (old_migrate, old_context_switch)
          };
  
@@ -2291,7 +2387,7 @@ index 7b8e01b759e..ba42f566081 100644
              last_cpu: AtomicU32::new(INVALID_CPU),
              thread: AtomicPtr::new(thread),
              vmcs_page: VmxPage::default(),
-@@ -1090,6 +1247,30 @@ impl Vcpu {
+@@ -1090,6 +1254,30 @@ impl Vcpu {
          })
      }
  
@@ -2322,7 +2418,7 @@ index 7b8e01b759e..ba42f566081 100644
      fn guest(&self) -> &Guest {
          // SAFETY: The guest outlives the VCPU, as `create` requires.
          unsafe { self.guest.as_ref() }
-@@ -1154,12 +1335,14 @@ impl Vcpu {
+@@ -1154,12 +1342,14 @@ impl Vcpu {
              //   ensures that all VMCS data that may be cached by the processor are
              //   flushed to memory.
              MigrateStage::Save => {
@@ -2343,7 +2439,7 @@ index 7b8e01b759e..ba42f566081 100644
                  self.last_cpu.store(INVALID_CPU, Ordering::Relaxed);
              }
              // * Copy the VMCS region from one memory location to another location. This
-@@ -1168,6 +1351,16 @@ impl Vcpu {
+@@ -1168,6 +1358,16 @@ impl Vcpu {
              // * Perform a VMPTRLD of the physical address of VMCS region on the
              //   destination processor to establish its current VMCS pointer.
              MigrateStage::Restore => {
@@ -2360,7 +2456,7 @@ index 7b8e01b759e..ba42f566081 100644
                  // Volume 3, Section 31.8.2: To migrate a VMCS to another logical
                  // processor, a VMM must use the sequence of VMCLEAR, VMPTRLD and
                  // VMLAUNCH.
-@@ -1237,6 +1430,11 @@ impl Vcpu {
+@@ -1237,6 +1437,11 @@ impl Vcpu {
      /// Must be called by the thread of the VCPU with interrupts disabled, or by its context switch
      /// function.
      unsafe fn context_switch(&self, include_gs: bool) {
@@ -2372,7 +2468,7 @@ index 7b8e01b759e..ba42f566081 100644
          // SAFETY: Guaranteed by the caller, so nothing else accesses `msr_state` meanwhile.
          let msr_state = unsafe { &mut *self.msr_state.get() };
          // SAFETY: These MSRs hold the system call and TSC_AUX state of the thread running on this
-@@ -1290,22 +1488,13 @@ impl Vcpu {
+@@ -1290,22 +1495,13 @@ impl Vcpu {
      /// # Safety
      ///
      /// Must be called by the thread of the VCPU (holding `VcpuInUseGuard`) with interrupts
@@ -2399,7 +2495,7 @@ index 7b8e01b759e..ba42f566081 100644
          unsafe {
              extended_register_save_state(x86_thread_extended_register_buffer(thread));
              let mut host_xcr0 = 0;
-@@ -1325,19 +1514,23 @@ impl Vcpu {
+@@ -1325,19 +1521,23 @@ impl Vcpu {
          }
      }
  
@@ -2430,7 +2526,7 @@ index 7b8e01b759e..ba42f566081 100644
          unsafe {
              extended_register_save_state(self.extended_register_state.get().cast());
              if save_guest {
-@@ -1350,6 +1543,125 @@ impl Vcpu {
+@@ -1350,6 +1550,125 @@ impl Vcpu {
          }
      }
  
@@ -2556,7 +2652,7 @@ index 7b8e01b759e..ba42f566081 100644
      /// Enters the guest, returning once the guest traps, faults, or is kicked.
      ///
      /// While the thread of the VCPU runs this, `vmx_state`, `msr_state`, `pv_clock_state` and
-@@ -1357,6 +1669,9 @@ impl Vcpu {
+@@ -1357,6 +1676,9 @@ impl Vcpu {
      /// is valid), except for `vmx_state.guest_state` and `pv_clock_state` while handling a VM exit,
      /// which the migrate and context switch functions do not access.
      pub fn enter(&self, packet: &mut zx_port_packet_t) -> Result<(), Status> {
@@ -2566,7 +2662,7 @@ index 7b8e01b759e..ba42f566081 100644
          let current_thread = current_get();
          let _in_use = self.enter_our_thread(current_thread)?;
  
-@@ -1557,11 +1872,19 @@ impl Vcpu {
+@@ -1557,11 +1879,19 @@ impl Vcpu {
          // SAFETY: `_in_use` guarantees this is the VCPU's thread in a non-reentrant context, so
          // nothing else accesses `vmx_state.guest_state`.
          register_copy!(&mut vcpu_state, unsafe { &(*self.vmx_state.get()).guest_state });
@@ -2591,7 +2687,7 @@ index 7b8e01b759e..ba42f566081 100644
          Ok(vcpu_state)
      }
  
-@@ -1571,16 +1894,29 @@ impl Vcpu {
+@@ -1571,16 +1901,29 @@ impl Vcpu {
          // SAFETY: `_in_use` guarantees this is the VCPU's thread in a non-reentrant context, so
          // nothing else accesses `vmx_state.guest_state`.
          register_copy!(unsafe { &mut (*self.vmx_state.get()).guest_state }, vcpu_state);
@@ -2631,7 +2727,7 @@ index 7b8e01b759e..ba42f566081 100644
          }
          Ok(())
      }
-@@ -1672,7 +2008,7 @@ impl PinnedDrop for Vcpu {
+@@ -1672,7 +2015,7 @@ impl PinnedDrop for Vcpu {
          // that actually makes this safe.
          let cpu = self.last_cpu.load(Ordering::Relaxed);
  

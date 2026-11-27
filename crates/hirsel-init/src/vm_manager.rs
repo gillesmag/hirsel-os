@@ -2,12 +2,15 @@
 
 #![cfg(target_os = "fuchsia")]
 
+use crate::caps::DirBackend;
 use crate::runner::BootContext;
 use hirsel_proto::{PortForward, VmNetSpec, VmSpec, VmStatus, VmSummary};
 use hirsel_virtio::net::VirtioNet;
 use hirsel_vmm::ManagedVmControl;
 use hirsel_vmm::nat::NatEngine;
-use hirsel_vmm::virtio_net_mmio::{GPA_VIRTIO_NET_MMIO, VIRTIO_NET_IRQ, VirtioNetChannel};
+use hirsel_vmm::virtio_blk_mmio::VmBlockBackend;
+use hirsel_vmm::virtio_console_mmio::VirtioConsoleChannel;
+use hirsel_vmm::virtio_net_mmio::VirtioNetChannel;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -18,10 +21,152 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use zx_sys::*;
 
+/// Persistent Virtio-Blk backend backed by a named volume slice on Hirsel-OS's outer `virtio-blk`.
+struct DiskVolumeBackend {
+    dir_backend: Arc<Mutex<DirBackend>>,
+    start_sector: u64,
+    sectors: u64,
+}
+
+impl VmBlockBackend for DiskVolumeBackend {
+    fn capacity_sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read_sectors(&mut self, sector: u64, dst: &mut [u8]) -> Result<(), String> {
+        let mut db = self.dir_backend.lock().unwrap();
+        let disk = db
+            .disk
+            .as_mut()
+            .ok_or_else(|| "outer virtio-blk unavailable".to_string())?;
+        disk.read_volume_sectors(self.start_sector, self.sectors, sector, dst)
+    }
+
+    fn write_sectors(&mut self, sector: u64, src: &[u8]) -> Result<(), String> {
+        let mut db = self.dir_backend.lock().unwrap();
+        let disk = db
+            .disk
+            .as_mut()
+            .ok_or_else(|| "outer virtio-blk unavailable".to_string())?;
+        disk.write_volume_sectors(self.start_sector, self.sectors, sector, src)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        let mut db = self.dir_backend.lock().unwrap();
+        let disk = db
+            .disk
+            .as_mut()
+            .ok_or_else(|| "outer virtio-blk unavailable".to_string())?;
+        disk.flush_blk()
+    }
+}
+
+fn b64_encode(input: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TBL[(b0 >> 2) as usize] as char);
+        out.push(TBL[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TBL[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TBL[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let Some(v0) = val(chunk[0]) else { break };
+        let Some(v1) = val(chunk[1]) else { break };
+        out.push((v0 << 2) | (v1 >> 4));
+        if chunk.len() > 2 && chunk[2] != b'=' {
+            if let Some(v2) = val(chunk[2]) {
+                out.push((v1 << 4) | (v2 >> 2));
+                if chunk.len() > 3 && chunk[3] != b'=' {
+                    if let Some(v3) = val(chunk[3]) {
+                        out.push((v2 << 6) | v3);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Runs a shell command inside a guest VM over its `virtio-console` (`/dev/hvc0`) agent
+/// without holding the global `NodeState` mutex.
+pub fn exec_over_console(
+    channel: &VirtioConsoleChannel,
+    exec_lock: &Mutex<()>,
+    command: &str,
+    timeout_ms: u64,
+) -> Result<(i32, Vec<u8>), String> {
+    let _guard = exec_lock.lock().unwrap();
+    channel.host_clear_rx();
+    let req = format!("HREXEC {}\n", b64_encode(command.as_bytes()));
+    channel.host_write(req.as_bytes());
+
+    let eff_timeout = if timeout_ms == 0 { 15_000 } else { timeout_ms };
+    let deadline = unsafe { zx_clock_get_monotonic() }
+        .saturating_add((eff_timeout as i64).saturating_mul(1_000_000));
+
+    loop {
+        if let Some(line) = channel.host_try_read_line() {
+            if let Some(rest) = line.strip_prefix("HRDONE ") {
+                let (code_s, b64_out) = rest.split_once(' ').unwrap_or((rest, ""));
+                let exit_code = code_s.trim().parse::<i32>().unwrap_or(-1);
+                let stdout = b64_decode(b64_out);
+                return Ok((exit_code, stdout));
+            }
+        }
+        let now = unsafe { zx_clock_get_monotonic() };
+        if now >= deadline {
+            return Err(format!(
+                "vm exec timed out after {eff_timeout} ms waiting for guest /dev/hvc0 agent (rx_bytes={}, tx_bytes={})",
+                channel.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                channel.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+        }
+        let next = now.saturating_add(5_000_000);
+        unsafe { zx_nanosleep(next) };
+    }
+}
+
 struct ManagedVmRecord {
     id: String,
     name: String,
     ram_mib: u32,
+    vcpus: u8,
+    disk: String,
+    autostart: bool,
     started_mono_ns: i64,
     ended_mono_ns: Option<i64>,
     status: VmStatus,
@@ -29,6 +174,7 @@ struct ManagedVmRecord {
     error: String,
     net: Option<VmNetSpec>,
     ctrl: Arc<ManagedVmControl>,
+    exec_lock: Arc<Mutex<()>>,
 }
 
 /// Thread-safe registry of persistent managed Tier 2 Linux MicroVMs.
@@ -52,12 +198,45 @@ impl VmManager {
         }
     }
 
+    pub fn is_volume_in_use(&self, vol_name: &str) -> bool {
+        self.vms.values().any(|r| {
+            let rec = r.lock().unwrap();
+            rec.status == VmStatus::Running && rec.disk == vol_name
+        })
+    }
+
+    pub fn get_exec_handle(
+        &self,
+        id: &str,
+    ) -> Result<(Arc<VirtioConsoleChannel>, Arc<Mutex<()>>), String> {
+        let rec = self
+            .vms
+            .get(id)
+            .ok_or_else(|| format!("VM `{id}` not found"))?;
+        let r = rec.lock().unwrap();
+        if r.status != VmStatus::Running {
+            return Err(format!("VM `{id}` is not running"));
+        }
+        Ok((Arc::clone(&r.ctrl.console_channel), Arc::clone(&r.exec_lock)))
+    }
+
+    pub fn stop_all_vms(&self) {
+        let ids: Vec<String> = self.vms.keys().cloned().collect();
+        for id in ids {
+            let _ = self.stop_vm(&id);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn start_vm(
         &mut self,
         ctx: &Arc<BootContext>,
-        spec: VmSpec,
+        dir_backend: &Arc<Mutex<DirBackend>>,
+        dns_server: [u8; 4],
+        mut spec: VmSpec,
         kernel_bytes: Vec<u8>,
         initrd_bytes: Option<Vec<u8>>,
+        persist_spec: bool,
     ) -> Result<VmSummary, String> {
         let id = if spec.name.trim().is_empty() {
             let n = self.next_id;
@@ -66,12 +245,41 @@ impl VmManager {
         } else {
             spec.name.trim().to_owned()
         };
+        spec.name = id.clone();
 
         if let Some(existing) = self.vms.get(&id) {
             if existing.lock().unwrap().status == VmStatus::Running {
                 return Err(format!("VM `{id}` is already running"));
             }
         }
+
+        // Resolve optional persistent disk volume (`virtio-blk` -> `/dev/vda`).
+        let (disk_name, blk_backend): (String, Option<Arc<Mutex<dyn VmBlockBackend>>>) =
+            if let Some(ref vol_name) = spec.disk {
+                if self.is_volume_in_use(vol_name) {
+                    return Err(format!(
+                        "persistent volume `{vol_name}` is already attached to a running VM"
+                    ));
+                }
+                let vol_info = {
+                    let db = dir_backend.lock().unwrap();
+                    let disk = db.disk.as_ref().ok_or_else(|| {
+                        "persistent VM volumes require an outer virtio-blk disk".to_string()
+                    })?;
+                    disk.find_volume(vol_name)
+                        .cloned()
+                        .ok_or_else(|| format!("persistent volume `{vol_name}` not found"))?
+                };
+                let backend: Arc<Mutex<dyn VmBlockBackend>> =
+                    Arc::new(Mutex::new(DiskVolumeBackend {
+                        dir_backend: Arc::clone(dir_backend),
+                        start_sector: vol_info.start_sector,
+                        sectors: vol_info.sectors,
+                    }));
+                (vol_name.clone(), Some(backend))
+            } else {
+                (String::new(), None)
+            };
 
         // Check for host port conflicts across currently running VMs.
         if let Some(net) = spec.net.as_ref() {
@@ -96,6 +304,10 @@ impl VmManager {
         }
 
         let ram_mib = spec.ram_mib.max(64);
+        let vcpus = spec.vcpus.clamp(1, 8);
+        spec.ram_mib = ram_mib;
+        spec.vcpus = vcpus;
+
         let mut net_spec = spec.net.clone();
         if let Some(ref mut n) = net_spec {
             if n.mac == [0; 6] {
@@ -106,23 +318,21 @@ impl VmManager {
                 n.prefix_len = 24;
             }
         }
+        spec.net = net_spec.clone();
 
-        // Compose final Linux kernel command line with Virtio-MMIO net device & IP parameters.
+        // Compose final Linux kernel command line (ACPI DSDT LNRO0005 exposes virtio-net/blk/console).
         let mut cmdline = if spec.cmdline.trim().is_empty() {
             String::from("console=ttyS0 reboot=k panic=1 pci=off nomodules")
         } else {
             spec.cmdline.clone()
         };
+        if !cmdline.contains("hirsel.name=") {
+            cmdline.push_str(&format!(" hirsel.name={id}"));
+        }
         if let Some(ref n) = net_spec {
-            if !cmdline.contains("virtio_mmio.device=") {
-                cmdline.push_str(&format!(
-                    " virtio_mmio.device=4K@{:#x}:{}",
-                    GPA_VIRTIO_NET_MMIO, VIRTIO_NET_IRQ
-                ));
-            }
             if !cmdline.contains("hirsel.ip=") {
                 cmdline.push_str(&format!(
-                    " hirsel.ip={}.{}.{}.{}/{} hirsel.gw={}.{}.{}.{} hirsel.name={}",
+                    " hirsel.ip={}.{}.{}.{}/{} hirsel.gw={}.{}.{}.{} hirsel.dns={}.{}.{}.{}",
                     n.guest_ip[0],
                     n.guest_ip[1],
                     n.guest_ip[2],
@@ -132,8 +342,27 @@ impl VmManager {
                     n.gateway_ip[1],
                     n.gateway_ip[2],
                     n.gateway_ip[3],
-                    id
+                    dns_server[0],
+                    dns_server[1],
+                    dns_server[2],
+                    dns_server[3],
                 ));
+            }
+        }
+
+        // Persist declarative autostart spec into `HRSLFS01` on `virtio-blk` if requested.
+        if persist_spec && spec.autostart {
+            let key = format!("vm-spec:{id}");
+            if key.len() <= 44 {
+                let now_ns = unsafe { zx_clock_get_monotonic() } as u64;
+                let mut db = dir_backend.lock().unwrap();
+                if let Some(disk) = db.disk.as_mut() {
+                    if let Err(e) = disk.fs_put(&key, spec.encode_bytes(), now_ns) {
+                        println!("[hirsel-vm] warning: failed to persist autostart spec `{id}`: {e}");
+                    } else {
+                        println!("[hirsel-vm] persisted declarative autostart spec `{id}` in HRSLFS01");
+                    }
+                }
             }
         }
 
@@ -146,6 +375,9 @@ impl VmManager {
             id: id.clone(),
             name: id.clone(),
             ram_mib,
+            vcpus,
+            disk: disk_name.clone(),
+            autostart: spec.autostart,
             started_mono_ns: now,
             ended_mono_ns: None,
             status: VmStatus::Running,
@@ -153,13 +385,16 @@ impl VmManager {
             error: String::new(),
             net: net_spec.clone(),
             ctrl: Arc::clone(&ctrl),
+            exec_lock: Arc::new(Mutex::new(())),
         }));
 
         self.vms.insert(id.clone(), Arc::clone(&rec));
         let summary = summarize_record(&rec.lock().unwrap());
 
         println!(
-            "[hirsel-vm] starting managed Linux VM `{id}` ({ram_mib} MiB, net={})",
+            "[hirsel-vm] starting managed Linux VM `{id}` ({vcpus} vCPU, {ram_mib} MiB, disk={}, autostart={}, net={})",
+            if disk_name.is_empty() { "none" } else { &disk_name },
+            spec.autostart,
             net_spec
                 .as_ref()
                 .map(|n| format!(
@@ -193,7 +428,9 @@ impl VmManager {
                 initrd_bytes.as_deref(),
                 &cmdline,
                 ram_bytes,
+                vcpus,
                 mac,
+                blk_backend,
                 ctrl,
             );
             let ended = unsafe { zx_clock_get_monotonic() };
@@ -292,7 +529,11 @@ impl VmManager {
         Ok(summarize_record(&rec.lock().unwrap()))
     }
 
-    pub fn remove_vm(&mut self, id: &str) -> Result<(), String> {
+    pub fn remove_vm(
+        &mut self,
+        id: &str,
+        dir_backend: &Arc<Mutex<DirBackend>>,
+    ) -> Result<(), String> {
         let running = self
             .vms
             .get(id)
@@ -305,6 +546,10 @@ impl VmManager {
             return Err(format!("VM `{id}` is still running; stop it first"));
         }
         self.vms.remove(id);
+        let key = format!("vm-spec:{id}");
+        if let Some(disk) = dir_backend.lock().unwrap().disk.as_mut() {
+            let _ = disk.fs_remove(&key);
+        }
         Ok(())
     }
 
@@ -345,9 +590,14 @@ fn summarize_record(r: &ManagedVmRecord) -> VmSummary {
         exit_code: r.exit_code,
         error: r.error.clone(),
         ram_mib: r.ram_mib,
+        vcpus: r.vcpus,
+        disk: r.disk.clone(),
+        autostart: r.autostart,
         uptime_ms,
         io_exits: r.ctrl.io_exits.load(std::sync::atomic::Ordering::Relaxed),
         mmio_exits: r.ctrl.mmio_exits.load(std::sync::atomic::Ordering::Relaxed),
+        blk_reads: r.ctrl.blk_reads.load(std::sync::atomic::Ordering::Relaxed),
+        blk_writes: r.ctrl.blk_writes.load(std::sync::atomic::Ordering::Relaxed),
         net_rx_packets,
         net_tx_packets,
         net: r.net.clone(),

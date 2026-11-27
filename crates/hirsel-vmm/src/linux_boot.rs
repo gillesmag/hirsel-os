@@ -11,7 +11,7 @@ pub const GPA_ACPI_RSDP: u64 = 0x000E_0000;
 pub const GPA_ACPI_XSDT: u64 = 0x000E_0040;
 pub const GPA_ACPI_FADT: u64 = 0x000E_0100;
 pub const GPA_ACPI_DSDT: u64 = 0x000E_0280;
-pub const GPA_ACPI_MADT: u64 = 0x000E_0400;
+pub const GPA_ACPI_MADT: u64 = 0x000E_0600;
 pub const GPA_KERNEL_DEFAULT: u64 = 0x0100_0000; // 16 MiB standard 64-bit load address
 
 pub const BOOT_FLAG_MAGIC: u16 = 0xAA55;
@@ -118,12 +118,23 @@ pub fn parse_bzimage(image: &[u8]) -> Result<BzImageInfo, String> {
 }
 
 /// Populates a Linux x86-64 `boot_params` zero-page at `GPA_ZERO_PAGE`, command line
-/// at `GPA_CMDLINE`, E820 RAM map, and optional initramfs inside `ram`.
+/// at `GPA_CMDLINE`, E820 RAM map, minimal ACPI 2.0 tables (with `vcpus` CPUs in MADT
+/// and Virtio-MMIO DSDT devices), and optional initramfs inside `ram`.
 pub fn install_linux_boot_params(
     ram: &mut [u8],
     cmdline: &str,
     initrd: Option<&[u8]>,
     bzimage_setup_hdr: Option<&[u8]>,
+) -> Result<(), String> {
+    install_linux_boot_params_smp(ram, cmdline, initrd, bzimage_setup_hdr, 1)
+}
+
+pub fn install_linux_boot_params_smp(
+    ram: &mut [u8],
+    cmdline: &str,
+    initrd: Option<&[u8]>,
+    bzimage_setup_hdr: Option<&[u8]>,
+    vcpus: u8,
 ) -> Result<(), String> {
     let zp = GPA_ZERO_PAGE as usize;
     let cmd_gpa = GPA_CMDLINE as usize;
@@ -208,10 +219,10 @@ pub fn install_linux_boot_params(
         ram[dst + 8..dst + 16].copy_from_slice(&size.to_le_bytes());
         ram[dst + 16..dst + 20].copy_from_slice(&ty.to_le_bytes());
     }
-    // Install minimal ACPI 2.0 tables (RSDP, XSDT, HW-reduced FADT, DSDT, 1-CPU MADT)
+    // Install minimal ACPI 2.0 tables (RSDP, XSDT, FADT, DSDT with VNET/VBLK/VCON, N-CPU MADT)
     // in the reserved BIOS ROM region [0x000E_0000 .. 0x000E_1000) and point boot_params
-    // `acpi_rsdp_addr` directly at RSDP so Linux discovers CPU 0 Local APIC / x2APIC cleanly.
-    install_minimal_acpi(ram)?;
+    // `acpi_rsdp_addr` directly at RSDP so Linux discovers all vCPUs & Virtio-MMIO devices cleanly.
+    install_minimal_acpi(ram, vcpus.clamp(1, 8))?;
     ram[zp + offsets::ACPI_RSDP_ADDR..zp + offsets::ACPI_RSDP_ADDR + 8]
         .copy_from_slice(&GPA_ACPI_RSDP.to_le_bytes());
 
@@ -245,16 +256,15 @@ fn aml_pkg_len(body_len: usize) -> Vec<u8> {
     }
 }
 
-fn build_virtio_net_dsdt_aml() -> Vec<u8> {
-    // ResourceTemplate(): Memory32Fixed(RW, 0xD0000000, 0x1000) + ExtendedInterrupt(IRQ 5) + EndTag
+fn build_virtio_mmio_aml_device(name: &[u8; 4], uid: u8, base_gpa: u32, irq: u32) -> Vec<u8> {
     let mut crs_data = Vec::new();
-    // Memory32Fixed (0x86, len=9, RW=1, base=0xD0000000, size=0x1000)
+    // Memory32Fixed (0x86, len=9, RW=1, base_gpa, size=0x1000)
     crs_data.extend_from_slice(&[0x86, 0x09, 0x00, 0x01]);
-    crs_data.extend_from_slice(&0xD000_0000u32.to_le_bytes());
+    crs_data.extend_from_slice(&base_gpa.to_le_bytes());
     crs_data.extend_from_slice(&0x0000_1000u32.to_le_bytes());
-    // Extended Interrupt Descriptor (0x89, len=6, flags=0x03 Consumer|Edge|ActiveHigh|Exclusive, count=1, gsi=5)
+    // Extended Interrupt Descriptor (0x89, len=6, Consumer|Edge|ActiveHigh|Exclusive, count=1, gsi=irq)
     crs_data.extend_from_slice(&[0x89, 0x06, 0x00, 0x03, 0x01]);
-    crs_data.extend_from_slice(&5u32.to_le_bytes());
+    crs_data.extend_from_slice(&irq.to_le_bytes());
     // EndTag
     crs_data.extend_from_slice(&[0x79, 0x00]);
 
@@ -268,16 +278,23 @@ fn build_virtio_net_dsdt_aml() -> Vec<u8> {
     crs_buf.extend_from_slice(&buf_inner);
 
     let mut dev_body = Vec::new();
-    dev_body.extend_from_slice(b"VNET");
+    dev_body.extend_from_slice(name);
     // Name (_HID, "LNRO0005")
     dev_body.push(0x08);
     dev_body.extend_from_slice(b"_HID");
     dev_body.push(0x0D);
     dev_body.extend_from_slice(b"LNRO0005\0");
-    // Name (_UID, 0)
+    // Name (_UID, uid)
     dev_body.push(0x08);
     dev_body.extend_from_slice(b"_UID");
-    dev_body.push(0x00);
+    if uid == 0 {
+        dev_body.push(0x00);
+    } else if uid == 1 {
+        dev_body.push(0x01);
+    } else {
+        dev_body.push(0x0A);
+        dev_body.push(uid);
+    }
     // Name (_CRS, Buffer(...))
     dev_body.push(0x08);
     dev_body.extend_from_slice(b"_CRS");
@@ -287,10 +304,18 @@ fn build_virtio_net_dsdt_aml() -> Vec<u8> {
     dev.extend_from_slice(&[0x5B, 0x82]); // DeviceOp
     dev.extend_from_slice(&aml_pkg_len(dev_body.len()));
     dev.extend_from_slice(&dev_body);
+    dev
+}
 
+fn build_virtio_devices_dsdt_aml() -> Vec<u8> {
     let mut scope_body = Vec::new();
     scope_body.extend_from_slice(b"\\_SB_");
-    scope_body.extend_from_slice(&dev);
+    // VNET: virtio-net at 0xD000_0000, IRQ 5
+    scope_body.extend_from_slice(&build_virtio_mmio_aml_device(b"VNET", 0, 0xD000_0000, 5));
+    // VBLK: virtio-blk at 0xD000_1000, IRQ 6
+    scope_body.extend_from_slice(&build_virtio_mmio_aml_device(b"VBLK", 1, 0xD000_1000, 6));
+    // VCON: virtio-console at 0xD000_2000, IRQ 3
+    scope_body.extend_from_slice(&build_virtio_mmio_aml_device(b"VCON", 2, 0xD000_2000, 3));
 
     let mut scope = Vec::new();
     scope.push(0x10); // ScopeOp
@@ -299,17 +324,15 @@ fn build_virtio_net_dsdt_aml() -> Vec<u8> {
     scope
 }
 
-fn install_minimal_acpi(ram: &mut [u8]) -> Result<(), String> {
+fn install_minimal_acpi(ram: &mut [u8], vcpus: u8) -> Result<(), String> {
     if ram.len() < 0x000F_0000 {
         return Err("guest RAM too small for ACPI tables".into());
     }
     ram[GPA_ACPI_RSDP as usize..GPA_ACPI_RSDP as usize + 0x1000].fill(0);
 
-    // 1. DSDT: 36-byte ACPI header + minimal AML declaring `\_SB_.VNET` (`LNRO0005`,
-    //    Virtio-MMIO at 0xD000_0000, size 4 KiB, ISA/GSI IRQ 5) so Linux discovers
-    //    `virtio-net` via standard ACPI even if `virtio_mmio.device=` is absent.
+    // 1. DSDT: 36-byte ACPI header + AML declaring `\_SB_.{VNET, VBLK, VCON}` (`LNRO0005`).
     {
-        let aml = build_virtio_net_dsdt_aml();
+        let aml = build_virtio_devices_dsdt_aml();
         let total = 36 + aml.len();
         let dsdt = &mut ram[GPA_ACPI_DSDT as usize..GPA_ACPI_DSDT as usize + total];
         write_acpi_header(dsdt, b"DSDT", 2);
@@ -353,18 +376,21 @@ fn install_minimal_acpi(ram: &mut [u8]) -> Result<(), String> {
         fadt[9] = acpi_checksum(fadt);
     }
 
-    // 3. MADT ("APIC", 44-byte header + 8-byte Processor Local APIC entry for CPU 0)
+    // 3. MADT ("APIC", 44-byte header + N x 8-byte Processor Local APIC entries for CPUs 0..vcpus)
     {
-        let madt = &mut ram[GPA_ACPI_MADT as usize..GPA_ACPI_MADT as usize + 52];
+        let madt_len = 44 + usize::from(vcpus) * 8;
+        let madt = &mut ram[GPA_ACPI_MADT as usize..GPA_ACPI_MADT as usize + madt_len];
         write_acpi_header(madt, b"APIC", 4);
         madt[36..40].copy_from_slice(&0xFEE0_0000u32.to_le_bytes()); // Local Interrupt Controller Address
         madt[40..44].copy_from_slice(&1u32.to_le_bytes()); // Flags: PCAT_COMPAT (dual-8259 present)
-        // Entry 0: Processor Local APIC (Type=0, Len=8, ACPI UID=0, APIC ID=0, Flags=Enabled)
-        madt[44] = 0;
-        madt[45] = 8;
-        madt[46] = 0;
-        madt[47] = 0;
-        madt[48..52].copy_from_slice(&1u32.to_le_bytes());
+        for cpu in 0..vcpus {
+            let off = 44 + usize::from(cpu) * 8;
+            madt[off] = 0; // Type 0: Processor Local APIC
+            madt[off + 1] = 8; // Length
+            madt[off + 2] = cpu; // ACPI Processor UID
+            madt[off + 3] = cpu; // APIC ID
+            madt[off + 4..off + 8].copy_from_slice(&1u32.to_le_bytes()); // Flags: Enabled
+        }
         madt[9] = acpi_checksum(madt);
     }
 

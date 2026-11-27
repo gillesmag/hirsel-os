@@ -127,6 +127,9 @@ pub const ZX_PKT_TYPE_GUEST_MEM: u32 = 4;
 pub const ZX_PKT_TYPE_GUEST_IO: u32 = 5;
 pub const ZX_PKT_TYPE_GUEST_VCPU: u32 = 6;
 
+pub const ZX_PKT_GUEST_VCPU_INTERRUPT: u8 = 0;
+pub const ZX_PKT_GUEST_VCPU_STARTUP: u8 = 1;
+
 // Zircon processargs protocol constants (<zircon/processargs.h>).
 pub const ZX_PROCARGS_PROTOCOL: u32 = 0x4150_585d; // MXPA (legacy Magenta/Zircon ABI)
 pub const ZX_PROCARGS_VERSION: u32 = 0x0000_1000;
@@ -276,6 +279,18 @@ pub struct zx_packet_guest_io_t {
     pub reserved0: u64,
     pub reserved1: u64,
     pub reserved2: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct zx_packet_guest_vcpu_t {
+    pub r#type: u32,
+    pub _pad: [u8; 4],
+    /// For `INTERRUPT`: `word0 = mask: u64`, `(word1 & 0xFF) as u8 = vector`.
+    /// For `STARTUP`: `word0 = target: u64`, `word1 = entry: u64`, `word2 = context: u64`.
+    pub word0: u64,
+    pub word1: u64,
+    pub word2: u64,
 }
 
 #[cfg(target_os = "fuchsia")]

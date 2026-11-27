@@ -7,9 +7,10 @@
 mod vm;
 
 use hirsel_proto::crypto::{
-    DEFAULT_DEV_KEY_STR, SessionCipher, compute_client_auth_mac, compute_server_auth_mac, ct_eq,
-    derive_cluster_key,
+    DEFAULT_DEV_KEY_STR, SessionCipher, client_auth_mac_pfs, ct_eq, derive_cluster_key,
+    server_auth_mac_pfs,
 };
+use hirsel_proto::x25519::{x25519, x25519_public_key};
 use hirsel_proto::{
     DEFAULT_CHUNK_SIZE, Request, Response, RunTarget, Tier2Mode, hex_encode,
     read_frame_with_cipher, sha256, write_frame,
@@ -42,7 +43,11 @@ fn fill_random_32() -> [u8; 32] {
 }
 
 impl Transport {
-    fn connect_and_auth(addr: &str, unix: Option<&str>, key_str: &str) -> Result<Self, String> {
+    pub(crate) fn connect_and_auth(
+        addr: &str,
+        unix: Option<&str>,
+        key_str: &str,
+    ) -> Result<Self, String> {
         let stream = if let Some(path) = unix {
             let s = UnixStream::connect(path).map_err(|e| format!("unix connect: {e}"))?;
             s.set_read_timeout(Some(Duration::from_secs(60))).ok();
@@ -83,27 +88,50 @@ impl Transport {
     fn authenticate(&mut self, key_str: &str) -> Result<(), String> {
         let key = derive_cluster_key(key_str);
         let client_nonce = fill_random_32();
-        let hello = Request::AuthHello { client_nonce }.encode()?;
+        let client_secret = fill_random_32();
+        let client_pubkey = x25519_public_key(&client_secret);
+
+        let hello = Request::AuthHello {
+            client_nonce,
+            client_pubkey,
+        }
+        .encode()?;
         self.send_raw(&hello)?;
-        let (server_nonce, server_mac) = match self.recv_response()? {
+        let (server_nonce, server_pubkey, server_mac) = match self.recv_response()? {
             Response::AuthChallenge {
                 server_nonce,
+                server_pubkey,
                 server_mac,
-            } => (server_nonce, server_mac),
+            } => (server_nonce, server_pubkey, server_mac),
             Response::Error { message } => return Err(message),
             other => return Err(format!("unexpected AuthHello response: {other:?}")),
         };
-        let expected_server_mac = compute_server_auth_mac(&key, &client_nonce, &server_nonce);
+        let expected_server_mac = server_auth_mac_pfs(
+            &key,
+            &client_nonce,
+            &client_pubkey,
+            &server_nonce,
+            &server_pubkey,
+        );
         if !ct_eq(&expected_server_mac, &server_mac) {
             return Err("server authentication failed: cluster key mismatch".into());
         }
-        let client_mac = compute_client_auth_mac(&key, &client_nonce, &server_nonce);
+        let ecdh_shared = x25519(&client_secret, &server_pubkey);
+        let client_mac = client_auth_mac_pfs(
+            &key,
+            &ecdh_shared,
+            &client_nonce,
+            &client_pubkey,
+            &server_nonce,
+            &server_pubkey,
+        );
         let verify = Request::AuthVerify { client_mac }.encode()?;
         self.send_raw(&verify)?;
         match self.recv_response()? {
             Response::AuthOk => {
-                self.cipher = Some(SessionCipher::new_client(
+                self.cipher = Some(SessionCipher::new_client_pfs(
                     &key,
+                    &ecdh_shared,
                     &client_nonce,
                     &server_nonce,
                 ));
@@ -137,14 +165,19 @@ fn usage() {
         "Usage: hirsel-os-ctl [--addr 127.0.0.1:4444 | --unix PATH] [--key SECRET] <command>\n\
          \n\
          Commands:\n\
-           ping                                         Check node liveness & AEAD RPC RTT\n\
-           info                                         Show node capabilities, slots & image cache\n\
+           ping                                         Check node liveness & PFS AEAD RPC RTT\n\
+           info                                         Show node capabilities, DHCP, PFS & image cache\n\
            images                                       List cached & persisted content-addressed images\n\
+           vol <create|ls|rm>                           Manage persistent VM block volumes (HRSLVOL1)\n\
            upgrade <path-to-zbi>                        Stream & verify ZBI into inactive A/B boot slot\n\
            upgrade-status                               Show A/B boot slot state & staged ZBI digest\n\
+           upgrade-commit                               Promote pending A/B slot to active\n\
+           upgrade-rollback                             Roll back pending or active A/B slot\n\
+           node reboot                                  Gracefully stop VMs, flush disk & cold-reboot node\n\
            run [options] <path>                         Compile (if Hirsel dir), upload & run\n\
            run-bootfs [options] <bootfs-path>           Run a built-in BOOTFS image\n\
-           vm <start|ls|inspect|logs|send|ssh|stop|rm>  Manage persistent Linux MicroVMs & SSH\n\
+           vm <start|ls|inspect|logs|console|exec|send|ssh|stop|rm>\n\
+                                                        Manage persistent SMP Linux MicroVMs\n\
          \n\
          Run options:\n\
            --tier 1|2                                   Execution tier (default: 1)\n\
@@ -353,7 +386,22 @@ fn main() {
                 println!("Hirsel-OS Zircon Node:");
                 println!("  mono_ns:          {}", info.mono_ns);
                 println!("  boot_ns:          {}", info.boot_ns);
-                println!("  auth_aead:        {}", info.auth_enabled);
+                println!(
+                    "  auth_aead:        {} (pfs_x25519={})",
+                    info.auth_enabled, info.pfs_x25519
+                );
+                println!(
+                    "  network:          {}.{}.{}.{} gw={}.{}.{}.{} (dhcp={})",
+                    info.ipv4[0],
+                    info.ipv4[1],
+                    info.ipv4[2],
+                    info.ipv4[3],
+                    info.gateway_ip[0],
+                    info.gateway_ip[1],
+                    info.gateway_ip[2],
+                    info.gateway_ip[3],
+                    info.dhcp_active,
+                );
                 println!(
                     "  ab_slots:         active={} pending={}",
                     slot_label(info.active_slot),
@@ -659,7 +707,46 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        "vm" => vm::handle_vm_command(&mut tx, &addr, args),
+        "upgrade-commit" => match tx.call(&Request::UpgradeCommit) {
+            Ok(Response::UpgradeInfo(u)) => {
+                println!(
+                    "A/B slot committed: active={} pending={}",
+                    slot_label(u.active_slot),
+                    slot_label(u.pending_slot)
+                );
+                Ok(())
+            }
+            Ok(Response::Error { message }) => Err(message),
+            Ok(other) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(e),
+        },
+        "upgrade-rollback" => match tx.call(&Request::UpgradeRollback) {
+            Ok(Response::UpgradeInfo(u)) => {
+                println!(
+                    "A/B slot rolled back: active={} pending={}",
+                    slot_label(u.active_slot),
+                    slot_label(u.pending_slot)
+                );
+                Ok(())
+            }
+            Ok(Response::Error { message }) => Err(message),
+            Ok(other) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(e),
+        },
+        "node" => match args.first().map(String::as_str) {
+            Some("reboot") => match tx.call(&Request::NodeReboot) {
+                Ok(Response::Ok) => {
+                    println!("Hirsel-OS node reboot initiated (VMs stopped, virtio-blk flushed)");
+                    Ok(())
+                }
+                Ok(Response::Error { message }) => Err(message),
+                Ok(other) => Err(format!("unexpected response: {other:?}")),
+                Err(e) => Err(e),
+            },
+            _ => Err("usage: hirsel-os-ctl node reboot".into()),
+        },
+        "vol" | "volume" => vm::handle_vol_command(&mut tx, args),
+        "vm" => vm::handle_vm_command(&mut tx, &addr, unix.as_deref(), &key, args),
         other => Err(format!("unknown command `{other}`")),
     };
 

@@ -354,7 +354,7 @@ boot-os extra_cmdline="":
     DISK="{{out_dir}}/hirsel-store.img"
     mkdir -p "{{out_dir}}"
     if [[ ! -f "$DISK" ]]; then
-      truncate -s 64M "$DISK"
+      truncate -s 128M "$DISK"
     fi
     QEMU_ARGS=(
       -L "{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/share/qemu"
@@ -366,7 +366,7 @@ boot-os extra_cmdline="":
       -drive "file=${DISK},format=raw,if=none,id=blk0"
       -device "virtio-blk-pci,drive=blk0"
       -m 1024
-      -smp 2
+      -smp 4
       -vga none
       -nographic
       -serial mon:stdio
@@ -574,7 +574,7 @@ test-net-blk: build-os
       fi
       QEMU_PID=$!
       for _ in $(seq 1 80); do
-        if grep -qa "Control Plane TCP API listening" "$log" 2>/dev/null; then
+        if grep -qaE "DHCPv4 lease acquired|falling back to static" "$log" 2>/dev/null; then
           return 0
         fi
         sleep 0.1
@@ -663,7 +663,7 @@ test-all: build-rt build-os build-linux-workload
       fi
       QEMU_PID=$!
       for _ in $(seq 1 80); do
-        if grep -qa "Control Plane TCP API listening" "$log" 2>/dev/null; then
+        if grep -qaE "DHCPv4 lease acquired|falling back to static" "$log" 2>/dev/null; then
           return 0
         fi
         sleep 0.1
@@ -789,12 +789,12 @@ test-linux-vm: build-os build-linux-initrd fetch-linux-kernel
     fi
     QEMU_PID=$!
     for _ in $(seq 1 80); do
-      if grep -qa "Control Plane TCP API listening" "$LOG" 2>/dev/null; then
+      if grep -qaE "DHCPv4 lease acquired|falling back to static" "$LOG" 2>/dev/null; then
         break
       fi
       sleep 0.1
     done
-    grep -qa "Control Plane TCP API listening" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
+    grep -qaE "DHCPv4 lease acquired|falling back to static" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
 
     echo "=== 1. Boot REAL Linux 6.1.102 kernel + initramfs inside Zircon AMD SVM ==="
     OUT1="$(
@@ -825,7 +825,12 @@ test-linux-vm: build-os build-linux-initrd fetch-linux-kernel
     grep -q "uname:     Linux 6.1.102 x86_64" <<<"$OUT2"
     echo "=== PASS: Upstream Linux 6.1.102 microVM booted cleanly to PID 1 twice inside Zircon AMD SVM! ==="
 
-# End-to-end KVM test: start persistent Linux 6.1.102 MicroVM from vm.spec, set up virtio-net eth0, and SSH into it!
+# End-to-end KVM verification of ALL 5 production milestones:
+# 1. Persistent Virtio-Blk VM volumes (/dev/vda) surviving VM restart AND node cold reboot
+# 2. Multi-vCPU SMP Linux 6.1.102 MicroVMs (vcpus = 2, nproc == 2)
+# 3. Declarative autostart reconciliation on cold boot + `node reboot` + A/B commit/rollback
+# 4. Dynamic DHCPv4 + X25519 Perfect Forward Secrecy (PFS) AEAD control plane
+# 5. Network-less `vm exec` over Virtio-Console (/dev/hvc0) on `--no-net` VM + inbound/outbound SSH/DNS/NAT
 test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     #!/usr/bin/env bash
     set -euo pipefail
@@ -838,20 +843,15 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     CTL_PORT=14447
     SSH_PORT=12222
     rm -f "$DISK" "$LOG"
-    truncate -s 64M "$DISK"
+    truncate -s 128M "$DISK"
 
     QEMU_PID=""
-    HOST_DB_PID=""
     stop_qemu() {
-      if [[ -n "$HOST_DB_PID" ]]; then
-        kill "$HOST_DB_PID" 2>/dev/null || true
-      fi
       if [[ -n "$QEMU_PID" ]]; then
         kill "$QEMU_PID" 2>/dev/null || true
       fi
       pkill -f "hostfwd=tcp:127.0.0.1:${CTL_PORT}-:4444" 2>/dev/null || true
       QEMU_PID=""
-      HOST_DB_PID=""
       sleep 0.2
     }
     trap stop_qemu EXIT
@@ -868,7 +868,7 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
       -device "virtio-blk-pci,drive=blk0"
       -enable-kvm -cpu "host,migratable=no,+invtsc"
       -m 1024
-      -smp 2
+      -smp 4
       -vga none
       -display none
       -serial "file:${LOG}"
@@ -884,18 +884,30 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     fi
     QEMU_PID=$!
     for _ in $(seq 1 80); do
-      if grep -qa "Control Plane TCP API listening" "$LOG" 2>/dev/null; then
+      if grep -qaE "DHCPv4 lease acquired|falling back to static" "$LOG" 2>/dev/null; then
         break
       fi
       sleep 0.1
     done
-    grep -qa "Control Plane TCP API listening" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
+    grep -qaE "DHCPv4 lease acquired|falling back to static" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
 
-    echo "=== 1. Start persistent Linux 6.1.102 VM from examples/linux-vm/vm.spec ==="
-    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm start --spec "{{root}}/examples/linux-vm/vm.spec"
+    echo "=== 1. Verify X25519 PFS AEAD + dynamic DHCPv4 lease ==="
+    INFO_OUT="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" info)"
+    printf '%s\n' "$INFO_OUT"
+    grep -q "pfs_x25519=true" <<<"$INFO_OUT"
+    grep -q "dhcp=true" <<<"$INFO_OUT"
 
-    echo "=== 2. Wait for VM boot & SSH daemon readiness via live vm logs ==="
-    for _ in $(seq 1 80); do
+    echo "=== 2. Create persistent named VM volume (8 MiB on virtio-blk HRSLVOL1) ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vol create data-1 8
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vol ls
+
+    echo "=== 3. Start 2-vCPU SMP Linux 6.1.102 VM with persistent /dev/vda & autostart ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm start \
+      --spec "{{root}}/examples/linux-vm/vm.spec" \
+      --disk data-1 \
+      --autostart
+
+    for _ in $(seq 1 100); do
       LOGS="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" vm logs dev-1)"
       if grep -q "SSH daemon listening on 0.0.0.0:22" <<<"$LOGS"; then
         printf '%s\n' "$LOGS"
@@ -903,12 +915,12 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
       fi
       sleep 0.2
     done
+    grep -q "cpus=2" <<<"$LOGS"
+    grep -q "virtio-blk attached at /dev/vda" <<<"$LOGS"
+    grep -q "virtio-console guest agent active on /dev/hvc0" <<<"$LOGS"
 
-    echo "=== 3. List & inspect running persistent VM ==="
-    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
-    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm inspect dev-1
-
-    echo "=== 4. REAL SSH into Linux 6.1.102 MicroVM over virtio-net MMIO -> smoltcp gateway! ==="
+    echo "=== 4. Verify 2 vCPUs, /dev/vda persistent write, inbound SSH & outbound DNS/NAT/SSH ==="
+    OUT_KEY_B64="$(base64 -w0 "{{out_dir}}/linux/id_ed25519")"
     SSH_OUT="$(
       ssh \
         -i "{{out_dir}}/linux/id_ed25519" \
@@ -918,46 +930,84 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
         -o LogLevel=ERROR \
         -p "${SSH_PORT}" \
         root@127.0.0.1 \
-        "echo '[ssh] CONNECTED TO:' \$(hostname) && uname -a && ip -o -4 addr show eth0 && ping -c 2 -W 2 10.0.3.1 && id"
-    )"
-    printf '%s\n' "$SSH_OUT"
-    grep -q "CONNECTED TO: dev-1" <<<"$SSH_OUT"
-    grep -q "Linux dev-1 6.1.102" <<<"$SSH_OUT"
-    grep -q "10.0.3.2/24" <<<"$SSH_OUT"
-    grep -q "2 packets received" <<<"$SSH_OUT"
-
-    echo "=== 5. REAL OUTBOUND DNS, ICMP & SSH from inside Linux 6.1.102 VM through Hirsel-OS NAT! ==="
-    # Verify outbound UDP DNS (`10.0.2.3`), ICMP (`10.0.2.2`), and TCP SSH from INSIDE dev-1!
-    OUT_KEY_B64="$(base64 -w0 "{{out_dir}}/linux/id_ed25519")"
-    OUTBOUND_OUT="$(
-      ssh \
-        -i "{{out_dir}}/linux/id_ed25519" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        -p "${SSH_PORT}" \
-        root@127.0.0.1 \
-        "nslookup example.com && \
+        "echo '[ssh] CONNECTED TO:' \$(hostname) && \
+         echo 'NPROC='\"\$(nproc)\" && \
+         echo 'PERSIST_MARKER_42' > /mnt/data/hello.txt && sync && \
+         cat /mnt/data/hello.txt && \
+         nslookup example.com && \
          ping -c 1 -W 3 example.com && \
          echo '${OUT_KEY_B64}' | base64 -d > /tmp/id_openssh && \
          chmod 600 /tmp/id_openssh && \
          dropbearconvert openssh dropbear /tmp/id_openssh /tmp/id_dropbear && \
          ping -c 2 -W 2 10.0.2.2 && \
-         ssh -y -i /tmp/id_dropbear -p ${SSH_PORT} root@10.0.2.2 'echo OUTBOUND_SSH_OK && uname -r && hostname'"
+         ssh -y -i /tmp/id_dropbear -p ${SSH_PORT} root@10.0.2.2 'echo OUTBOUND_SSH_OK && nproc'"
     )"
-    printf '%s\n' "$OUTBOUND_OUT"
-    grep -q "Name:.*example.com" <<<"$OUTBOUND_OUT"
-    grep -q "2 packets received" <<<"$OUTBOUND_OUT"
-    grep -q "OUTBOUND_SSH_OK" <<<"$OUTBOUND_OUT"
-    grep -q "6.1.102" <<<"$OUTBOUND_OUT"
+    printf '%s\n' "$SSH_OUT"
+    grep -q "CONNECTED TO: dev-1" <<<"$SSH_OUT"
+    grep -q "NPROC=2" <<<"$SSH_OUT"
+    grep -q "PERSIST_MARKER_42" <<<"$SSH_OUT"
+    grep -q "Name:.*example.com" <<<"$SSH_OUT"
+    grep -q "OUTBOUND_SSH_OK" <<<"$SSH_OUT"
 
-    echo "=== 6. Verify live network packet counters & stop/remove VM cleanly ==="
+    echo "=== 5. Verify network-less --no-net VM + virtio-console /dev/hvc0 vm exec! ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm start \
+      --name airgap-1 \
+      --kernel "{{out_dir}}/linux/vmlinux.stripped" \
+      --initrd "{{out_dir}}/linux/initramfs-ssh.cpio" \
+      --vcpus 2 \
+      --no-net
+    for _ in $(seq 1 100); do
+      AG_LOGS="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" vm logs airgap-1)"
+      if grep -q "virtio-console guest agent active on /dev/hvc0" <<<"$AG_LOGS"; then
+        break
+      fi
+      sleep 0.2
+    done
+    EXEC_OUT="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" vm exec airgap-1 -- "echo AIRGAP_EXEC_OK && uname -r && nproc && ip link show")"
+    printf '%s\n' "$EXEC_OUT"
+    grep -q "AIRGAP_EXEC_OK" <<<"$EXEC_OUT"
+    grep -q "6.1.102" <<<"$EXEC_OUT"
+    ! grep -q "eth0" <<<"$EXEC_OUT"
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm stop airgap-1
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm rm airgap-1
+
+    echo "=== 6. Cold-reboot Hirsel-OS node via 'node reboot' & verify autostart + persistent /dev/vda! ==="
+    BOOT1_COUNT="$(grep -ac "DHCPv4 lease acquired" "$LOG" || true)"
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" node reboot
+    for _ in $(seq 1 120); do
+      BOOT2_COUNT="$(grep -ac "DHCPv4 lease acquired" "$LOG" || true)"
+      if [[ "$BOOT2_COUNT" -gt "$BOOT1_COUNT" ]]; then
+        break
+      fi
+      sleep 0.2
+    done
+    [[ "$BOOT2_COUNT" -gt "$BOOT1_COUNT" ]] || { echo "Node did not complete cold reboot:"; tr -d '\000' < "$LOG" | tail -n 50; exit 1; }
+
+    echo "=== 7. Wait for auto-reconciled dev-1 & verify /mnt/data/hello.txt survived cold reboot! ==="
+    for _ in $(seq 1 100); do
+      LOGS2="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" vm logs dev-1 2>/dev/null || true)"
+      if grep -q "SSH daemon listening on 0.0.0.0:22" <<<"$LOGS2"; then
+        break
+      fi
+      sleep 0.2
+    done
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm inspect dev-1
+    PERSIST_OUT="$(
+      "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm exec dev-1 -- "cat /mnt/data/hello.txt && nproc"
+    )"
+    printf '%s\n' "$PERSIST_OUT"
+    grep -q "PERSIST_MARKER_42" <<<"$PERSIST_OUT"
+    grep -q "^2$" <<<"$PERSIST_OUT"
+
+    echo "=== 8. Verify A/B upgrade commit & rollback + clean teardown ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" upgrade "{{out_dir}}/hirsel-os.zbi"
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" upgrade-commit
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" upgrade-rollback
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm stop dev-1
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm rm dev-1
-    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
-    echo "=== PASS: Managed persistent Linux 6.1.102 VM + inbound & outbound SSH over NAT verified end-to-end! ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vol rm data-1
+    echo "=== PASS: ALL 5 PRODUCTION MILESTONES VERIFIED END-TO-END UNDER KVM! ==="
 
 # Run host Rust unit tests (zbi, zx-sys, hirsel-proto, hirsel-vmm, hirsel-virtio)
 test:

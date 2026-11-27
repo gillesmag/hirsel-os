@@ -86,6 +86,66 @@ pub fn client_auth_mac(
 pub use client_auth_mac as compute_client_auth_mac;
 pub use server_auth_mac as compute_server_auth_mac;
 
+/// Perfect Forward Secrecy (PFS) session key derivation combining static cluster key
+/// with an ephemeral RFC 7748 X25519 ECDH shared secret and both session nonces.
+pub fn derive_session_keys_pfs(
+    cluster_key: &[u8; 32],
+    ecdh_shared: &[u8; 32],
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
+    let prk = hmac_sha256(
+        cluster_key,
+        &[b"hirsel-os.hkdf.pfs.v2", ecdh_shared, client_nonce, server_nonce],
+    );
+    let c2s = hmac_sha256(&prk, &[b"c2s", &[1u8]]);
+    let s2c = hmac_sha256(&prk, &[b"s2c", &[1u8]]);
+    (c2s, s2c)
+}
+
+/// Server authentication MAC binding the ephemeral X25519 public keys and nonces
+/// to the pre-shared cluster key (prevents MitM on the ephemeral key exchange).
+pub fn server_auth_mac_pfs(
+    cluster_key: &[u8; 32],
+    client_nonce: &[u8; 32],
+    client_pubkey: &[u8; 32],
+    server_nonce: &[u8; 32],
+    server_pubkey: &[u8; 32],
+) -> [u8; 32] {
+    hmac_sha256(
+        cluster_key,
+        &[
+            b"hirsel-os-srv-pfs-v2",
+            client_nonce,
+            client_pubkey,
+            server_nonce,
+            server_pubkey,
+        ],
+    )
+}
+
+/// Client authentication MAC binding both ephemeral X25519 public keys, nonces, and shared secret.
+pub fn client_auth_mac_pfs(
+    cluster_key: &[u8; 32],
+    ecdh_shared: &[u8; 32],
+    client_nonce: &[u8; 32],
+    client_pubkey: &[u8; 32],
+    server_nonce: &[u8; 32],
+    server_pubkey: &[u8; 32],
+) -> [u8; 32] {
+    hmac_sha256(
+        cluster_key,
+        &[
+            b"hirsel-os-cli-pfs-v2",
+            ecdh_shared,
+            client_nonce,
+            client_pubkey,
+            server_nonce,
+            server_pubkey,
+        ],
+    )
+}
+
 // --- RFC 8439 ChaCha20 ---
 
 #[inline]
@@ -403,6 +463,28 @@ impl SessionCipher {
         server_nonce: &[u8; 32],
     ) -> Self {
         let (c2s, s2c) = derive_session_keys(cluster_key, client_nonce, server_nonce);
+        Self::new(s2c, c2s)
+    }
+
+    pub fn new_client_pfs(
+        cluster_key: &[u8; 32],
+        ecdh_shared: &[u8; 32],
+        client_nonce: &[u8; 32],
+        server_nonce: &[u8; 32],
+    ) -> Self {
+        let (c2s, s2c) =
+            derive_session_keys_pfs(cluster_key, ecdh_shared, client_nonce, server_nonce);
+        Self::new(c2s, s2c)
+    }
+
+    pub fn new_server_pfs(
+        cluster_key: &[u8; 32],
+        ecdh_shared: &[u8; 32],
+        client_nonce: &[u8; 32],
+        server_nonce: &[u8; 32],
+    ) -> Self {
+        let (c2s, s2c) =
+            derive_session_keys_pfs(cluster_key, ecdh_shared, client_nonce, server_nonce);
         Self::new(s2c, c2s)
     }
 

@@ -5,10 +5,13 @@ use crate::{Transport, ensure_uploaded};
 use hirsel_proto::{
     PortForward, Request, Response, RunTarget, VmNetSpec, VmSpec, VmStatus, VmSummary,
 };
+use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -75,6 +78,10 @@ struct FileVmSpec {
     kernel: Option<String>,
     initrd: Option<String>,
     ram_mib: Option<u32>,
+    vcpus: Option<u8>,
+    disk: Option<String>,
+    image: Option<String>,
+    autostart: bool,
     cmdline: Option<String>,
     guest_ip: Option<String>,
     gateway_ip: Option<String>,
@@ -112,6 +119,15 @@ fn parse_spec_file(path: &Path) -> Result<FileVmSpec, String> {
                         .map_err(|_| format!("invalid ram_mib `{val}`"))?,
                 )
             }
+            "vcpus" => {
+                spec.vcpus = Some(
+                    val.parse::<u8>()
+                        .map_err(|_| format!("invalid vcpus `{val}`"))?,
+                )
+            }
+            "disk" => spec.disk = Some(val),
+            "image" => spec.image = Some(val),
+            "autostart" => spec.autostart = val == "true" || val == "1",
             "cmdline" => spec.cmdline = Some(val),
             "guest_ip" => spec.guest_ip = Some(val),
             "gateway_ip" => spec.gateway_ip = Some(val),
@@ -154,7 +170,15 @@ fn fmt_mac(m: [u8; 6]) -> String {
 
 fn print_summary_detail(s: &VmSummary) {
     println!("VM `{}` ({}):", s.id, s.status.as_str());
+    println!("  vcpus:      {}", s.vcpus);
     println!("  ram_mib:    {} MiB", s.ram_mib);
+    println!(
+        "  disk:       {} (blk reads={} writes={})",
+        if s.disk.is_empty() { "none" } else { &s.disk },
+        s.blk_reads,
+        s.blk_writes
+    );
+    println!("  autostart:  {}", s.autostart);
     println!("  uptime_ms:  {} ms", s.uptime_ms);
     println!("  exit_code:  {}", s.exit_code);
     if !s.error.is_empty() {
@@ -195,6 +219,10 @@ pub fn vm_usage() {
              --kernel PATH                 Linux x86-64 vmlinux/bzImage path\n\
              --initrd PATH                 cpio initramfs path\n\
              --ram-mib N                   Guest RAM in MiB (default: 128)\n\
+             --vcpus N                     Number of vCPUs 1..8 (default: 1)\n\
+             --disk VOLUME                 Attach persistent named volume as /dev/vda\n\
+             --image OCI_IMAGE             Build ext4 from Docker/OCI image & attach as /dev/vda\n\
+             --autostart                   Persist spec in HRSLFS01 & auto-start on cold boot\n\
              --cmdline STRING              Kernel command line\n\
              --guest-ip IP[/PFX]           Guest eth0 IPv4/CIDR (default: 10.0.3.2/24)\n\
              --gateway-ip IP               Virtual gateway IPv4 (default: 10.0.3.1)\n\
@@ -203,16 +231,194 @@ pub fn vm_usage() {
              --port HOST:GUEST             Add extra TCP port forward (repeatable)\n\
              --no-net                      Disable Virtio-Net networking\n\
            vm ls                           List managed VMs\n\
-           vm inspect <id>                 Show VM spec, network, and live counters\n\
+           vm inspect <id>                 Show VM spec, network, disk & live counters\n\
            vm logs <id> [--offset N] [-f]  Read or follow live COM1 serial console logs\n\
+           vm console <id>                 Interactive raw-TTY serial console (Ctrl-] to detach)\n\
+           vm exec <id> [--timeout-ms MS] -- <cmd...>\n\
+                                           Execute command via virtio-console /dev/hvc0 (works without network!)\n\
            vm send <id> <text>             Send text + newline to VM serial console\n\
            vm ssh <id> [-i KEY] [-- CMD]   Open an SSH session directly into the running VM\n\
            vm stop <id>                    Stop a running VM and free its resources/ports\n\
-           vm rm <id>                      Remove a stopped VM record"
+           vm rm <id>                      Remove a stopped VM record & persisted autostart spec"
     );
 }
 
-pub fn handle_vm_command(tx: &mut Transport, node_addr: &str, mut args: Vec<String>) -> Result<(), String> {
+/// Exports a Docker/OCI container image into a standalone ext4 filesystem image using `mkfs.ext4 -d`.
+fn build_ext4_from_oci(image: &str, size_mib: u32) -> Result<Vec<u8>, String> {
+    let tmp = env::temp_dir().join(format!("hirsel-oci-{}", process::id()));
+    let rootfs = tmp.join("rootfs");
+    let img_path = tmp.join("rootfs.ext4");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&rootfs).map_err(|e| format!("mkdir {}: {e}", rootfs.display()))?;
+
+    eprintln!("[hirsel-os-ctl] exporting OCI image `{image}` into {size_mib} MiB ext4...");
+    let create_out = Command::new("docker")
+        .args(["create", image])
+        .output()
+        .map_err(|e| format!("failed to run docker create: {e}"))?;
+    if !create_out.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "docker create `{image}` failed: {}",
+            String::from_utf8_lossy(&create_out.stderr)
+        ));
+    }
+    let cid = String::from_utf8_lossy(&create_out.stdout).trim().to_owned();
+    let tar_path = tmp.join("rootfs.tar");
+    let export_status = Command::new("docker")
+        .args(["export", "-o", tar_path.to_str().unwrap(), &cid])
+        .status()
+        .map_err(|e| format!("docker export failed: {e}"))?;
+    let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+    if !export_status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("docker export failed with {export_status}"));
+    }
+
+    let untar = Command::new("tar")
+        .args(["-xf", tar_path.to_str().unwrap(), "-C", rootfs.to_str().unwrap()])
+        .status()
+        .map_err(|e| format!("tar extract failed: {e}"))?;
+    if !untar.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("tar extract failed with {untar}"));
+    }
+
+    let mkfs_bin = if Path::new("/usr/sbin/mkfs.ext4").is_file() {
+        "/usr/sbin/mkfs.ext4"
+    } else {
+        "mkfs.ext4"
+    };
+    let mkfs = Command::new(mkfs_bin)
+        .args([
+            "-q",
+            "-F",
+            "-d",
+            rootfs.to_str().unwrap(),
+            img_path.to_str().unwrap(),
+            &format!("{size_mib}M"),
+        ])
+        .status()
+        .map_err(|e| format!("mkfs.ext4 failed: {e}"))?;
+    if !mkfs.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("mkfs.ext4 exited with {mkfs}"));
+    }
+
+    let bytes = fs::read(&img_path).map_err(|e| format!("read ext4 image: {e}"))?;
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(bytes)
+}
+
+pub fn handle_vol_command(tx: &mut Transport, mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        eprintln!(
+            "Usage: hirsel-os-ctl vol <subcommand>\n\
+             \n\
+             Subcommands:\n\
+               vol create <name> <size-mib> [--from-file PATH | --from-oci IMAGE]\n\
+               vol ls\n\
+               vol rm <name>"
+        );
+        return Ok(());
+    }
+    let sub = args.remove(0);
+    match sub.as_str() {
+        "create" => {
+            if args.len() < 2 {
+                return Err(
+                    "usage: vol create <name> <size-mib> [--from-file PATH | --from-oci IMAGE]"
+                        .into(),
+                );
+            }
+            let name = args.remove(0);
+            let size_mib = args
+                .remove(0)
+                .parse::<u32>()
+                .map_err(|_| "invalid size-mib".to_string())?;
+            let mut from_file: Option<String> = None;
+            let mut from_oci: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from-file" if i + 1 < args.len() => {
+                        from_file = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--from-oci" if i + 1 < args.len() => {
+                        from_oci = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown option `{other}` for `vol create`")),
+                }
+            }
+            let initial_image = if let Some(path) = from_file {
+                let bytes = fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+                let d = ensure_uploaded(tx, &format!("vol-{name}"), &bytes)?;
+                Some(RunTarget::Digest(d))
+            } else if let Some(image) = from_oci {
+                let bytes = build_ext4_from_oci(&image, size_mib)?;
+                let d = ensure_uploaded(tx, &format!("oci-{name}"), &bytes)?;
+                Some(RunTarget::Digest(d))
+            } else {
+                None
+            };
+            match tx.call(&Request::VolumeCreate {
+                name,
+                size_mib,
+                initial_image,
+            })? {
+                Response::VolumeInfo(v) => {
+                    println!(
+                        "Volume `{}` created: {} MiB ({} sectors @ {})",
+                        v.name, v.size_mib, v.sectors, v.start_sector
+                    );
+                    Ok(())
+                }
+                Response::Error { message } => Err(message),
+                other => Err(format!("unexpected VolumeCreate response: {other:?}")),
+            }
+        }
+        "ls" | "list" => match tx.call(&Request::VolumeList)? {
+            Response::VolumeList(list) => {
+                if list.is_empty() {
+                    println!("(no persistent volumes)");
+                } else {
+                    println!("{:<24} {:>8} {:>10} {:>12}", "NAME", "SIZE", "SECTORS", "START_SECTOR");
+                    for v in list {
+                        println!(
+                            "{:<24} {:>6}MiB {:>10} {:>12}",
+                            v.name, v.size_mib, v.sectors, v.start_sector
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected VolumeList response: {other:?}")),
+        },
+        "rm" | "remove" => {
+            let name = args.first().ok_or("usage: vol rm <name>")?.clone();
+            match tx.call(&Request::VolumeRemove { name: name.clone() })? {
+                Response::Ok => {
+                    println!("Volume `{name}` removed");
+                    Ok(())
+                }
+                Response::Error { message } => Err(message),
+                other => Err(format!("unexpected VolumeRemove response: {other:?}")),
+            }
+        }
+        other => Err(format!("unknown vol subcommand `{other}`")),
+    }
+}
+
+pub fn handle_vm_command(
+    tx: &mut Transport,
+    node_addr: &str,
+    unix: Option<&str>,
+    key: &str,
+    mut args: Vec<String>,
+) -> Result<(), String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         vm_usage();
         return Ok(());
@@ -233,6 +439,8 @@ pub fn handle_vm_command(tx: &mut Transport, node_addr: &str, mut args: Vec<Stri
             }
         }
         "logs" => cmd_vm_logs(tx, args),
+        "console" => cmd_vm_console(tx, node_addr, unix, key, args),
+        "exec" => cmd_vm_exec(tx, args),
         "send" => {
             if args.len() < 2 {
                 return Err("usage: vm send <id> <text>".into());
@@ -288,6 +496,10 @@ fn cmd_vm_start(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {
     let mut kernel_path: Option<String> = None;
     let mut initrd_path: Option<String> = None;
     let mut ram_mib: Option<u32> = None;
+    let mut vcpus: Option<u8> = None;
+    let mut disk: Option<String> = None;
+    let mut image: Option<String> = None;
+    let mut autostart = false;
     let mut cmdline: Option<String> = None;
     let mut guest_ip_str: Option<String> = None;
     let mut gateway_ip_str: Option<String> = None;
@@ -322,6 +534,26 @@ fn cmd_vm_start(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {
                         .map_err(|_| format!("invalid --ram-mib `{}`", args[i + 1]))?,
                 );
                 i += 2;
+            }
+            "--vcpus" if i + 1 < args.len() => {
+                vcpus = Some(
+                    args[i + 1]
+                        .parse::<u8>()
+                        .map_err(|_| format!("invalid --vcpus `{}`", args[i + 1]))?,
+                );
+                i += 2;
+            }
+            "--disk" if i + 1 < args.len() => {
+                disk = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--image" if i + 1 < args.len() => {
+                image = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--autostart" => {
+                autostart = true;
+                i += 1;
             }
             "--cmdline" if i + 1 < args.len() => {
                 cmdline = Some(args[i + 1].clone());
@@ -370,8 +602,42 @@ fn cmd_vm_start(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {
         .ok_or("missing --kernel PATH (or `kernel = ...` in --spec)")?;
     let eff_initrd = initrd_path.or(file_spec.initrd);
     let eff_ram = ram_mib.or(file_spec.ram_mib).unwrap_or(128);
+    let eff_vcpus = vcpus.or(file_spec.vcpus).unwrap_or(1).clamp(1, 8);
+    let eff_autostart = autostart || file_spec.autostart;
     let eff_cmdline = cmdline.or(file_spec.cmdline).unwrap_or_default();
     let eff_no_net = no_net || file_spec.no_net;
+
+    // Optional OCI image -> ext4 volume creation.
+    let mut eff_disk = disk.or(file_spec.disk);
+    if let Some(oci_ref) = image.or(file_spec.image) {
+        let vol_name = eff_disk.clone().unwrap_or_else(|| {
+            if eff_name.is_empty() {
+                "oci-rootfs".into()
+            } else {
+                format!("{eff_name}-root")
+            }
+        });
+        let ext4_bytes = build_ext4_from_oci(&oci_ref, 32)?;
+        let digest = ensure_uploaded(tx, &format!("oci-{vol_name}"), &ext4_bytes)?;
+        match tx.call(&Request::VolumeCreate {
+            name: vol_name.clone(),
+            size_mib: 32,
+            initial_image: Some(RunTarget::Digest(digest)),
+        })? {
+            Response::VolumeInfo(v) => {
+                eprintln!(
+                    "[hirsel-os-ctl] created OCI volume `{}` ({} MiB)",
+                    v.name, v.size_mib
+                );
+            }
+            Response::Error { message } if message.contains("already exists") => {
+                eprintln!("[hirsel-os-ctl] reusing existing persistent volume `{vol_name}`");
+            }
+            Response::Error { message } => return Err(message),
+            other => return Err(format!("unexpected VolumeCreate response: {other:?}")),
+        }
+        eff_disk = Some(vol_name);
+    }
 
     let net = if eff_no_net {
         None
@@ -440,8 +706,11 @@ fn cmd_vm_start(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {
         kernel: RunTarget::Digest(kdigest),
         initrd: initrd_target,
         ram_mib: eff_ram,
+        vcpus: eff_vcpus,
         cmdline: eff_cmdline,
         net,
+        disk: eff_disk,
+        autostart: eff_autostart,
     };
 
     match tx.call(&Request::VmStart(spec))? {
@@ -462,8 +731,8 @@ fn cmd_vm_ls(tx: &mut Transport) -> Result<(), String> {
                 return Ok(());
             }
             println!(
-                "{:<14} {:<9} {:>6} {:<16} {:<14} {:>8} {:>10}",
-                "ID", "STATE", "RAM", "GUEST_IP", "PORTS", "UPTIME", "NET RX/TX"
+                "{:<14} {:<8} {:>4} {:>5} {:<10} {:<15} {:<11} {:>7}",
+                "ID", "STATE", "CPU", "RAM", "DISK", "GUEST_IP", "PORTS", "UPTIME"
             );
             for vm in list {
                 let (ip, ports) = match vm.net.as_ref() {
@@ -478,15 +747,15 @@ fn cmd_vm_ls(tx: &mut Transport) -> Result<(), String> {
                     None => ("-".into(), "-".into()),
                 };
                 println!(
-                    "{:<14} {:<9} {:>4}M {:<16} {:<14} {:>6}ms {:>4}/{}",
+                    "{:<14} {:<8} {:>4} {:>4}M {:<10} {:<15} {:<11} {:>5}ms",
                     vm.id,
                     vm.status.as_str(),
+                    vm.vcpus,
                     vm.ram_mib,
+                    if vm.disk.is_empty() { "-" } else { &vm.disk },
                     ip,
                     ports,
                     vm.uptime_ms,
-                    vm.net_rx_packets,
-                    vm.net_tx_packets,
                 );
             }
             Ok(())
@@ -494,6 +763,184 @@ fn cmd_vm_ls(tx: &mut Transport) -> Result<(), String> {
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected VmList response: {other:?}")),
     }
+}
+
+fn cmd_vm_exec(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {
+    let mut id: Option<String> = None;
+    let mut timeout_ms: u64 = 15_000;
+    let mut cmd_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout-ms" if i + 1 < args.len() => {
+                timeout_ms = args[i + 1].parse().unwrap_or(15_000);
+                i += 2;
+            }
+            "--" => {
+                cmd_parts.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            s if id.is_none() => {
+                id = Some(s.to_owned());
+                i += 1;
+            }
+            s => {
+                cmd_parts.push(s.to_owned());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("usage: vm exec <id> [--timeout-ms MS] -- <command...>")?;
+    if cmd_parts.is_empty() {
+        return Err("missing command for `vm exec`".into());
+    }
+    let command = cmd_parts.join(" ");
+    match tx.call(&Request::VmExec {
+        id,
+        command,
+        timeout_ms,
+    })? {
+        Response::ExecResult { exit_code, stdout } => {
+            let _ = io::stdout().write_all(&stdout);
+            let _ = io::stdout().flush();
+            if exit_code != 0 {
+                process::exit(exit_code);
+            }
+            Ok(())
+        }
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected VmExec response: {other:?}")),
+    }
+}
+
+struct SttyGuard(Option<String>);
+
+impl SttyGuard {
+    fn enter_raw() -> Self {
+        let saved = Command::new("stty")
+            .arg("-g")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        if saved.is_some() {
+            let _ = Command::new("stty").args(["raw", "-echo"]).status();
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for SttyGuard {
+    fn drop(&mut self) {
+        if let Some(ref state) = self.0 {
+            let _ = Command::new("stty").arg(state).status();
+        }
+    }
+}
+
+fn cmd_vm_console(
+    tx: &mut Transport,
+    node_addr: &str,
+    unix: Option<&str>,
+    key: &str,
+    args: Vec<String>,
+) -> Result<(), String> {
+    let id = args
+        .first()
+        .ok_or("usage: vm console <id>")?
+        .clone();
+
+    // Verify VM exists and fetch current console tail offset.
+    let start_offset = match tx.call(&Request::VmLogs {
+        id: id.clone(),
+        offset: 0,
+        max_bytes: 64 * 1024,
+    })? {
+        Response::VmLogs {
+            data,
+            next_offset,
+            status,
+        } => {
+            if !data.is_empty() {
+                let _ = io::stdout().write_all(&data);
+                let _ = io::stdout().flush();
+            }
+            if status != VmStatus::Running {
+                return Err(format!("VM `{id}` is not running (status={})", status.as_str()));
+            }
+            next_offset
+        }
+        Response::Error { message } => return Err(message),
+        other => return Err(format!("unexpected VmLogs response: {other:?}")),
+    };
+
+    eprintln!("\r\n[hirsel-os-ctl] attached to VM `{id}` console (press Ctrl-] to detach)\r\n");
+    let _raw = SttyGuard::enter_raw();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_r = Arc::clone(&stop);
+
+    // Background log follower on a dedicated authenticated PFS transport.
+    let addr_c = node_addr.to_owned();
+    let unix_c = unix.map(str::to_owned);
+    let key_c = key.to_owned();
+    let id_c = id.clone();
+    let reader_thread = thread::spawn(move || {
+        let Ok(mut rtx) = Transport::connect_and_auth(&addr_c, unix_c.as_deref(), &key_c) else {
+            return;
+        };
+        let mut offset = start_offset;
+        while !stop_r.load(Ordering::Acquire) {
+            match rtx.call(&Request::VmLogs {
+                id: id_c.clone(),
+                offset,
+                max_bytes: 16 * 1024,
+            }) {
+                Ok(Response::VmLogs {
+                    data,
+                    next_offset,
+                    status,
+                }) => {
+                    if !data.is_empty() {
+                        let _ = io::stdout().write_all(&data);
+                        let _ = io::stdout().flush();
+                        offset = next_offset;
+                        continue;
+                    }
+                    if status != VmStatus::Running {
+                        stop_r.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
+
+    // Forward stdin bytes to VM COM1 until Ctrl-] (0x1D) or EOF.
+    let mut stdin = io::stdin().lock();
+    let mut byte = [0u8; 1];
+    while !stop.load(Ordering::Acquire) {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == 0x1D {
+                    break;
+                }
+                let _ = tx.call(&Request::VmConsoleWrite {
+                    id: id.clone(),
+                    data: vec![byte[0]],
+                });
+            }
+            Err(_) => break,
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+    let _ = reader_thread.join();
+    drop(_raw);
+    eprintln!("\n[hirsel-os-ctl] detached from VM `{id}` console");
+    Ok(())
 }
 
 fn cmd_vm_logs(tx: &mut Transport, args: Vec<String>) -> Result<(), String> {

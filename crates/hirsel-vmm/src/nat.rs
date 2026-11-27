@@ -66,6 +66,24 @@ impl NatEngine {
         }
     }
 
+    /// Updates outer IPv4 and gateway IPv4 dynamically (e.g. when DHCPv4 acquires a lease).
+    pub fn set_outer_network(&mut self, outer_ip: [u8; 4], outer_gw_ip: [u8; 4]) {
+        if self.outer_ip == outer_ip && self.outer_gw_ip == outer_gw_ip {
+            return;
+        }
+        self.outer_ip = outer_ip;
+        self.outer_gw_ip = outer_gw_ip;
+        // Preserve SLIRP synthetic MAC fallback if on 10.0.2.x; real LAN learns via ARP.
+        if outer_ip[0..3] == [10, 0, 2] {
+            self.outer_arp
+                .entry(outer_gw_ip)
+                .or_insert([0x52, 0x55, outer_gw_ip[0], outer_gw_ip[1], outer_gw_ip[2], outer_gw_ip[3]]);
+            self.outer_arp
+                .entry([10, 0, 2, 3])
+                .or_insert([0x52, 0x55, 10, 0, 2, 3]);
+        }
+    }
+
     /// Learns L2 MAC addresses for peers on the outer subnet (e.g. gateway `10.0.2.2`
     /// and SLIRP DNS `10.0.2.3`) from incoming ARP and IPv4 frames.
     pub fn learn_outer_gw(&mut self, frame: &[u8]) {

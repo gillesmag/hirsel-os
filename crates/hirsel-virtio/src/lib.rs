@@ -13,12 +13,13 @@ pub mod net;
 #[cfg(target_os = "fuchsia")]
 pub mod pci;
 
-use hirsel_proto::{UpgradeInfo, crc32, sha256};
+use hirsel_proto::{UpgradeInfo, VolumeInfo, crc32, sha256};
 
 pub const SECTOR_SIZE: usize = 512;
 const SUPERBLOCK_MAGIC: [u8; 8] = *b"HRSLBLK1";
 const AB_META_MAGIC: [u8; 8] = *b"HRSLAB01";
 const FS_SUPER_MAGIC: [u8; 8] = *b"HRSLFS01";
+const VOL_META_MAGIC: [u8; 8] = *b"HRSLVOL1";
 
 const CATALOG_START_SECTOR: u64 = 1;
 const CATALOG_SECTORS: u64 = 16; // 8 KiB = 128 x 64-byte entries
@@ -28,15 +29,18 @@ const ENTRY_BYTES: usize = 64;
 
 /// Reserved tail regions on the persistent disk:
 /// - Last sector (`cap - 1`): A/B ZBI upgrade slot metadata (`HRSLAB01`).
-/// - Preceding 512 sectors (256 KiB): Persistent Tier 1 `Dir` file store (`HRSLFS01`).
-/// - Preceding `ab_slot_sectors` (8 MiB on >=16 MiB disks, smaller on tiny test disks):
-///   Staged inactive ZBI boot image slot.
+/// - Preceding 512 sectors (256 KiB): Persistent Tier 1 `Dir` + declarative VM state store (`HRSLFS01`).
+/// - Preceding `ab_slot_sectors` (8 MiB on >=16 MiB disks): Staged inactive ZBI boot image slot.
+/// - Preceding 2 sectors (1 KiB): Persistent named VM volume catalog (`HRSLVOL1`, up to 16 volumes).
 const AB_META_SECTORS: u64 = 1;
 const FS_TOTAL_SECTORS: u64 = 512; // 256 KiB total
 const FS_INDEX_SECTORS: u64 = 8; // 4 KiB = 64 x 64-byte file headers
 const FS_MAX_FILES: usize = 64;
 const FS_ENTRY_BYTES: usize = 64;
 const FS_DATA_BYTES: usize = ((FS_TOTAL_SECTORS - FS_INDEX_SECTORS) as usize) * SECTOR_SIZE;
+const VOL_META_SECTORS: u64 = 2; // 1 KiB = 16-byte header + 16 x 48-byte volume entries
+const MAX_VOLUMES: usize = 16;
+const VOL_ENTRY_BYTES: usize = 48;
 const LARGE_DISK_THRESHOLD_SECTORS: u64 = 32 * 1024; // 16 MiB
 const DEFAULT_AB_SLOT_SECTORS: u64 = 16 * 1024; // 8 MiB
 
@@ -69,12 +73,14 @@ pub struct StoredFile {
 }
 
 /// Content-addressed persistent image store + A/B ZBI upgrade slots + Tier 1 `Dir`
-/// file store backed by a raw block device (`virtio-blk`).
+/// file store + persistent named VM volumes (`HRSLVOL1`) backed by `virtio-blk`.
 pub struct DiskImageStore<B: BlockDevice> {
     blk: B,
     entries: Vec<StoredImageMeta>,
+    volumes: Vec<VolumeInfo>,
     next_free_sector: u64,
     data_limit_sector: u64,
+    vol_meta_sector: u64,
     ab_slot_sector: u64,
     ab_slot_sectors: u64,
     ab_meta_sector: u64,
@@ -87,7 +93,7 @@ impl<B: BlockDevice> DiskImageStore<B> {
     /// Opens an existing `HRSLBLK1` store or formats a blank disk.
     pub fn open_or_format(mut blk: B) -> Result<(Self, bool), String> {
         let cap = blk.capacity_sectors();
-        let min_needed = DATA_START_SECTOR + FS_TOTAL_SECTORS + AB_META_SECTORS + 32;
+        let min_needed = DATA_START_SECTOR + FS_TOTAL_SECTORS + AB_META_SECTORS + VOL_META_SECTORS + 32;
         if cap < min_needed {
             return Err(format!("block device too small ({cap} sectors, need >= {min_needed})"));
         }
@@ -100,7 +106,8 @@ impl<B: BlockDevice> DiskImageStore<B> {
             (fs_start_sector - DATA_START_SECTOR) / 4
         };
         let ab_slot_sector = fs_start_sector - ab_slot_sectors;
-        let data_limit_sector = ab_slot_sector;
+        let vol_meta_sector = ab_slot_sector - VOL_META_SECTORS;
+        let data_limit_sector = vol_meta_sector;
 
         let mut sb = [0u8; SECTOR_SIZE];
         blk.read_sectors(0, &mut sb)?;
@@ -144,12 +151,15 @@ impl<B: BlockDevice> DiskImageStore<B> {
 
         let (upgrade, need_write_ab) = Self::load_ab_meta(&mut blk, ab_meta_sector)?;
         let (files, need_write_fs) = Self::load_fs(&mut blk, fs_start_sector)?;
+        let (volumes, need_write_vols) = Self::load_volumes(&mut blk, vol_meta_sector)?;
 
         let mut store = Self {
             blk,
             entries,
+            volumes,
             next_free_sector,
             data_limit_sector,
+            vol_meta_sector,
             ab_slot_sector,
             ab_slot_sectors,
             ab_meta_sector,
@@ -166,7 +176,67 @@ impl<B: BlockDevice> DiskImageStore<B> {
         if formatted || need_write_fs {
             store.write_fs()?;
         }
+        if formatted || need_write_vols {
+            store.write_volumes()?;
+        }
         Ok((store, formatted))
+    }
+
+    fn load_volumes(blk: &mut B, sector: u64) -> Result<(Vec<VolumeInfo>, bool), String> {
+        let mut buf = vec![0u8; (VOL_META_SECTORS as usize) * SECTOR_SIZE];
+        blk.read_sectors(sector, &mut buf)?;
+        let valid_magic = buf[0..8] == VOL_META_MAGIC;
+        let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let saved_crc = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        if !valid_magic || version != 1 || count > MAX_VOLUMES {
+            return Ok((Vec::new(), true));
+        }
+        let body_start = 32;
+        let body_end = body_start + MAX_VOLUMES * VOL_ENTRY_BYTES;
+        let calc_crc = crc32(&[&buf[0..16], &buf[body_start..body_end]]);
+        if calc_crc != saved_crc {
+            return Ok((Vec::new(), true));
+        }
+        let mut vols = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = body_start + i * VOL_ENTRY_BYTES;
+            let raw_name = &buf[off..off + 24];
+            let nlen = raw_name.iter().position(|&b| b == 0).unwrap_or(24);
+            let name = String::from_utf8_lossy(&raw_name[..nlen]).into_owned();
+            let start_sector = u64::from_le_bytes(buf[off + 24..off + 32].try_into().unwrap());
+            let sectors = u64::from_le_bytes(buf[off + 32..off + 40].try_into().unwrap());
+            let size_mib = u32::from_le_bytes(buf[off + 40..off + 44].try_into().unwrap());
+            vols.push(VolumeInfo {
+                name,
+                size_mib,
+                sectors,
+                start_sector,
+            });
+        }
+        Ok((vols, false))
+    }
+
+    fn write_volumes(&mut self) -> Result<(), String> {
+        let mut buf = vec![0u8; (VOL_META_SECTORS as usize) * SECTOR_SIZE];
+        buf[0..8].copy_from_slice(&VOL_META_MAGIC);
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&(self.volumes.len() as u32).to_le_bytes());
+        let body_start = 32;
+        let body_end = body_start + MAX_VOLUMES * VOL_ENTRY_BYTES;
+        for (i, v) in self.volumes.iter().enumerate() {
+            let off = body_start + i * VOL_ENTRY_BYTES;
+            let nb = v.name.as_bytes();
+            let nlen = nb.len().min(24);
+            buf[off..off + nlen].copy_from_slice(&nb[..nlen]);
+            buf[off + 24..off + 32].copy_from_slice(&v.start_sector.to_le_bytes());
+            buf[off + 32..off + 40].copy_from_slice(&v.sectors.to_le_bytes());
+            buf[off + 40..off + 44].copy_from_slice(&v.size_mib.to_le_bytes());
+        }
+        let crc = crc32(&[&buf[0..16], &buf[body_start..body_end]]);
+        buf[16..20].copy_from_slice(&crc.to_le_bytes());
+        self.blk.write_sectors(self.vol_meta_sector, &buf)?;
+        self.blk.flush()
     }
 
     fn load_ab_meta(blk: &mut B, sector: u64) -> Result<(UpgradeInfo, bool), String> {
@@ -384,6 +454,160 @@ impl<B: BlockDevice> DiskImageStore<B> {
         Ok(Some(buf))
     }
 
+    /// Commits a pending A/B ZBI upgrade: promotes `pending_slot` to `active_slot`
+    /// and clears `pending_slot`.
+    pub fn commit_upgrade(&mut self) -> Result<UpgradeInfo, String> {
+        if self.upgrade.pending_slot == 0xFF {
+            return Err("no pending A/B upgrade to commit".into());
+        }
+        self.upgrade.active_slot = self.upgrade.pending_slot;
+        self.upgrade.pending_slot = 0xFF;
+        self.upgrade.boot_attempts = 0;
+        self.write_ab_meta()?;
+        Ok(self.upgrade.clone())
+    }
+
+    /// Rolls back a pending A/B ZBI upgrade (or swaps active slot back to previous slot).
+    pub fn rollback_upgrade(&mut self) -> Result<UpgradeInfo, String> {
+        if self.upgrade.pending_slot != 0xFF {
+            self.upgrade.pending_slot = 0xFF;
+            self.upgrade.staged_digest = [0u8; 32];
+            self.upgrade.staged_size = 0;
+            self.upgrade.boot_attempts = 0;
+        } else {
+            self.upgrade.active_slot = if self.upgrade.active_slot == 0 { 1 } else { 0 };
+            self.upgrade.boot_attempts = 0;
+        }
+        self.write_ab_meta()?;
+        Ok(self.upgrade.clone())
+    }
+
+    // ---- Persistent Named VM Block Volumes (`HRSLVOL1`) ----
+
+    pub fn list_volumes(&self) -> &[VolumeInfo] {
+        &self.volumes
+    }
+
+    pub fn find_volume(&self, name: &str) -> Option<&VolumeInfo> {
+        self.volumes.iter().find(|v| v.name == name)
+    }
+
+    /// Creates a new persistent named VM block volume carved out of `virtio-blk`.
+    /// Optionally seeds the beginning of the volume with `initial_data` (e.g. an ext4 image).
+    pub fn create_volume(
+        &mut self,
+        name: &str,
+        size_mib: u32,
+        initial_data: Option<&[u8]>,
+    ) -> Result<VolumeInfo, String> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 24 {
+            return Err("volume name must be 1..=24 characters".into());
+        }
+        if self.volumes.iter().any(|v| v.name == name) {
+            return Err(format!("volume `{name}` already exists"));
+        }
+        if self.volumes.len() >= MAX_VOLUMES {
+            return Err(format!("volume catalog full ({MAX_VOLUMES} volumes)"));
+        }
+        let min_mib = initial_data
+            .map(|d| (d.len().div_ceil(1024 * 1024) as u32).max(1))
+            .unwrap_or(1);
+        let eff_mib = size_mib.max(min_mib);
+        let sectors = u64::from(eff_mib) * ((1024 * 1024) / SECTOR_SIZE as u64);
+        let end_sector = self
+            .next_free_sector
+            .checked_add(sectors)
+            .ok_or_else(|| "volume sector overflow".to_string())?;
+        if end_sector > self.data_limit_sector {
+            let avail_mib =
+                ((self.data_limit_sector.saturating_sub(self.next_free_sector)) * SECTOR_SIZE as u64)
+                    / (1024 * 1024);
+            return Err(format!(
+                "not enough space on virtio-blk for {eff_mib} MiB volume `{name}` ({avail_mib} MiB free)"
+            ));
+        }
+
+        let start_sector = self.next_free_sector;
+
+        // Zero the first 64 KiB (superblock area) unless seeding from an initial image,
+        // so fresh volumes don't inherit stale filesystem signatures.
+        let zero_chunk = vec![0u8; 64 * 1024];
+        if let Some(init) = initial_data {
+            let mut off = 0usize;
+            while off < init.len() {
+                let end = (off + 64 * 1024).min(init.len());
+                let slice = &init[off..end];
+                let padded_len = slice.len().div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+                let mut buf = vec![0u8; padded_len];
+                buf[..slice.len()].copy_from_slice(slice);
+                self.blk
+                    .write_sectors(start_sector + (off / SECTOR_SIZE) as u64, &buf)?;
+                off = end;
+            }
+        } else {
+            let clear_sectors = sectors.min((zero_chunk.len() / SECTOR_SIZE) as u64);
+            self.blk
+                .write_sectors(start_sector, &zero_chunk[..(clear_sectors as usize) * SECTOR_SIZE])?;
+        }
+
+        let info = VolumeInfo {
+            name: name.to_owned(),
+            size_mib: eff_mib,
+            sectors,
+            start_sector,
+        };
+        self.volumes.push(info.clone());
+        self.next_free_sector = end_sector;
+        self.write_metadata()?;
+        self.write_volumes()?;
+        Ok(info)
+    }
+
+    /// Removes a named volume from the catalog.
+    pub fn delete_volume(&mut self, name: &str) -> Result<bool, String> {
+        let before = self.volumes.len();
+        self.volumes.retain(|v| v.name != name);
+        if self.volumes.len() != before {
+            self.write_volumes()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn read_volume_sectors(
+        &mut self,
+        start_sector: u64,
+        vol_sectors: u64,
+        rel_sector: u64,
+        dst: &mut [u8],
+    ) -> Result<(), String> {
+        let count = (dst.len() / SECTOR_SIZE) as u64;
+        if rel_sector.checked_add(count).is_none_or(|e| e > vol_sectors) {
+            return Err("volume read out of bounds".into());
+        }
+        self.blk.read_sectors(start_sector + rel_sector, dst)
+    }
+
+    pub fn write_volume_sectors(
+        &mut self,
+        start_sector: u64,
+        vol_sectors: u64,
+        rel_sector: u64,
+        src: &[u8],
+    ) -> Result<(), String> {
+        let count = (src.len() / SECTOR_SIZE) as u64;
+        if rel_sector.checked_add(count).is_none_or(|e| e > vol_sectors) {
+            return Err("volume write out of bounds".into());
+        }
+        self.blk.write_sectors(start_sector + rel_sector, src)
+    }
+
+    pub fn flush_blk(&mut self) -> Result<(), String> {
+        self.blk.flush()
+    }
+
     // ---- Persistent Tier 1 Dir file store (`HRSLFS01`) ----
 
     pub fn fs_get(&self, name: &str) -> Option<&StoredFile> {
@@ -596,5 +820,47 @@ mod tests {
         let bad = b"not-a-valid-zbi-container-at-all-0123456789";
         let err = store.stage_upgrade_zbi(sha256(bad), bad).unwrap_err();
         assert!(err.contains("invalid ZBI container header"));
+    }
+
+    #[test]
+    fn volumes_and_upgrade_commit_rollback_persist_across_reopen() {
+        let disk = MemDisk(vec![0u8; 4 * 1024 * 1024]);
+        let (mut store, _) = DiskImageStore::open_or_format(disk).unwrap();
+
+        let vol = store.create_volume("data-1", 1, None).unwrap();
+        assert_eq!(vol.name, "data-1");
+        assert_eq!(vol.size_mib, 1);
+        assert_eq!(vol.sectors, 2048);
+
+        let mut sec = [0u8; SECTOR_SIZE];
+        sec[..15].copy_from_slice(b"HIRSEL_PERSIST!");
+        store
+            .write_volume_sectors(vol.start_sector, vol.sectors, 3, &sec)
+            .unwrap();
+        store.flush_blk().unwrap();
+
+        let zbi = make_mock_zbi(b"zbi-upgrade-v2");
+        store.stage_upgrade_zbi(sha256(&zbi), &zbi).unwrap();
+        let committed = store.commit_upgrade().unwrap();
+        assert_eq!(committed.active_slot, 1);
+        assert_eq!(committed.pending_slot, 0xFF);
+
+        // Reopen raw disk bytes (simulate reboot).
+        let raw = store.blk;
+        let (mut reopened, formatted) = DiskImageStore::open_or_format(raw).unwrap();
+        assert!(!formatted);
+        let v2 = reopened.find_volume("data-1").unwrap().clone();
+        assert_eq!(v2.start_sector, vol.start_sector);
+        let mut readback = [0u8; SECTOR_SIZE];
+        reopened
+            .read_volume_sectors(v2.start_sector, v2.sectors, 3, &mut readback)
+            .unwrap();
+        assert_eq!(&readback[..15], b"HIRSEL_PERSIST!");
+        assert_eq!(reopened.upgrade_info().active_slot, 1);
+
+        let rolled = reopened.rollback_upgrade().unwrap();
+        assert_eq!(rolled.active_slot, 0);
+        assert!(reopened.delete_volume("data-1").unwrap());
+        assert!(reopened.find_volume("data-1").is_none());
     }
 }

@@ -9,6 +9,7 @@ name = "dev-1"
 kernel = "out/linux/vmlinux.stripped"
 initrd = "out/linux/initramfs-ssh.cpio"
 ram_mib = 128
+vcpus = 2
 guest_ip = "10.0.3.2/24"
 gateway_ip = "10.0.3.1"
 ssh_port = 2222

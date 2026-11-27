@@ -11,16 +11,16 @@
 
 use crate::caps::DirBackend;
 use crate::runner::{BootContext, Tier1LaunchOpts};
-use crate::vm_manager::{ActiveVmGateway, NatVirtioNet, VmManager};
-use hirsel_vmm::nat::NatEngine;
+use crate::vm_manager::{ActiveVmGateway, NatVirtioNet, VmManager, exec_over_console};
 use core::arch::asm;
 use hirsel_proto::crypto::{
-    DEFAULT_DEV_KEY_STR, SessionCipher, compute_client_auth_mac, compute_server_auth_mac, ct_eq,
-    derive_cluster_key,
+    DEFAULT_DEV_KEY_STR, SessionCipher, client_auth_mac_pfs, ct_eq, derive_cluster_key,
+    server_auth_mac_pfs,
 };
+use hirsel_proto::x25519::{x25519, x25519_public_key};
 use hirsel_proto::{
     FLAG_ENCRYPTED, FRAME_HEADER_LEN, FRAME_MAGIC, ImageEntry, MAX_FRAME_PAYLOAD, NodeInfo,
-    PROTO_VERSION, Request, Response, RunResult, RunTarget, Tier2Mode, UpgradeInfo, crc32,
+    PROTO_VERSION, Request, Response, RunResult, RunTarget, Tier2Mode, UpgradeInfo, VmSpec, crc32,
     hex_encode, read_frame_with_cipher, sha256, write_frame,
 };
 use hirsel_virtio::DiskImageStore;
@@ -28,10 +28,11 @@ use hirsel_virtio::blk::VirtioBlk;
 use hirsel_virtio::dma::ZirconIommu;
 use hirsel_virtio::net::VirtioNet;
 use hirsel_virtio::pci::PciBus;
+use hirsel_vmm::nat::NatEngine;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -182,7 +183,10 @@ enum AuthState {
     Unauthenticated,
     ChallengeSent {
         client_nonce: [u8; 32],
+        client_pubkey: [u8; 32],
         server_nonce: [u8; 32],
+        server_pubkey: [u8; 32],
+        ecdh_shared: [u8; 32],
     },
     Authenticated(SessionCipher),
 }
@@ -223,6 +227,10 @@ struct NodeState {
     auth_key: [u8; 32],
     has_net: bool,
     has_blk: bool,
+    dhcp_active: bool,
+    ipv4: [u8; 4],
+    gateway_ip: [u8; 4],
+    dns_ip: [u8; 4],
     disk_mib: u32,
     tier1_runs: u64,
     tier2_runs: u64,
@@ -328,10 +336,17 @@ pub fn serve_control_plane(ctx: Arc<BootContext>, initial_t1: u64, initial_t2: u
         auth_key,
         has_net,
         has_blk,
+        dhcp_active: false,
+        ipv4: [10, 0, 2, 15],
+        gateway_ip: [10, 0, 2, 2],
+        dns_ip: [10, 0, 2, 3],
         disk_mib,
         tier1_runs: initial_t1,
         tier2_runs: initial_t2,
     }));
+
+    // Reconcile declarative autostart VM specs persisted in `HRSLFS01` across cold reboots!
+    reconcile_persisted_vms(&ctx, &state);
 
     // Spawn virtio-net + smoltcp TCP/IP server if NIC is present.
     if let Some(net) = net_dev {
@@ -344,7 +359,7 @@ pub fn serve_control_plane(ctx: Arc<BootContext>, initial_t1: u64, initial_t2: u
     match Com2Uart::open(ctx.ioport_resource) {
         Ok(mut uart) => {
             println!(
-                "[hirsel-os] Control Plane API ready on COM2 (0x2F8, mutual-auth ChaCha20-Poly1305)"
+                "[hirsel-os] Control Plane API ready on COM2 (0x2F8, X25519 PFS + ChaCha20-Poly1305)"
             );
             let mut session = SessionState::new();
             loop {
@@ -374,6 +389,79 @@ pub fn serve_control_plane(ctx: Arc<BootContext>, initial_t1: u64, initial_t2: u
                 let next = unsafe { zx_clock_get_monotonic() }.saturating_add(5_000_000_000);
                 unsafe { zx_nanosleep(next) };
             }
+        }
+    }
+}
+
+fn reconcile_persisted_vms(ctx: &Arc<BootContext>, state: &Mutex<NodeState>) {
+    let persisted_specs: Vec<(String, VmSpec)> = {
+        let st = state.lock().unwrap();
+        let db = st.dir_backend.lock().unwrap();
+        let Some(disk) = db.disk.as_ref() else {
+            return;
+        };
+        let mut out = Vec::new();
+        for f in disk.fs_list() {
+            if let Some(id) = f.name.strip_prefix("vm-spec:") {
+                match VmSpec::decode_bytes(&f.data) {
+                    Ok(spec) if spec.autostart => out.push((id.to_owned(), spec)),
+                    Ok(_) => {}
+                    Err(e) => println!("[hirsel-reconcile] ignoring corrupt spec `{id}`: {e}"),
+                }
+            }
+        }
+        out
+    };
+
+    if persisted_specs.is_empty() {
+        return;
+    }
+    println!(
+        "[hirsel-reconcile] found {} declarative autostart VM spec(s) on virtio-blk; reconciling...",
+        persisted_specs.len()
+    );
+    for (id, spec) in persisted_specs {
+        let resolve_target = |t: &RunTarget| -> Result<Vec<u8>, String> {
+            match t {
+                RunTarget::Bootfs(p) => ctx.read_bootfs_bytes(p),
+                RunTarget::Digest(d) => {
+                    let st = state.lock().unwrap();
+                    st.cache
+                        .get(d)
+                        .map(|img| img.bytes.clone())
+                        .ok_or_else(|| format!("cached image missing: sha256:{}", hex_encode(d)))
+                }
+            }
+        };
+        let kernel_bytes = match resolve_target(&spec.kernel) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("[hirsel-reconcile] skipping VM `{id}`: {e}");
+                continue;
+            }
+        };
+        let initrd_bytes = match spec.initrd.as_ref() {
+            Some(rd) => match resolve_target(rd) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    println!("[hirsel-reconcile] skipping VM `{id}` initrd: {e}");
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let mut st = state.lock().unwrap();
+        let dir_backend = Arc::clone(&st.dir_backend);
+        let dns_ip = st.dns_ip;
+        match st
+            .vm_manager
+            .start_vm(ctx, &dir_backend, dns_ip, spec, kernel_bytes, initrd_bytes, false)
+        {
+            Ok(_) => {
+                st.tier2_runs += 1;
+                println!("[hirsel-reconcile] auto-started declared VM `{id}`");
+            }
+            Err(e) => println!("[hirsel-reconcile] failed to auto-start `{id}`: {e}"),
         }
     }
 }
@@ -475,13 +563,6 @@ fn serve_tcp_control_plane(
     cfg.random_seed = u64::from_le_bytes(seed_bytes);
 
     let mut iface = Interface::new(cfg, &mut nat_net, smol_now());
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
-    });
-    let _ = iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
-
     let mut nat = NatEngine::new([10, 0, 2, 15], outer_mac, [0x02, 0x48, 0x52, 0x53, 0x00, 0x01]);
 
     struct ConnSlot {
@@ -494,6 +575,7 @@ fn serve_tcp_control_plane(
 
     const TCP_POOL_SIZE: usize = 4;
     let mut sockets = SocketSet::new(vec![]);
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let mut conns = Vec::with_capacity(TCP_POOL_SIZE);
     for _ in 0..TCP_POOL_SIZE {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 128 * 1024]);
@@ -512,8 +594,11 @@ fn serve_tcp_control_plane(
         });
     }
 
+    let dhcp_fallback_deadline = unsafe { zx_clock_get_monotonic() }.saturating_add(1_500_000_000);
+    let mut ip_configured = false;
+
     println!(
-        "[hirsel-netd] Control Plane TCP API listening on 10.0.2.15:{API_TCP_PORT} ({TCP_POOL_SIZE} slots, mutual-auth ChaCha20-Poly1305)"
+        "[hirsel-netd] DHCPv4 client started; Control Plane TCP API on :{API_TCP_PORT} ({TCP_POOL_SIZE} slots, X25519 PFS + ChaCha20-Poly1305)"
     );
 
     let mut scratch = [0u8; 16 * 1024];
@@ -554,6 +639,65 @@ fn serve_tcp_control_plane(
         let poll_res = iface.poll(now, &mut nat_net, &mut sockets);
         if !matches!(poll_res, smoltcp::iface::PollResult::None) {
             active = true;
+        }
+
+        // Process DHCPv4 lease events (dynamically configures IPv4, default route, DNS, and NAT).
+        if let Some(ev) = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+            active = true;
+            match ev {
+                dhcpv4::Event::Configured(config) => {
+                    let ip_octets = config.address.address().octets();
+                    let gw_octets = config
+                        .router
+                        .map(|r| r.octets())
+                        .unwrap_or([ip_octets[0], ip_octets[1], ip_octets[2], 1]);
+                    let dns_octets = config
+                        .dns_servers
+                        .first()
+                        .map(|d| d.octets())
+                        .unwrap_or([ip_octets[0], ip_octets[1], ip_octets[2], 3]);
+
+                    iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    });
+                    if let Some(router) = config.router {
+                        let _ = iface.routes_mut().add_default_ipv4_route(router);
+                    }
+                    nat.set_outer_network(ip_octets, gw_octets);
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.dhcp_active = true;
+                        st.ipv4 = ip_octets;
+                        st.gateway_ip = gw_octets;
+                        st.dns_ip = dns_octets;
+                    }
+                    ip_configured = true;
+                    println!(
+                        "[hirsel-netd] DHCPv4 lease acquired: {}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                        config.address.address(),
+                        config.address.prefix_len(),
+                        gw_octets[0], gw_octets[1], gw_octets[2], gw_octets[3],
+                        dns_octets[0], dns_octets[1], dns_octets[2], dns_octets[3],
+                    );
+                }
+                dhcpv4::Event::Deconfigured => {
+                    state.lock().unwrap().dhcp_active = false;
+                    iface.update_ip_addrs(|addrs| addrs.clear());
+                    iface.routes_mut().remove_default_ipv4_route();
+                }
+            }
+        } else if !ip_configured && unsafe { zx_clock_get_monotonic() } >= dhcp_fallback_deadline {
+            // Static fallback if no DHCP server answered on the link.
+            iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24)));
+            });
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+            ip_configured = true;
+            println!("[hirsel-netd] DHCPv4 timeout; falling back to static 10.0.2.15/24 gw=10.0.2.2");
         }
 
         outbound_nat_frames.clear();
@@ -666,48 +810,84 @@ fn dispatch_session_frame(
         Err(e) => return (Response::Error { message: e }, false),
     };
 
-    // Always allow starting a fresh mutual-auth handshake (supports serial reconnects).
+    // Always allow starting a fresh X25519 PFS mutual-auth handshake (supports serial reconnects).
     match req {
-        Request::AuthHello { client_nonce } => {
+        Request::AuthHello {
+            client_nonce,
+            client_pubkey,
+        } => {
             let key = state.lock().unwrap().auth_key;
             let mut server_nonce = [0u8; 32];
-            unsafe { zx_cprng_draw(server_nonce.as_mut_ptr(), server_nonce.len()) };
-            let server_mac = compute_server_auth_mac(&key, &client_nonce, &server_nonce);
+            let mut server_secret = [0u8; 32];
+            unsafe {
+                zx_cprng_draw(server_nonce.as_mut_ptr(), server_nonce.len());
+                zx_cprng_draw(server_secret.as_mut_ptr(), server_secret.len());
+            }
+            let server_pubkey = x25519_public_key(&server_secret);
+            let ecdh_shared = x25519(&server_secret, &client_pubkey);
+            let server_mac = server_auth_mac_pfs(
+                &key,
+                &client_nonce,
+                &client_pubkey,
+                &server_nonce,
+                &server_pubkey,
+            );
             session.pending = None;
             session.pending_upgrade = None;
             session.auth = AuthState::ChallengeSent {
                 client_nonce,
+                client_pubkey,
                 server_nonce,
+                server_pubkey,
+                ecdh_shared,
             };
             return (
                 Response::AuthChallenge {
                     server_nonce,
+                    server_pubkey,
                     server_mac,
                 },
                 true,
             );
         }
         Request::AuthVerify { client_mac } => {
-            let (client_nonce, server_nonce) = match session.auth {
-                AuthState::ChallengeSent {
-                    client_nonce,
-                    server_nonce,
-                } => (client_nonce, server_nonce),
-                _ => {
-                    session.reset();
-                    return (
-                        Response::Error {
-                            message: "AuthVerify without preceding AuthHello".into(),
-                        },
-                        true,
-                    );
-                }
-            };
+            let (client_nonce, client_pubkey, server_nonce, server_pubkey, ecdh_shared) =
+                match session.auth {
+                    AuthState::ChallengeSent {
+                        client_nonce,
+                        client_pubkey,
+                        server_nonce,
+                        server_pubkey,
+                        ecdh_shared,
+                    } => (
+                        client_nonce,
+                        client_pubkey,
+                        server_nonce,
+                        server_pubkey,
+                        ecdh_shared,
+                    ),
+                    _ => {
+                        session.reset();
+                        return (
+                            Response::Error {
+                                message: "AuthVerify without preceding AuthHello".into(),
+                            },
+                            true,
+                        );
+                    }
+                };
             let key = state.lock().unwrap().auth_key;
-            let expected = compute_client_auth_mac(&key, &client_nonce, &server_nonce);
+            let expected = client_auth_mac_pfs(
+                &key,
+                &ecdh_shared,
+                &client_nonce,
+                &client_pubkey,
+                &server_nonce,
+                &server_pubkey,
+            );
             if !ct_eq(&expected, &client_mac) {
                 session.reset();
-                println!("[hirsel-api] REJECTED unauthenticated client (invalid cluster key MAC)");
+                println!("[hirsel-api] REJECTED unauthenticated client (invalid X25519 PFS MAC)");
                 return (
                     Response::Error {
                         message: "authentication failed: invalid cluster key".into(),
@@ -715,9 +895,10 @@ fn dispatch_session_frame(
                     true,
                 );
             }
-            let cipher = SessionCipher::new_server(&key, &client_nonce, &server_nonce);
+            let cipher =
+                SessionCipher::new_server_pfs(&key, &ecdh_shared, &client_nonce, &server_nonce);
             session.auth = AuthState::Authenticated(cipher);
-            // AuthOk is sent plaintext; all subsequent frames use AEAD encryption.
+            // AuthOk is sent plaintext; all subsequent frames use PFS AEAD encryption.
             return (Response::AuthOk, true);
         }
         _ => {}
@@ -780,6 +961,10 @@ fn handle_request(
                 has_net: st.has_net,
                 has_blk: st.has_blk,
                 auth_enabled: true,
+                pfs_x25519: true,
+                dhcp_active: st.dhcp_active,
+                ipv4: st.ipv4,
+                gateway_ip: st.gateway_ip,
                 active_slot,
                 pending_slot,
                 disk_mib: st.disk_mib,
@@ -1170,6 +1355,71 @@ fn handle_request(
                 Err(e) => Response::Error { message: e },
             }
         }
+        Request::UpgradeCommit => {
+            let dir_backend = Arc::clone(&state.lock().unwrap().dir_backend);
+            let mut db = dir_backend.lock().unwrap();
+            let Some(disk) = db.disk.as_mut() else {
+                return Response::Error {
+                    message: "A/B ZBI upgrade requires persistent virtio-blk disk".into(),
+                };
+            };
+            match disk.commit_upgrade() {
+                Ok(info) => {
+                    println!(
+                        "[hirsel-upgrade] committed A/B slot -> active={}",
+                        slot_label(info.active_slot)
+                    );
+                    Response::UpgradeInfo(info)
+                }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::UpgradeRollback => {
+            let dir_backend = Arc::clone(&state.lock().unwrap().dir_backend);
+            let mut db = dir_backend.lock().unwrap();
+            let Some(disk) = db.disk.as_mut() else {
+                return Response::Error {
+                    message: "A/B ZBI upgrade requires persistent virtio-blk disk".into(),
+                };
+            };
+            match disk.rollback_upgrade() {
+                Ok(info) => {
+                    println!(
+                        "[hirsel-upgrade] rolled back A/B slot -> active={} pending={}",
+                        slot_label(info.active_slot),
+                        slot_label(info.pending_slot)
+                    );
+                    Response::UpgradeInfo(info)
+                }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::NodeReboot => {
+            println!("[hirsel-os] operator requested clean node reboot: stopping VMs & flushing virtio-blk...");
+            let dir_backend = {
+                let st = state.lock().unwrap();
+                st.vm_manager.stop_all_vms();
+                Arc::clone(&st.dir_backend)
+            };
+            if let Some(disk) = dir_backend.lock().unwrap().disk.as_mut() {
+                let _ = disk.flush_blk();
+            }
+            let ioport = ctx.ioport_resource;
+            thread::spawn(move || {
+                // Allow encrypted Response::Ok to flush over TCP/COM2 before hardware reset.
+                let next = unsafe { zx_clock_get_monotonic() }.saturating_add(150_000_000);
+                unsafe { zx_nanosleep(next) };
+                println!("[hirsel-os] pulsing x86 hardware reset (0xCF9 / 0x64)...");
+                unsafe {
+                    let _ = zx_ioports_request(ioport, 0x0CF9, 1);
+                    outb(0x0CF9, 0x02);
+                    outb(0x0CF9, 0x06);
+                    let _ = zx_ioports_request(ioport, 0x0064, 1);
+                    outb(0x0064, 0xFE);
+                }
+            });
+            Response::Ok
+        }
         Request::VmStart(spec) => {
             let resolve_bytes = |t: &RunTarget| -> Result<Vec<u8>, String> {
                 match t {
@@ -1197,7 +1447,12 @@ fn handle_request(
                 None => None,
             };
             let mut st = state.lock().unwrap();
-            match st.vm_manager.start_vm(ctx, spec, kernel_bytes, initrd_bytes) {
+            let dir_backend = Arc::clone(&st.dir_backend);
+            let dns_ip = st.dns_ip;
+            match st
+                .vm_manager
+                .start_vm(ctx, &dir_backend, dns_ip, spec, kernel_bytes, initrd_bytes, true)
+            {
                 Ok(summary) => {
                     st.tier2_runs += 1;
                     Response::VmInfo(summary)
@@ -1247,8 +1502,108 @@ fn handle_request(
         }
         Request::VmRemove { id } => {
             let mut st = state.lock().unwrap();
-            match st.vm_manager.remove_vm(&id) {
+            let dir_backend = Arc::clone(&st.dir_backend);
+            match st.vm_manager.remove_vm(&id, &dir_backend) {
                 Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmExec {
+            id,
+            command,
+            timeout_ms,
+        } => {
+            let handle_res = {
+                let st = state.lock().unwrap();
+                st.vm_manager.get_exec_handle(&id)
+            };
+            match handle_res {
+                Ok((channel, exec_lock)) => {
+                    match exec_over_console(&channel, &exec_lock, &command, timeout_ms) {
+                        Ok((exit_code, stdout)) => Response::ExecResult { exit_code, stdout },
+                        Err(e) => Response::Error { message: e },
+                    }
+                }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VolumeCreate {
+            name,
+            size_mib,
+            initial_image,
+        } => {
+            let init_bytes = match initial_image {
+                Some(RunTarget::Bootfs(p)) => match ctx.read_bootfs_bytes(&p) {
+                    Ok(b) => Some(b),
+                    Err(e) => return Response::Error { message: e },
+                },
+                Some(RunTarget::Digest(d)) => {
+                    let st = state.lock().unwrap();
+                    match st.cache.get(&d) {
+                        Some(img) => Some(img.bytes.clone()),
+                        None => {
+                            return Response::Error {
+                                message: format!("initial volume image not cached: sha256:{}", hex_encode(&d)),
+                            };
+                        }
+                    }
+                }
+                None => None,
+            };
+            let dir_backend = Arc::clone(&state.lock().unwrap().dir_backend);
+            let mut db = dir_backend.lock().unwrap();
+            let Some(disk) = db.disk.as_mut() else {
+                return Response::Error {
+                    message: "persistent volumes require outer virtio-blk disk".into(),
+                };
+            };
+            match disk.create_volume(&name, size_mib, init_bytes.as_deref()) {
+                Ok(v) => {
+                    println!(
+                        "[hirsel-stored] created persistent volume `{}` ({} MiB, sector {}..{})",
+                        v.name,
+                        v.size_mib,
+                        v.start_sector,
+                        v.start_sector + v.sectors
+                    );
+                    Response::VolumeInfo(v)
+                }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VolumeList => {
+            let dir_backend = Arc::clone(&state.lock().unwrap().dir_backend);
+            let db = dir_backend.lock().unwrap();
+            let list = db
+                .disk
+                .as_ref()
+                .map(|d| d.list_volumes().to_vec())
+                .unwrap_or_default();
+            Response::VolumeList(list)
+        }
+        Request::VolumeRemove { name } => {
+            let st = state.lock().unwrap();
+            if st.vm_manager.is_volume_in_use(&name) {
+                return Response::Error {
+                    message: format!("volume `{name}` is currently attached to a running VM"),
+                };
+            }
+            let dir_backend = Arc::clone(&st.dir_backend);
+            drop(st);
+            let mut db = dir_backend.lock().unwrap();
+            let Some(disk) = db.disk.as_mut() else {
+                return Response::Error {
+                    message: "persistent volumes require outer virtio-blk disk".into(),
+                };
+            };
+            match disk.delete_volume(&name) {
+                Ok(true) => {
+                    println!("[hirsel-stored] deleted persistent volume `{name}`");
+                    Response::Ok
+                }
+                Ok(false) => Response::Error {
+                    message: format!("volume `{name}` not found"),
+                },
                 Err(e) => Response::Error { message: e },
             }
         }

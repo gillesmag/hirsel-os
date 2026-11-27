@@ -12,6 +12,8 @@
 pub mod linux_boot;
 pub mod mmio;
 pub mod nat;
+pub mod virtio_blk_mmio;
+pub mod virtio_console_mmio;
 pub mod virtio_net_mmio;
 
 use core::mem::size_of;
@@ -19,6 +21,9 @@ use core::ptr;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "fuchsia")]
+use virtio_blk_mmio::VmBlockBackend;
+use virtio_console_mmio::VirtioConsoleChannel;
 use virtio_net_mmio::VirtioNetChannel;
 
 pub const PAGE_SIZE: usize = 4096;
@@ -112,11 +117,14 @@ pub struct ManagedVmControl {
     console_out: Mutex<ConsoleRing>,
     console_in: Mutex<VecDeque<u8>>,
     pub net_channel: Option<Arc<VirtioNetChannel>>,
+    pub console_channel: Arc<VirtioConsoleChannel>,
     stop_requested: AtomicBool,
     pub io_exits: AtomicU64,
     pub mmio_exits: AtomicU64,
+    pub blk_reads: AtomicU64,
+    pub blk_writes: AtomicU64,
     #[cfg(target_os = "fuchsia")]
-    vcpu_dup: Mutex<zx_sys::zx_handle_t>,
+    vcpu_dups: Mutex<Vec<zx_sys::zx_handle_t>>,
 }
 
 impl ManagedVmControl {
@@ -128,11 +136,14 @@ impl ManagedVmControl {
             }),
             console_in: Mutex::new(VecDeque::with_capacity(256)),
             net_channel,
+            console_channel: VirtioConsoleChannel::new(),
             stop_requested: AtomicBool::new(false),
             io_exits: AtomicU64::new(0),
             mmio_exits: AtomicU64::new(0),
+            blk_reads: AtomicU64::new(0),
+            blk_writes: AtomicU64::new(0),
             #[cfg(target_os = "fuchsia")]
-            vcpu_dup: Mutex::new(zx_sys::ZX_HANDLE_INVALID),
+            vcpu_dups: Mutex::new(Vec::new()),
         })
     }
 
@@ -191,14 +202,16 @@ impl ManagedVmControl {
 
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        self.kick();
+        self.kick_all();
     }
 
     #[cfg(target_os = "fuchsia")]
     pub fn kick(&self) {
-        let h = *self.vcpu_dup.lock().unwrap();
-        if h != zx_sys::ZX_HANDLE_INVALID {
-            unsafe { zx_sys::zx_vcpu_kick(h) };
+        let dups = self.vcpu_dups.lock().unwrap();
+        if let Some(&h) = dups.first() {
+            if h != zx_sys::ZX_HANDLE_INVALID {
+                unsafe { zx_sys::zx_vcpu_kick(h) };
+            }
         }
     }
 
@@ -206,12 +219,49 @@ impl ManagedVmControl {
     pub fn kick(&self) {}
 
     #[cfg(target_os = "fuchsia")]
-    fn set_vcpu_dup(&self, handle: zx_sys::zx_handle_t) {
-        let mut guard = self.vcpu_dup.lock().unwrap();
-        if *guard != zx_sys::ZX_HANDLE_INVALID {
-            unsafe { zx_sys::zx_handle_close(*guard) };
+    pub fn kick_all(&self) {
+        let dups = self.vcpu_dups.lock().unwrap();
+        for &h in dups.iter() {
+            if h != zx_sys::ZX_HANDLE_INVALID {
+                unsafe { zx_sys::zx_vcpu_kick(h) };
+            }
         }
-        *guard = handle;
+    }
+
+    #[cfg(not(target_os = "fuchsia"))]
+    pub fn kick_all(&self) {}
+
+    #[cfg(target_os = "fuchsia")]
+    pub fn interrupt_vcpu(&self, apic_id: usize, vector: u32) {
+        let h = {
+            let dups = self.vcpu_dups.lock().unwrap();
+            dups.get(apic_id).copied().unwrap_or(zx_sys::ZX_HANDLE_INVALID)
+        };
+        if h != zx_sys::ZX_HANDLE_INVALID {
+            let _ = unsafe { zx_sys::zx_vcpu_interrupt(h, vector) };
+        }
+    }
+
+    #[cfg(target_os = "fuchsia")]
+    fn set_vcpu_dup(&self, apic_id: usize, handle: zx_sys::zx_handle_t) {
+        let mut dups = self.vcpu_dups.lock().unwrap();
+        if dups.len() <= apic_id {
+            dups.resize(apic_id + 1, zx_sys::ZX_HANDLE_INVALID);
+        }
+        if dups[apic_id] != zx_sys::ZX_HANDLE_INVALID {
+            unsafe { zx_sys::zx_handle_close(dups[apic_id]) };
+        }
+        dups[apic_id] = handle;
+    }
+
+    #[cfg(target_os = "fuchsia")]
+    fn clear_vcpu_dups(&self) {
+        let mut dups = self.vcpu_dups.lock().unwrap();
+        for h in dups.drain(..) {
+            if h != zx_sys::ZX_HANDLE_INVALID {
+                unsafe { zx_sys::zx_handle_close(h) };
+            }
+        }
     }
 }
 
@@ -342,17 +392,18 @@ pub fn load_elf_into_ram(elf: &[u8], ram: &mut [u8]) -> Result<u64, String> {
 }
 
 /// Loads either an uncompressed Linux `vmlinux` ELF64 or a Linux `bzImage` into `ram`,
-/// populates Linux `boot_params` @ `0x7000`, cmdline @ `0x20000`, E820 map, and optional
-/// `initramfs`, returning the 64-bit `startup_64` entry GPA.
-pub fn load_linux_kernel_into_ram(
+/// populates Linux `boot_params` @ `0x7000`, cmdline @ `0x20000`, E820 map, SMP ACPI
+/// MADT/DSDT tables, and optional `initramfs`, returning the 64-bit `startup_64` entry GPA.
+pub fn load_linux_kernel_into_ram_smp(
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
     ram: &mut [u8],
+    vcpus: u8,
 ) -> Result<u64, String> {
     if kernel.len() >= 4 && &kernel[0..4] == b"\x7fELF" {
         let entry = load_elf_into_ram(kernel, ram)?;
-        linux_boot::install_linux_boot_params(ram, cmdline, initrd, None)?;
+        linux_boot::install_linux_boot_params_smp(ram, cmdline, initrd, None, vcpus)?;
         Ok(entry)
     } else {
         let bz = linux_boot::parse_bzimage(kernel)?;
@@ -366,15 +417,26 @@ pub fn load_linux_kernel_into_ram(
             ));
         }
         ram[dst..dst + payload.len()].copy_from_slice(payload);
-        linux_boot::install_linux_boot_params(ram, cmdline, initrd, Some(kernel))?;
+        linux_boot::install_linux_boot_params_smp(ram, cmdline, initrd, Some(kernel), vcpus)?;
         Ok(bz.code64_entry)
     }
+}
+
+pub fn load_linux_kernel_into_ram(
+    kernel: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    ram: &mut [u8],
+) -> Result<u64, String> {
+    load_linux_kernel_into_ram_smp(kernel, initrd, cmdline, ram, 1)
 }
 
 #[cfg(target_os = "fuchsia")]
 mod fuchsia_vmm {
     use super::*;
     use crate::mmio::{MmioAccess, decode_mmio_inst, fetch_guest_inst_bytes, get_gpr, set_gpr};
+    use crate::virtio_blk_mmio::{GPA_VIRTIO_BLK_MMIO, VIRTIO_BLK_IRQ, VirtioBlkMmio};
+    use crate::virtio_console_mmio::{GPA_VIRTIO_CON_MMIO, VIRTIO_CON_IRQ, VirtioConsoleMmio};
     use crate::virtio_net_mmio::{GPA_VIRTIO_NET_MMIO, VIRTIO_NET_IRQ, VirtioNetMmio};
     use std::thread;
     use zx_sys::*;
@@ -386,6 +448,8 @@ mod fuchsia_vmm {
     const TRAP_KEY_VIRTIO_CON: u64 = 5;
     const TRAP_KEY_ALL_IO: u64 = 6;
     const TRAP_KEY_VIRTIO_NET: u64 = 7;
+    const TRAP_KEY_VIRTIO_BLK: u64 = 8;
+    const TRAP_KEY_VIRTIO_CON_MMIO: u64 = 9;
 
     struct LaunchSpec {
         entry_gpa: u64,
@@ -397,7 +461,9 @@ mod fuchsia_vmm {
 
     struct ManagedLaunch {
         ctrl: Arc<ManagedVmControl>,
+        vcpus: u8,
         mac: Option<[u8; 6]>,
+        blk_backend: Option<Arc<Mutex<dyn VmBlockBackend>>>,
     }
 
     /// Minimal 16550A UART state so Linux's `8250` serial driver probes and opens COM1 cleanly.
@@ -779,9 +845,10 @@ mod fuchsia_vmm {
         })
     }
 
-    /// Runs a persistent, operator-managed upstream Linux x86-64 MicroVM with live
-    /// console streaming/input, optional Virtio-MMIO `virtio-net` networking (IRQ 5),
-    /// and clean remote stop via `ManagedVmControl`.
+    /// Runs a persistent, operator-managed upstream Linux x86-64 MicroVM with SMP multi-vCPU
+    /// support, live console streaming/input, optional Virtio-MMIO `virtio-net` (IRQ 5),
+    /// optional persistent Virtio-MMIO `virtio-blk` (IRQ 6 -> `/dev/vda`), Virtio-MMIO
+    /// `virtio-console` (IRQ 7 -> `/dev/hvc0`), and clean remote stop via `ManagedVmControl`.
     #[allow(clippy::too_many_arguments)]
     pub fn run_managed_linux_vm(
         hypervisor_resource: zx_handle_t,
@@ -790,9 +857,12 @@ mod fuchsia_vmm {
         initrd_bytes: Option<&[u8]>,
         cmdline: &str,
         ram_bytes: usize,
+        vcpus: u8,
         mac: Option<[u8; 6]>,
+        blk_backend: Option<Arc<Mutex<dyn VmBlockBackend>>>,
         ctrl: Arc<ManagedVmControl>,
     ) -> Result<VmRunReport, String> {
+        let vcpus_eff = vcpus.clamp(1, 8);
         let cfg = MicroVmConfig {
             ram_bytes: ram_bytes.max(64 * 1024 * 1024),
             max_vm_exits: u64::MAX,
@@ -806,10 +876,20 @@ mod fuchsia_vmm {
             hypervisor_resource,
             vmex_resource,
             cfg,
-            Some(ManagedLaunch { ctrl, mac }),
+            Some(ManagedLaunch {
+                ctrl,
+                vcpus: vcpus_eff,
+                mac,
+                blk_backend,
+            }),
             |ram, _| {
-                let entry_gpa =
-                    load_linux_kernel_into_ram(kernel_bytes, initrd_bytes, cmdline_eff, ram)?;
+                let entry_gpa = load_linux_kernel_into_ram_smp(
+                    kernel_bytes,
+                    initrd_bytes,
+                    cmdline_eff,
+                    ram,
+                    vcpus_eff,
+                )?;
                 Ok(LaunchSpec {
                     entry_gpa,
                     rsp: 0x0000_6000,
@@ -1010,6 +1090,36 @@ mod fuchsia_vmm {
                             "zx_guest_set_trap(VIRTIO_NET)",
                         )
                     })
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_MEM,
+                                    GPA_VIRTIO_BLK_MMIO as usize,
+                                    PAGE_SIZE,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_VIRTIO_BLK,
+                                )
+                            },
+                            "zx_guest_set_trap(VIRTIO_BLK)",
+                        )
+                    })
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_MEM,
+                                    GPA_VIRTIO_CON_MMIO as usize,
+                                    PAGE_SIZE,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_VIRTIO_CON_MMIO,
+                                )
+                            },
+                            "zx_guest_set_trap(VIRTIO_CON_MMIO)",
+                        )
+                    })
                 } else {
                     check(
                         unsafe {
@@ -1100,9 +1210,702 @@ mod fuchsia_vmm {
             return Err(err);
         }
 
-        // 5. Run the VCPU on a dedicated thread (Zircon binds each VCPU to its creator thread).
+        // 5. Run BSP (and dynamically spawned SMP AP vCPUs) on dedicated Zircon threads.
         let max_exits = config.max_vm_exits;
         let ram_bytes_len = config.ram_bytes;
+        let max_vcpus = managed.as_ref().map_or(1, |m| m.vcpus.clamp(1, 8));
+
+        struct SharedDevices {
+            stdout: Vec<u8>,
+            uart: Uart16550,
+            legacy: PcLegacyIo,
+            virtio_net: Option<VirtioNetMmio>,
+            virtio_blk: Option<VirtioBlkMmio>,
+            virtio_con: Option<VirtioConsoleMmio>,
+            latched_mono: u64,
+            exit_code: Option<i32>,
+            loop_err: Option<String>,
+        }
+
+        struct SharedVmState {
+            guest: zx_handle_t,
+            host_ram_base: usize,
+            ram_bytes_len: usize,
+            trap_all_io: bool,
+            max_exits: u64,
+            max_vcpus: u8,
+            managed_ctrl: Option<Arc<ManagedVmControl>>,
+            stop_all: AtomicBool,
+            io_exits: AtomicU64,
+            mmio_exits: AtomicU64,
+            total_exits: AtomicU64,
+            devs: Mutex<SharedDevices>,
+            local_vcpu_dups: Mutex<Vec<zx_handle_t>>,
+            ap_threads: Mutex<Vec<Option<thread::JoinHandle<()>>>>,
+        }
+
+        impl SharedVmState {
+            fn register_vcpu(&self, apic_id: usize, vcpu: zx_handle_t) {
+                let mut dup = ZX_HANDLE_INVALID;
+                if unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut dup) } == ZX_OK {
+                    if let Some(ctrl) = self.managed_ctrl.as_ref() {
+                        ctrl.set_vcpu_dup(apic_id, dup);
+                    } else {
+                        let mut dups = self.local_vcpu_dups.lock().unwrap();
+                        if dups.len() <= apic_id {
+                            dups.resize(apic_id + 1, ZX_HANDLE_INVALID);
+                        }
+                        if dups[apic_id] != ZX_HANDLE_INVALID {
+                            unsafe { zx_handle_close(dups[apic_id]) };
+                        }
+                        dups[apic_id] = dup;
+                    }
+                }
+            }
+
+            fn interrupt_vcpu(&self, apic_id: usize, vector: u32) {
+                if let Some(ctrl) = self.managed_ctrl.as_ref() {
+                    ctrl.interrupt_vcpu(apic_id, vector);
+                } else {
+                    let h = self
+                        .local_vcpu_dups
+                        .lock()
+                        .unwrap()
+                        .get(apic_id)
+                        .copied()
+                        .unwrap_or(ZX_HANDLE_INVALID);
+                    if h != ZX_HANDLE_INVALID {
+                        let _ = unsafe { zx_vcpu_interrupt(h, vector) };
+                    }
+                }
+            }
+
+            fn signal_stop(&self) {
+                self.stop_all.store(true, Ordering::Release);
+                if let Some(ctrl) = self.managed_ctrl.as_ref() {
+                    ctrl.kick_all();
+                } else {
+                    let dups = self.local_vcpu_dups.lock().unwrap();
+                    for &h in dups.iter() {
+                        if h != ZX_HANDLE_INVALID {
+                            unsafe { zx_vcpu_kick(h) };
+                        }
+                    }
+                }
+            }
+
+            fn deliver_pic_irqs(&self, devs: &mut SharedDevices, cur_vcpu: zx_handle_t, apic_id: usize) {
+                if !self.trap_all_io {
+                    return;
+                }
+                let mut inject = |irq: u8| {
+                    if let Some(vec) = devs.legacy.pic_master.try_deliver(irq) {
+                        if apic_id == 0 {
+                            let _ = unsafe { zx_vcpu_interrupt(cur_vcpu, vec) };
+                        } else {
+                            self.interrupt_vcpu(0, vec);
+                        }
+                    }
+                };
+                if devs.uart.irq_pending() {
+                    inject(4);
+                }
+                if devs.virtio_net.as_ref().is_some_and(|v| v.irq_pending()) {
+                    inject(VIRTIO_NET_IRQ);
+                }
+                if devs.virtio_blk.as_ref().is_some_and(|v| v.irq_pending()) {
+                    inject(VIRTIO_BLK_IRQ);
+                }
+                if devs.virtio_con.as_ref().is_some_and(|v| v.irq_pending()) {
+                    inject(VIRTIO_CON_IRQ);
+                }
+            }
+        }
+
+        fn run_vcpu_loop(vcpu: zx_handle_t, apic_id: usize, state: Arc<SharedVmState>) {
+            let ram_slice = unsafe {
+                core::slice::from_raw_parts_mut(state.host_ram_base as *mut u8, state.ram_bytes_len)
+            };
+
+            while !state.stop_all.load(Ordering::Acquire) {
+                if state.total_exits.load(Ordering::Relaxed) >= state.max_exits {
+                    break;
+                }
+
+                // On BSP, drain incoming console stdin, Virtio-Net RX, and Virtio-Console RX before entering.
+                if apic_id == 0 {
+                    if let Some(ctrl) = state.managed_ctrl.as_deref() {
+                        if ctrl.is_stop_requested() {
+                            let mut devs = state.devs.lock().unwrap();
+                            devs.exit_code.get_or_insert(0);
+                            drop(devs);
+                            state.signal_stop();
+                            break;
+                        }
+                    }
+                    let mut devs = state.devs.lock().unwrap();
+                    if let Some(ctrl) = state.managed_ctrl.as_deref() {
+                        let _ = ctrl.drain_console_in(&mut devs.uart.rx_queue);
+                    }
+                    if let Some(vnet) = devs.virtio_net.as_mut() {
+                        let _ = vnet.process_rx(ram_slice);
+                    }
+                    if let Some(vcon) = devs.virtio_con.as_mut() {
+                        let _ = vcon.process_rx(ram_slice);
+                    }
+                    state.deliver_pic_irqs(&mut devs, vcpu, 0);
+                }
+
+                let mut pkt = zx_port_packet_t::default();
+                let st = unsafe { zx_vcpu_enter(vcpu, &mut pkt) };
+                if st == ZX_ERR_CANCELED {
+                    if state.stop_all.load(Ordering::Acquire)
+                        || state
+                            .managed_ctrl
+                            .as_deref()
+                            .is_some_and(|c| c.is_stop_requested())
+                    {
+                        if apic_id == 0 {
+                            let mut devs = state.devs.lock().unwrap();
+                            devs.exit_code.get_or_insert(0);
+                        }
+                        state.signal_stop();
+                        break;
+                    }
+                    continue;
+                }
+                if st != ZX_OK {
+                    let mut devs = state.devs.lock().unwrap();
+                    if state.trap_all_io
+                        && st == ZX_ERR_BAD_STATE
+                        && (!devs.stdout.is_empty() || state.managed_ctrl.is_some())
+                    {
+                        devs.exit_code.get_or_insert(0);
+                        drop(devs);
+                        state.signal_stop();
+                        break;
+                    }
+                    let mut st_regs = zx_vcpu_state_t::default();
+                    let _ = unsafe {
+                        zx_vcpu_read_state(
+                            vcpu,
+                            ZX_VCPU_STATE,
+                            ptr::from_mut(&mut st_regs).cast(),
+                            size_of::<zx_vcpu_state_t>(),
+                        )
+                    };
+                    devs.loop_err.get_or_insert_with(|| {
+                        format!(
+                            "vcpu[{apic_id}] zx_vcpu_enter exited with zx_status={st} (io_exits={}, mmio_exits={}, rsp={:#x}, rax={:#x}, rflags={:#x})",
+                            state.io_exits.load(Ordering::Relaxed),
+                            state.mmio_exits.load(Ordering::Relaxed),
+                            st_regs.rsp,
+                            st_regs.rax,
+                            st_regs.rflags
+                        )
+                    });
+                    drop(devs);
+                    state.signal_stop();
+                    break;
+                }
+
+                state.total_exits.fetch_add(1, Ordering::Relaxed);
+
+                match pkt.packet_type {
+                    ZX_PKT_TYPE_GUEST_VCPU => {
+                        let vp: zx_packet_guest_vcpu_t = read_packet(&pkt);
+                        match vp.r#type as u8 {
+                            ZX_PKT_GUEST_VCPU_INTERRUPT => {
+                                let mask = vp.word0;
+                                let vec = (vp.word1 & 0xFF) as u32;
+                                for cpu in 0..usize::from(state.max_vcpus) {
+                                    if (mask & (1u64 << cpu)) != 0 {
+                                        state.interrupt_vcpu(cpu, vec);
+                                    }
+                                }
+                            }
+                            ZX_PKT_GUEST_VCPU_STARTUP => {
+                                let target = vp.word0 as usize;
+                                let entry = vp.word1 as usize;
+                                if target >= 1 && target < usize::from(state.max_vcpus) {
+                                    let mut aps = state.ap_threads.lock().unwrap();
+                                    if aps.len() <= target {
+                                        aps.resize_with(target + 1, || None);
+                                    }
+                                    if aps[target].is_none() {
+                                        let ready = Arc::new(AtomicBool::new(false));
+                                        let ready_c = Arc::clone(&ready);
+                                        let state_c = Arc::clone(&state);
+                                        let jh = thread::spawn(move || {
+                                            let mut ap_vcpu = ZX_HANDLE_INVALID;
+                                            let res = unsafe {
+                                                zx_vcpu_create(state_c.guest, 0, entry, &mut ap_vcpu)
+                                            };
+                                            if res != ZX_OK {
+                                                println!(
+                                                    "[hirsel-vmm] AP[{target}] zx_vcpu_create(entry={entry:#x}) failed: {res}"
+                                                );
+                                                ready_c.store(true, Ordering::Release);
+                                                return;
+                                            }
+                                            state_c.register_vcpu(target, ap_vcpu);
+                                            ready_c.store(true, Ordering::Release);
+                                            run_vcpu_loop(ap_vcpu, target, state_c);
+                                            unsafe { zx_handle_close(ap_vcpu) };
+                                        });
+                                        aps[target] = Some(jh);
+                                        drop(aps);
+                                        // Wait briefly for deterministic VPID ordering & handle registration.
+                                        for _ in 0..200 {
+                                            if ready.load(Ordering::Acquire) {
+                                                break;
+                                            }
+                                            let next = unsafe { zx_clock_get_monotonic() }
+                                                .saturating_add(100_000);
+                                            unsafe { zx_nanosleep(next) };
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    ZX_PKT_TYPE_GUEST_IO => {
+                        let n_io = state.io_exits.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(ctrl) = state.managed_ctrl.as_deref() {
+                            ctrl.io_exits.store(n_io, Ordering::Relaxed);
+                        }
+                        let io: zx_packet_guest_io_t = read_packet(&pkt);
+                        let is_in = io.input != 0;
+                        let mut reply: Option<zx_vcpu_io_t> = None;
+                        let mut should_stop = false;
+
+                        {
+                            let mut devs = state.devs.lock().unwrap();
+                            match io.port {
+                                PORT_COM1_BASE..=0x03FF => {
+                                    let reg = io.port - PORT_COM1_BASE;
+                                    if is_in {
+                                        let b = devs.uart.read(reg);
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: io.access_size,
+                                            _pad: [0; 3],
+                                            data: [b, 0, 0, 0],
+                                        });
+                                    } else {
+                                        let d = &mut *devs;
+                                        d.uart.write(
+                                            reg,
+                                            io.data[0],
+                                            &mut d.stdout,
+                                            state.managed_ctrl.as_deref(),
+                                        );
+                                    }
+                                }
+                                0x0020 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.pic_master.read_cmd(), 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.pic_master.write_cmd(io.data[0]);
+                                    }
+                                }
+                                0x0021 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.pic_master.read_data(), 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.pic_master.write_data(io.data[0]);
+                                    }
+                                }
+                                0x00A0 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.pic_slave.read_cmd(), 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.pic_slave.write_cmd(io.data[0]);
+                                    }
+                                }
+                                0x00A1 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.pic_slave.read_data(), 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.pic_slave.write_data(io.data[0]);
+                                    }
+                                }
+                                0x0060 => {
+                                    if is_in {
+                                        let v = if devs.legacy.i8042_cmd == 0xAA { 0x55 } else { 0x00 };
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [v, 0, 0, 0],
+                                        });
+                                    }
+                                }
+                                0x0064 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [0x01, 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.i8042_cmd = io.data[0];
+                                        if io.data[0] == 0xFE {
+                                            devs.exit_code.get_or_insert(0);
+                                            should_stop = true;
+                                        }
+                                    }
+                                }
+                                0x0061 => {
+                                    if is_in {
+                                        devs.legacy.port61 ^= 0x20;
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.port61, 0, 0, 0],
+                                        });
+                                    } else {
+                                        devs.legacy.port61 =
+                                            (devs.legacy.port61 & 0xF0) | (io.data[0] & 0x0F);
+                                    }
+                                }
+                                0x0070 => {
+                                    if !is_in {
+                                        devs.legacy.cmos_idx = io.data[0] & 0x7F;
+                                    } else {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.cmos_idx, 0, 0, 0],
+                                        });
+                                    }
+                                }
+                                0x0071 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [devs.legacy.read_cmos(), 0, 0, 0],
+                                        });
+                                    }
+                                }
+                                0x0040..=0x0043 => {
+                                    if is_in {
+                                        devs.legacy.pit_tick =
+                                            devs.legacy.pit_tick.wrapping_sub(0x101);
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 1,
+                                            _pad: [0; 3],
+                                            data: [(devs.legacy.pit_tick & 0xFF) as u8, 0, 0, 0],
+                                        });
+                                    }
+                                }
+                                0x0600..=0x0607 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: io.access_size,
+                                            _pad: [0; 3],
+                                            data: [0; 4],
+                                        });
+                                    }
+                                }
+                                0x0CF9 => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: io.access_size,
+                                            _pad: [0; 3],
+                                            data: [0; 4],
+                                        });
+                                    } else if (io.data[0] & 0x04) != 0 {
+                                        devs.exit_code.get_or_insert(0);
+                                        should_stop = true;
+                                    }
+                                }
+                                PORT_PV_EXIT => {
+                                    if !is_in {
+                                        let code = i32::from_le_bytes(io.data);
+                                        devs.exit_code.get_or_insert(code);
+                                        should_stop = true;
+                                    }
+                                }
+                                PORT_PV_MONO_LO => {
+                                    if is_in {
+                                        devs.latched_mono =
+                                            unsafe { zx_clock_get_monotonic() } as u64;
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 4,
+                                            _pad: [0; 3],
+                                            data: (devs.latched_mono as u32).to_le_bytes(),
+                                        });
+                                    }
+                                }
+                                PORT_PV_MONO_HI => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 4,
+                                            _pad: [0; 3],
+                                            data: ((devs.latched_mono >> 32) as u32).to_le_bytes(),
+                                        });
+                                    }
+                                }
+                                PORT_PV_RNG => {
+                                    if is_in {
+                                        let mut rng = [0u8; 4];
+                                        unsafe { zx_cprng_draw(rng.as_mut_ptr(), rng.len()) };
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: 4,
+                                            _pad: [0; 3],
+                                            data: rng,
+                                        });
+                                    }
+                                }
+                                _ => {
+                                    if is_in {
+                                        reply = Some(zx_vcpu_io_t {
+                                            access_size: io.access_size,
+                                            _pad: [0; 3],
+                                            data: [0xff; 4],
+                                        });
+                                    }
+                                }
+                            }
+                            if !should_stop {
+                                state.deliver_pic_irqs(&mut devs, vcpu, apic_id);
+                            }
+                        }
+
+                        if should_stop {
+                            state.signal_stop();
+                            break;
+                        }
+                        if let Some(io_reply) = reply {
+                            let st = unsafe {
+                                zx_vcpu_write_state(
+                                    vcpu,
+                                    ZX_VCPU_IO,
+                                    ptr::from_ref(&io_reply).cast(),
+                                    size_of::<zx_vcpu_io_t>(),
+                                )
+                            };
+                            if st != ZX_OK {
+                                state.devs.lock().unwrap().loop_err.get_or_insert_with(|| {
+                                    format!("zx_vcpu_write_state(ZX_VCPU_IO): zx_status={st}")
+                                });
+                                state.signal_stop();
+                                break;
+                            }
+                        }
+                    }
+                    ZX_PKT_TYPE_GUEST_MEM => {
+                        let n_mmio = state.mmio_exits.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(ctrl) = state.managed_ctrl.as_deref() {
+                            ctrl.mmio_exits.store(n_mmio, Ordering::Relaxed);
+                        }
+                        let mem: zx_packet_guest_mem_t = read_packet(&pkt);
+                        let is_virtio = (pkt.key == TRAP_KEY_VIRTIO_NET
+                            && mem.addr >= GPA_VIRTIO_NET_MMIO
+                            && mem.addr < GPA_VIRTIO_NET_MMIO + PAGE_SIZE as u64)
+                            || (pkt.key == TRAP_KEY_VIRTIO_BLK
+                                && mem.addr >= GPA_VIRTIO_BLK_MMIO
+                                && mem.addr < GPA_VIRTIO_BLK_MMIO + PAGE_SIZE as u64)
+                            || (pkt.key == TRAP_KEY_VIRTIO_CON_MMIO
+                                && mem.addr >= GPA_VIRTIO_CON_MMIO
+                                && mem.addr < GPA_VIRTIO_CON_MMIO + PAGE_SIZE as u64);
+
+                        if is_virtio {
+                            let mut inst_buf = [0u8; 15];
+                            let n =
+                                fetch_guest_inst_bytes(ram_slice, mem.cr3, mem.rip, &mut inst_buf);
+                            match decode_mmio_inst(&inst_buf[..n]) {
+                                Ok(access) => {
+                                    let mut regs = zx_vcpu_state_t::default();
+                                    let _ = unsafe {
+                                        zx_vcpu_read_state(
+                                            vcpu,
+                                            ZX_VCPU_STATE,
+                                            ptr::from_mut(&mut regs).cast(),
+                                            size_of::<zx_vcpu_state_t>(),
+                                        )
+                                    };
+                                    let mut need_write_regs = false;
+                                    {
+                                        let mut devs = state.devs.lock().unwrap();
+                                        let val_opt: Option<u32> = match pkt.key {
+                                            TRAP_KEY_VIRTIO_NET => {
+                                                let off = mem.addr - GPA_VIRTIO_NET_MMIO;
+                                                match (devs.virtio_net.as_mut(), access) {
+                                                    (Some(v), MmioAccess::Read { size, .. }) => {
+                                                        Some(v.read(off, size))
+                                                    }
+                                                    (Some(v), MmioAccess::WriteReg { reg, .. }) => {
+                                                        v.write(
+                                                            off,
+                                                            get_gpr(&regs, reg) as u32,
+                                                            ram_slice,
+                                                        );
+                                                        None
+                                                    }
+                                                    (
+                                                        Some(v),
+                                                        MmioAccess::WriteImm { value, .. },
+                                                    ) => {
+                                                        v.write(off, value as u32, ram_slice);
+                                                        None
+                                                    }
+                                                    (None, MmioAccess::Read { .. }) => Some(0),
+                                                    (None, _) => None,
+                                                }
+                                            }
+                                            TRAP_KEY_VIRTIO_BLK => {
+                                                let off = mem.addr - GPA_VIRTIO_BLK_MMIO;
+                                                let res = match (devs.virtio_blk.as_mut(), access) {
+                                                    (Some(v), MmioAccess::Read { size, .. }) => {
+                                                        Some(v.read(off, size))
+                                                    }
+                                                    (Some(v), MmioAccess::WriteReg { reg, .. }) => {
+                                                        v.write(
+                                                            off,
+                                                            get_gpr(&regs, reg) as u32,
+                                                            ram_slice,
+                                                        );
+                                                        None
+                                                    }
+                                                    (
+                                                        Some(v),
+                                                        MmioAccess::WriteImm { value, .. },
+                                                    ) => {
+                                                        v.write(off, value as u32, ram_slice);
+                                                        None
+                                                    }
+                                                    (None, MmioAccess::Read { .. }) => Some(0),
+                                                    (None, _) => None,
+                                                };
+                                                if let (Some(ctrl), Some(v)) = (
+                                                    state.managed_ctrl.as_deref(),
+                                                    devs.virtio_blk.as_ref(),
+                                                ) {
+                                                    ctrl.blk_reads.store(
+                                                        v.reads.load(Ordering::Relaxed),
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    ctrl.blk_writes.store(
+                                                        v.writes.load(Ordering::Relaxed),
+                                                        Ordering::Relaxed,
+                                                    );
+                                                }
+                                                res
+                                            }
+                                            TRAP_KEY_VIRTIO_CON_MMIO => {
+                                                let off = mem.addr - GPA_VIRTIO_CON_MMIO;
+                                                match (devs.virtio_con.as_mut(), access) {
+                                                    (Some(v), MmioAccess::Read { size, .. }) => {
+                                                        Some(v.read(off, size))
+                                                    }
+                                                    (Some(v), MmioAccess::WriteReg { reg, .. }) => {
+                                                        v.write(
+                                                            off,
+                                                            get_gpr(&regs, reg) as u32,
+                                                            ram_slice,
+                                                        );
+                                                        None
+                                                    }
+                                                    (
+                                                        Some(v),
+                                                        MmioAccess::WriteImm { value, .. },
+                                                    ) => {
+                                                        v.write(off, value as u32, ram_slice);
+                                                        None
+                                                    }
+                                                    (None, MmioAccess::Read { .. }) => Some(0),
+                                                    (None, _) => None,
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        if let (
+                                            Some(val),
+                                            MmioAccess::Read {
+                                                reg,
+                                                size,
+                                                zero_extend,
+                                            },
+                                        ) = (val_opt, access)
+                                        {
+                                            set_gpr(&mut regs, reg, size, zero_extend, u64::from(val));
+                                            need_write_regs = true;
+                                        }
+                                        state.deliver_pic_irqs(&mut devs, vcpu, apic_id);
+                                    }
+                                    if need_write_regs {
+                                        let _ = unsafe {
+                                            zx_vcpu_write_state(
+                                                vcpu,
+                                                ZX_VCPU_STATE,
+                                                ptr::from_ref(&regs).cast(),
+                                                size_of::<zx_vcpu_state_t>(),
+                                            )
+                                        };
+                                    }
+                                }
+                                Err(e) => {
+                                    state.devs.lock().unwrap().loop_err.get_or_insert_with(|| {
+                                        format!(
+                                            "virtio MMIO decode error at addr={:#x} rip={:#x} bytes={:02x?}: {e}",
+                                            mem.addr,
+                                            mem.rip,
+                                            &inst_buf[..n.min(8)]
+                                        )
+                                    });
+                                    state.signal_stop();
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        let in_hb = pkt.key == TRAP_KEY_MMIO_HEARTBEAT
+                            && mem.addr >= GPA_MMIO_HEARTBEAT
+                            && mem.addr < GPA_MMIO_HEARTBEAT + PAGE_SIZE as u64;
+                        let in_con = pkt.key == TRAP_KEY_VIRTIO_CON
+                            && mem.addr >= GPA_VIRTIO_CON
+                            && mem.addr < GPA_VIRTIO_CON + PAGE_SIZE as u64;
+                        if !in_hb && !in_con {
+                            state.devs.lock().unwrap().loop_err.get_or_insert_with(|| {
+                                format!(
+                                    "unexpected GUEST_MEM trap addr={:#x} rip={:#x}",
+                                    mem.addr, mem.rip
+                                )
+                            });
+                            state.signal_stop();
+                            break;
+                        }
+                    }
+                    other => {
+                        state.devs.lock().unwrap().loop_err.get_or_insert_with(|| {
+                            format!("unhandled guest packet type={other}")
+                        });
+                        state.signal_stop();
+                        break;
+                    }
+                }
+            }
+        }
+
         let vcpu_res = thread::spawn(move || -> Result<VmRunReport, String> {
             let mut vcpu = ZX_HANDLE_INVALID;
             check(
@@ -1134,54 +1937,75 @@ mod fuchsia_vmm {
             }
 
             let managed_ctrl = managed.as_ref().map(|m| Arc::clone(&m.ctrl));
-            let mut virtio_net = managed.as_ref().and_then(|m| {
+            let virtio_net = managed.as_ref().and_then(|m| {
                 m.ctrl.net_channel.as_ref().map(|ch| {
                     let mac = m.mac.unwrap_or([0x02, 0x48, 0x52, 0x53, 0x4c, 0x01]);
                     VirtioNetMmio::new(mac, Arc::clone(ch))
                 })
             });
+            let virtio_blk = managed
+                .as_ref()
+                .and_then(|m| m.blk_backend.as_ref().map(|b| VirtioBlkMmio::new(Arc::clone(b))));
+            let virtio_con = managed
+                .as_ref()
+                .map(|m| VirtioConsoleMmio::new(Arc::clone(&m.ctrl.console_channel)));
 
+            let state = Arc::new(SharedVmState {
+                guest,
+                host_ram_base,
+                ram_bytes_len,
+                trap_all_io: spec.trap_all_io,
+                max_exits,
+                max_vcpus,
+                managed_ctrl: managed_ctrl.clone(),
+                stop_all: AtomicBool::new(false),
+                io_exits: AtomicU64::new(0),
+                mmio_exits: AtomicU64::new(0),
+                total_exits: AtomicU64::new(0),
+                devs: Mutex::new(SharedDevices {
+                    stdout: Vec::new(),
+                    uart: Uart16550::new(),
+                    legacy: PcLegacyIo::new(),
+                    virtio_net,
+                    virtio_blk,
+                    virtio_con,
+                    latched_mono: 0,
+                    exit_code: None,
+                    loop_err: None,
+                }),
+                local_vcpu_dups: Mutex::new(Vec::new()),
+                ap_threads: Mutex::new(Vec::new()),
+            });
+
+            state.register_vcpu(0, vcpu);
             if let Some(ctrl) = managed_ctrl.as_ref() {
-                let mut vcpu_dup = ZX_HANDLE_INVALID;
-                if unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut vcpu_dup) }
-                    == ZX_OK
-                {
-                    ctrl.set_vcpu_dup(vcpu_dup);
-                }
                 if let Some(ch) = ctrl.net_channel.as_ref() {
                     let ctrl_w = Arc::clone(ctrl);
                     ch.set_wake_guest(Some(Box::new(move || ctrl_w.kick())));
                 }
+                {
+                    let ctrl_w = Arc::clone(ctrl);
+                    ctrl.console_channel
+                        .set_wake_guest(Some(Box::new(move || ctrl_w.kick())));
+                }
             }
 
-            let ram_slice = unsafe {
-                core::slice::from_raw_parts_mut(host_ram_base as *mut u8, ram_bytes_len)
-            };
-
-            let mut stdout = Vec::new();
-            let mut uart = Uart16550::new();
-            let mut legacy = PcLegacyIo::new();
-            let mut io_exits: u64 = 0;
-            let mut mmio_exits: u64 = 0;
-            let mut latched_mono: u64 = 0;
-            let mut exit_code: Option<i32> = None;
-
             // Watchdog for one-shot Linux kernel boots only (managed VMs run persistently).
-            let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done_flag = Arc::new(AtomicBool::new(false));
             let mut watchdog = if spec.trap_all_io && managed_ctrl.is_none() {
-                let done_c = std::sync::Arc::clone(&done_flag);
+                let done_c = Arc::clone(&done_flag);
                 let mut vcpu_dup = ZX_HANDLE_INVALID;
                 let _ = unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut vcpu_dup) };
                 Some(thread::spawn(move || {
                     for _ in 0..120 {
-                        if done_c.load(std::sync::atomic::Ordering::Relaxed) {
+                        if done_c.load(Ordering::Relaxed) {
                             unsafe { zx_handle_close(vcpu_dup) };
                             return;
                         }
                         let next = unsafe { zx_clock_get_monotonic() }.saturating_add(100_000_000);
                         unsafe { zx_nanosleep(next) };
                     }
-                    if !done_c.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !done_c.load(Ordering::Relaxed) {
                         println!("[hirsel-vmm] watchdog kicking VCPU after 12s timeout");
                         unsafe { zx_vcpu_kick(vcpu_dup) };
                     }
@@ -1191,422 +2015,22 @@ mod fuchsia_vmm {
                 None
             };
 
-            let mut loop_err: Option<String> = None;
-            let mut total_exits: u64 = 0;
-            while total_exits < max_exits {
-                // Before entering the VCPU, deliver any host-queued console input or Virtio-Net RX frames.
-                if let Some(ctrl) = managed_ctrl.as_deref() {
-                    if ctrl.is_stop_requested() {
-                        exit_code = Some(0);
-                        break;
-                    }
-                    if ctrl.drain_console_in(&mut uart.rx_queue) && uart.irq_pending() {
-                        if let Some(vec) = legacy.pic_master.try_deliver(4) {
-                            let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
-                        }
-                    }
-                }
-                if let Some(vnet) = virtio_net.as_mut() {
-                    if vnet.process_rx(ram_slice) && vnet.irq_pending() {
-                        if let Some(vec) = legacy.pic_master.try_deliver(VIRTIO_NET_IRQ) {
-                            let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
-                        }
-                    }
-                }
+            run_vcpu_loop(vcpu, 0, Arc::clone(&state));
 
-                let mut pkt = zx_port_packet_t::default();
-                let st = unsafe { zx_vcpu_enter(vcpu, &mut pkt) };
-                if st == ZX_ERR_CANCELED {
-                    if let Some(ctrl) = managed_ctrl.as_deref() {
-                        if ctrl.is_stop_requested() {
-                            exit_code = Some(0);
-                            break;
-                        }
-                        // Wakeup kick for incoming Virtio-Net RX packet or console stdin!
-                        continue;
-                    }
-                }
-                if st != ZX_OK {
-                    if spec.trap_all_io && st == ZX_ERR_BAD_STATE && (!stdout.is_empty() || managed_ctrl.is_some()) {
-                        // Triple-fault / VMEXIT_SHUTDOWN during Linux reboot fallback.
-                        exit_code = Some(0);
-                        break;
-                    }
-                    let mut st_regs = zx_vcpu_state_t::default();
-                    let _ = unsafe {
-                        zx_vcpu_read_state(
-                            vcpu,
-                            ZX_VCPU_STATE,
-                            ptr::from_mut(&mut st_regs).cast(),
-                            size_of::<zx_vcpu_state_t>(),
-                        )
-                    };
-                    loop_err = Some(format!(
-                        "zx_vcpu_enter exited with zx_status={st} (io_exits={io_exits}, mmio_exits={mmio_exits}, rsp={:#x}, rax={:#x}, rflags={:#x})",
-                        st_regs.rsp,
-                        st_regs.rax,
-                        st_regs.rflags
-                    ));
-                    break;
-                }
-                total_exits = total_exits.saturating_add(1);
-
-                match pkt.packet_type {
-                    ZX_PKT_TYPE_GUEST_IO => {
-                        io_exits += 1;
-                        if let Some(ctrl) = managed_ctrl.as_deref() {
-                            ctrl.io_exits.store(io_exits, Ordering::Relaxed);
-                        }
-                        let io: zx_packet_guest_io_t = read_packet(&pkt);
-                        let is_in = io.input != 0;
-                        let mut reply: Option<zx_vcpu_io_t> = None;
-
-                        match io.port {
-                            // COM1 16550A UART (0x3F8..0x400)
-                            PORT_COM1_BASE..=0x03FF => {
-                                let reg = io.port - PORT_COM1_BASE;
-                                if is_in {
-                                    let b = uart.read(reg);
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: io.access_size,
-                                        _pad: [0; 3],
-                                        data: [b, 0, 0, 0],
-                                    });
-                                } else {
-                                    uart.write(reg, io.data[0], &mut stdout, managed_ctrl.as_deref());
-                                }
-                            }
-                            // Dual 8259A PIC (Master 0x20/0x21, Slave 0xA0/0xA1)
-                            0x0020 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.pic_master.read_cmd(), 0, 0, 0],
-                                    });
-                                } else {
-                                    legacy.pic_master.write_cmd(io.data[0]);
-                                }
-                            }
-                            0x0021 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.pic_master.read_data(), 0, 0, 0],
-                                    });
-                                } else {
-                                    legacy.pic_master.write_data(io.data[0]);
-                                }
-                            }
-                            0x00A0 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.pic_slave.read_cmd(), 0, 0, 0],
-                                    });
-                                } else {
-                                    legacy.pic_slave.write_cmd(io.data[0]);
-                                }
-                            }
-                            0x00A1 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.pic_slave.read_data(), 0, 0, 0],
-                                    });
-                                } else {
-                                    legacy.pic_slave.write_data(io.data[0]);
-                                }
-                            }
-                            // i8042 Keyboard Controller (0x60/0x64) -> `reboot=k` writes 0xFE to 0x64!
-                            0x0060 => {
-                                if is_in {
-                                    let v = if legacy.i8042_cmd == 0xAA { 0x55 } else { 0x00 };
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [v, 0, 0, 0],
-                                    });
-                                }
-                            }
-                            0x0064 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [0x01, 0, 0, 0], // output buffer full
-                                    });
-                                } else {
-                                    legacy.i8042_cmd = io.data[0];
-                                    if io.data[0] == 0xFE {
-                                        // Clean Linux `reboot=k` microVM shutdown!
-                                        exit_code = Some(0);
-                                        break;
-                                    }
-                                }
-                            }
-                            // Port 0x61 (NMI Status / PIT Ch2 gate): toggle bit 5 so calibration finishes!
-                            0x0061 => {
-                                if is_in {
-                                    legacy.port61 ^= 0x20;
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.port61, 0, 0, 0],
-                                    });
-                                } else {
-                                    legacy.port61 = (legacy.port61 & 0xF0) | (io.data[0] & 0x0F);
-                                }
-                            }
-                            // MC146818 CMOS/RTC (0x70/0x71)
-                            0x0070 => {
-                                if !is_in {
-                                    legacy.cmos_idx = io.data[0] & 0x7F;
-                                } else {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.cmos_idx, 0, 0, 0],
-                                    });
-                                }
-                            }
-                            0x0071 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [legacy.read_cmos(), 0, 0, 0],
-                                    });
-                                }
-                            }
-                            // Legacy 8254 PIT (0x40..0x43)
-                            0x0040..=0x0043 => {
-                                if is_in {
-                                    legacy.pit_tick = legacy.pit_tick.wrapping_sub(0x101);
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 1,
-                                        _pad: [0; 3],
-                                        data: [(legacy.pit_tick & 0xFF) as u8, 0, 0, 0],
-                                    });
-                                }
-                            }
-                            // Minimal ACPI PM1a status/control stub (0x600..0x608)
-                            0x0600..=0x0607 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: io.access_size,
-                                        _pad: [0; 3],
-                                        data: [0; 4],
-                                    });
-                                }
-                            }
-                            // ICH/PIIX Reset Control Register (0xCF9): bit 2 = system reset.
-                            0x0CF9 => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: io.access_size,
-                                        _pad: [0; 3],
-                                        data: [0; 4],
-                                    });
-                                } else if (io.data[0] & 0x04) != 0 {
-                                    exit_code = Some(0);
-                                    break;
-                                }
-                            }
-                            // Paravirt clean VM exit
-                            PORT_PV_EXIT => {
-                                if !is_in {
-                                    let code = i32::from_le_bytes(io.data);
-                                    exit_code = Some(code);
-                                    break;
-                                }
-                            }
-                            // Paravirt host monotonic clock (low 32 bits, latches 64-bit ns)
-                            PORT_PV_MONO_LO => {
-                                if is_in {
-                                    latched_mono = unsafe { zx_clock_get_monotonic() } as u64;
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 4,
-                                        _pad: [0; 3],
-                                        data: (latched_mono as u32).to_le_bytes(),
-                                    });
-                                }
-                            }
-                            // Paravirt host monotonic clock (high 32 bits of latched ns)
-                            PORT_PV_MONO_HI => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 4,
-                                        _pad: [0; 3],
-                                        data: ((latched_mono >> 32) as u32).to_le_bytes(),
-                                    });
-                                }
-                            }
-                            // Paravirt host CSPRNG entropy (32 bits per read)
-                            PORT_PV_RNG => {
-                                if is_in {
-                                    let mut rng = [0u8; 4];
-                                    unsafe { zx_cprng_draw(rng.as_mut_ptr(), rng.len()) };
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: 4,
-                                        _pad: [0; 3],
-                                        data: rng,
-                                    });
-                                }
-                            }
-                            // All other legacy ports (PIC 0x20/0xA0, PCI 0xCF8/0xCFC, COM2..4, etc.)
-                            _ => {
-                                if is_in {
-                                    reply = Some(zx_vcpu_io_t {
-                                        access_size: io.access_size,
-                                        _pad: [0; 3],
-                                        data: [0xff; 4],
-                                    });
-                                }
-                            }
-                        }
-
-                        if let Some(io_reply) = reply {
-                            check(
-                                unsafe {
-                                    zx_vcpu_write_state(
-                                        vcpu,
-                                        ZX_VCPU_IO,
-                                        ptr::from_ref(&io_reply).cast(),
-                                        size_of::<zx_vcpu_io_t>(),
-                                    )
-                                },
-                                "zx_vcpu_write_state(ZX_VCPU_IO)",
-                            )?;
-                        }
-                        // Deliver pending COM1 IRQ 4 and Virtio-Net IRQ 5 via 8259A master PIC.
-                        if spec.trap_all_io {
-                            if uart.irq_pending() {
-                                if let Some(vec) = legacy.pic_master.try_deliver(4) {
-                                    let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
-                                }
-                            }
-                            if let Some(vnet) = virtio_net.as_ref() {
-                                if vnet.irq_pending() {
-                                    if let Some(vec) = legacy.pic_master.try_deliver(VIRTIO_NET_IRQ) {
-                                        let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ZX_PKT_TYPE_GUEST_MEM => {
-                        mmio_exits += 1;
-                        if let Some(ctrl) = managed_ctrl.as_deref() {
-                            ctrl.mmio_exits.store(mmio_exits, Ordering::Relaxed);
-                        }
-                        let mem: zx_packet_guest_mem_t = read_packet(&pkt);
-                        if pkt.key == TRAP_KEY_VIRTIO_NET
-                            && mem.addr >= GPA_VIRTIO_NET_MMIO
-                            && mem.addr < GPA_VIRTIO_NET_MMIO + PAGE_SIZE as u64
-                        {
-                            let mut inst_buf = [0u8; 15];
-                            let n = fetch_guest_inst_bytes(ram_slice, mem.cr3, mem.rip, &mut inst_buf);
-                            match decode_mmio_inst(&inst_buf[..n]) {
-                                Ok(access) => {
-                                    let off = mem.addr - GPA_VIRTIO_NET_MMIO;
-                                    let mut regs = zx_vcpu_state_t::default();
-                                    let _ = unsafe {
-                                        zx_vcpu_read_state(
-                                            vcpu,
-                                            ZX_VCPU_STATE,
-                                            ptr::from_mut(&mut regs).cast(),
-                                            size_of::<zx_vcpu_state_t>(),
-                                        )
-                                    };
-                                    if let Some(vnet) = virtio_net.as_mut() {
-                                        match access {
-                                            MmioAccess::Read {
-                                                reg,
-                                                size,
-                                                zero_extend,
-                                            } => {
-                                                let val = u64::from(vnet.read(off, size));
-                                                set_gpr(&mut regs, reg, size, zero_extend, val);
-                                                let _ = unsafe {
-                                                    zx_vcpu_write_state(
-                                                        vcpu,
-                                                        ZX_VCPU_STATE,
-                                                        ptr::from_ref(&regs).cast(),
-                                                        size_of::<zx_vcpu_state_t>(),
-                                                    )
-                                                };
-                                            }
-                                            MmioAccess::WriteReg { reg, .. } => {
-                                                let val = get_gpr(&regs, reg) as u32;
-                                                vnet.write(off, val, ram_slice);
-                                            }
-                                            MmioAccess::WriteImm { value, .. } => {
-                                                vnet.write(off, value as u32, ram_slice);
-                                            }
-                                        }
-                                        if vnet.irq_pending() {
-                                            if let Some(vec) =
-                                                legacy.pic_master.try_deliver(VIRTIO_NET_IRQ)
-                                            {
-                                                let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
-                                            }
-                                        }
-                                    } else if let MmioAccess::Read {
-                                        reg,
-                                        size,
-                                        zero_extend,
-                                    } = access
-                                    {
-                                        // No virtio-net attached: return 0 (invalid magic) so Linux skips probe.
-                                        set_gpr(&mut regs, reg, size, zero_extend, 0);
-                                        let _ = unsafe {
-                                            zx_vcpu_write_state(
-                                                vcpu,
-                                                ZX_VCPU_STATE,
-                                                ptr::from_ref(&regs).cast(),
-                                                size_of::<zx_vcpu_state_t>(),
-                                            )
-                                        };
-                                    }
-                                }
-                                Err(e) => {
-                                    loop_err = Some(format!(
-                                        "virtio-net MMIO decode error at addr={:#x} rip={:#x} bytes={:02x?}: {e}",
-                                        mem.addr,
-                                        mem.rip,
-                                        &inst_buf[..n.min(8)]
-                                    ));
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        let in_hb = pkt.key == TRAP_KEY_MMIO_HEARTBEAT
-                            && mem.addr >= GPA_MMIO_HEARTBEAT
-                            && mem.addr < GPA_MMIO_HEARTBEAT + PAGE_SIZE as u64;
-                        let in_con = pkt.key == TRAP_KEY_VIRTIO_CON
-                            && mem.addr >= GPA_VIRTIO_CON
-                            && mem.addr < GPA_VIRTIO_CON + PAGE_SIZE as u64;
-                        if !in_hb && !in_con {
-                            loop_err = Some(format!(
-                                "unexpected GUEST_MEM trap addr={:#x} rip={:#x}",
-                                mem.addr, mem.rip
-                            ));
-                            break;
-                        }
-                    }
-                    other => {
-                        loop_err = Some(format!("unhandled guest packet type={other}"));
-                        break;
-                    }
-                }
+            // Stop and join all spawned SMP AP threads before closing guest handles!
+            state.signal_stop();
+            let aps: Vec<_> = state
+                .ap_threads
+                .lock()
+                .unwrap()
+                .drain(..)
+                .flatten()
+                .collect();
+            for jh in aps {
+                let _ = jh.join();
             }
 
-            done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            done_flag.store(true, Ordering::Relaxed);
             if let Some(w) = watchdog.take() {
                 let _ = w.join();
             }
@@ -1614,16 +2038,27 @@ mod fuchsia_vmm {
                 if let Some(ch) = ctrl.net_channel.as_ref() {
                     ch.set_wake_guest(None);
                 }
-                ctrl.set_vcpu_dup(ZX_HANDLE_INVALID);
+                ctrl.console_channel.set_wake_guest(None);
+                ctrl.clear_vcpu_dups();
+            }
+            for h in state.local_vcpu_dups.lock().unwrap().drain(..) {
+                if h != ZX_HANDLE_INVALID {
+                    unsafe { zx_handle_close(h) };
+                }
             }
             unsafe { zx_handle_close(vcpu) };
 
-            if let Some(err) = loop_err {
+            let io_exits = state.io_exits.load(Ordering::Relaxed);
+            let mmio_exits = state.mmio_exits.load(Ordering::Relaxed);
+            let mut devs = state.devs.lock().unwrap();
+            if let Some(err) = devs.loop_err.take() {
                 return Err(err);
             }
-
-            let code = exit_code
+            let code = devs
+                .exit_code
                 .ok_or_else(|| format!("guest exceeded max_vm_exits ({max_exits})"))?;
+            let stdout = core::mem::take(&mut devs.stdout);
+            drop(devs);
 
             let mut bell_count: u64 = 0;
             loop {
