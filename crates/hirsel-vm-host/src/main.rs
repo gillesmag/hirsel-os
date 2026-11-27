@@ -320,10 +320,15 @@ mod fuchsia_impl {
         let initrd = std::fs::read("/pkg/data/vm/initramfs-ssh.cpio")
             .map_err(|e| format!("read /pkg/data/vm/initramfs-ssh.cpio: {e}"))?;
 
+        let vm_name = std::env::args()
+            .nth(1)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            .unwrap_or_else(|| "vm-dev".to_string());
+        let disk_path = format!("/data/{vm_name}.img");
         let blk_backend: Arc<Mutex<dyn VmBlockBackend>> =
-            match FileBlockBackend::open_or_create("/data/vm-dev.img", 16 * 1024 * 1024) {
+            match FileBlockBackend::open_or_create(&disk_path, 64 * 1024 * 1024) {
                 Ok(fb) => {
-                    emit_log("[hirsel-vm-host] attached persistent 16 MiB Fxfs disk /data/vm-dev.img -> /dev/vda");
+                    emit_log(&format!("[hirsel-vm-host] attached persistent 64 MiB sparse Fxfs disk {disk_path} -> /dev/vda"));
                     Arc::new(Mutex::new(fb))
                 }
                 Err(e) => {
@@ -455,12 +460,15 @@ mod fuchsia_impl {
             }
         });
 
+        let cmdline = format!(
+            "console=ttyS0 reboot=k panic=1 pci=off nomodules hirsel.name={vm_name} hirsel.ip=10.0.3.2/24 hirsel.gw=10.0.3.1"
+        );
         let report = hirsel_vmm::run_managed_linux_vm(
             hyp_res,
             vmex_res,
             &kernel,
             Some(&initrd),
-            "console=ttyS0 reboot=k panic=1 pci=off nomodules hirsel.name=vm-dev hirsel.ip=10.0.3.2/24 hirsel.gw=10.0.3.1",
+            &cmdline,
             128 * 1024 * 1024,
             2,
             Some([0x52, 0x54, 0x00, 0x48, 0x52, 0x01]),

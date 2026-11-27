@@ -56,6 +56,16 @@ resource("vm_linux_initrd") {
   outputs = [ "data/vm/initramfs-ssh.cpio" ]
 }
 
+resource("figments_canvas_js") {
+  sources = [ "assets/figments-canvas.js" ]
+  outputs = [ "data/figments/figments-canvas.js" ]
+}
+
+resource("figments_themes_css") {
+  sources = [ "assets/themes.css" ]
+  outputs = [ "data/figments/themes.css" ]
+}
+
 rustc_binary("egress_gw_bin") {
   output_name = "egress_gw"
   edition = "2024"
@@ -87,6 +97,7 @@ rustc_binary("hirsel_shell_bin") {
     "src/main.rs",
     "src/painter.rs",
     "src/vm_client.rs",
+    "src/vt100.rs",
     "src/web_content.rs",
     "src/wm_client.rs",
   ]
@@ -147,6 +158,8 @@ fuchsia_component_manifest("hirsel_shell_manifest") {
 fuchsia_component("hirsel_shell_component") {
   cm_label = ":hirsel_shell_manifest"
   deps = [
+    ":figments_canvas_js",
+    ":figments_themes_css",
     ":hirsel_agent_bin",
     ":hirsel_board_bin",
     ":hirsel_js_bin",

@@ -1082,19 +1082,40 @@ build-vm-host:
     cp "{{out_dir}}/hirsel-vm-host" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-vm-host"
     ls -lh "{{out_dir}}/hirsel-vm-host"
 
-# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + hirsel-wm + hirsel-js + Linux 6.1.102 vm-dev)
+# Re-bundle real Figments canvas engine (A* elbow router + perfect-freehand + OKLCH themes) from /workspace/figments-hirsel
+bundle-figments figments_dir="/workspace/figments-hirsel":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ASSETS="{{root}}/desktop/hirsel_desktop/hirsel_session/assets"
+    mkdir -p "$ASSETS" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets"
+    TMP_ENTRY="$(mktemp --suffix=.ts)"
+    trap 'rm -f "$TMP_ENTRY"' EXIT
+    cat > "$TMP_ENTRY" <<EOF
+    export { routeElbow, autoAnchor } from '{{figments_dir}}/shell/canvas/elbow_router.ts';
+    export { getStroke, getSvgPathFromStroke } from '{{figments_dir}}/shell/canvas/freehand.ts';
+    export { shapePath } from '{{figments_dir}}/shell/canvas/shapes.ts';
+    EOF
+    npx --yes esbuild "$TMP_ENTRY" --bundle --minify --format=iife --global-name=FigmentsCanvas \
+      --outfile="$ASSETS/figments-canvas.js"
+    cp "{{figments_dir}}/shell/themes.css" "$ASSETS/themes.css"
+    cp "$ASSETS/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
+    ls -lh "$ASSETS/"
+
+# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + real Figments canvas + hirsel-wm + hirsel-js + Linux 6.1.102 vm-dev)
 build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ssh-initrd
     #!/usr/bin/env bash
     set -euo pipefail
     cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
     mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm"
     cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/fidl/"*.fidl "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
     cp "{{out_dir}}/linux/vmlinux.stripped" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/vmlinux.stripped"
     cp "{{out_dir}}/linux/initramfs-ssh.cpio" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/initramfs-ssh.cpio"
@@ -1109,6 +1130,10 @@ build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ss
     fi
     PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.x64 build //products/hirsel_desktop:hirsel_desktop.x64
     ls -lh out/hirsel-desktop.x64/obj/products/hirsel_desktop/hirsel_desktop.x64/product_bundle/system_a/
+
+# Build GPT A/B UEFI bootable raw disk image for bare-metal USB/NVMe flashing
+build-usb-image out_img="out/hirsel-desktop-uefi.img":
+    bash "{{root}}/scripts/build_uefi_usb.sh" "{{out_img}}"
 
 # Boot Hirsel-OS Desktop interactively in QEMU/KVM (VNC on :0 / port 5900, control API on :7780, Figments UI on :7711)
 boot-desktop vnc=":0":

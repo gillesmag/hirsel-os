@@ -11,6 +11,7 @@ mod font8x16;
 mod js_client;
 mod painter;
 mod vm_client;
+mod vt100;
 mod web_content;
 mod wm_client;
 
@@ -44,8 +45,10 @@ use vm_client::{VmClient, VmEvent, VmExecResult};
 use wm_client::{RectJson, ScenePlan, WmClient};
 
 const TOP_BAR_H: u32 = 36;
+const WEB_BAR_H: u32 = 24;
 const BORDER_PX: i32 = 3;
 const STATE_PATH: &str = "/data/hirsel_state.json";
+const INK_PATH: &str = "/data/ink.json";
 const SAS_HOSTS: &[&str] = &["api.anthropic.com", "api.openai.com", "api.github.com", "example.com"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,25 @@ enum ShellMsg {
     BoardOp {
         payload: serde_json::Value,
         reply: oneshot::Sender<Result<BoardSnapshot>>,
+    },
+    GetInk {
+        reply: oneshot::Sender<Vec<serde_json::Value>>,
+    },
+    AddInk {
+        stroke: serde_json::Value,
+        reply: oneshot::Sender<Vec<serde_json::Value>>,
+    },
+    ListVms {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    SpawnNamedVm {
+        name: String,
+        reply: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    ExecNamedVm {
+        name: String,
+        cmd: String,
+        reply: oneshot::Sender<Result<VmExecResult>>,
     },
     AgentRun {
         goal: String,
@@ -214,16 +236,24 @@ struct HirselShell {
     top_bar_surface: painter::CpuSurface,
     top_bar_attached: bool,
 
-    // Split vm-dev surface + border + live AMD-SVM Linux 6.1.102 MicroVM
+    // Split vm-dev surface + border + live AMD-SVM Linux 6.1.102 MicroVM (VT100 cell grid)
     dev_border_transform: fland::TransformId,
     dev_border_content: fland::ContentId,
     dev_transform: fland::TransformId,
     dev_surface: Option<painter::CpuSurface>,
     dev_attached: bool,
-    dev_logs: Vec<String>,
+    dev_vt: vt100::Vt100Screen,
     dev_input: String,
     vm_client: Option<Arc<VmClient>>,
+    extra_vms: HashMap<String, Arc<VmClient>>,
     vm_ready: bool,
+
+    // Compositor-owned unforgeable Origin/URL Bar above Web #2
+    web_bar_transform: fland::TransformId,
+    web_bar_surface: Option<painter::CpuSurface>,
+    web_bar_attached: bool,
+    powerbox_toast: String,
+    ink_strokes: Vec<serde_json::Value>,
 
     // Pure-Hirsel Figments js@1 sandbox Place
     js_client: Option<JsSandboxClient>,
@@ -630,6 +660,17 @@ impl HirselShell {
         let dev_transform = id_gen.next_transform_id();
         flatland.create_transform(&dev_transform)?;
 
+        let web_bar_transform = id_gen.next_transform_id();
+        flatland.create_transform(&web_bar_transform)?;
+
+        let ink_strokes: Vec<serde_json::Value> = std::fs::read_to_string(INK_PATH)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let mut dev_vt = vt100::Vt100Screen::new(56, 18);
+        dev_vt.push_line("[hirsel-shell] Starting Tier-2 Linux 6.1.102 AMD-SVM VT100 MicroVM...");
+
         // Protected Ceremony / SAS dim backdrop + card transforms (always topmost!)
         let dim_transform = id_gen.next_transform_id();
         let dim_content = id_gen.next_content_id();
@@ -668,12 +709,16 @@ impl HirselShell {
             dev_transform,
             dev_surface: None,
             dev_attached: false,
-            dev_logs: vec![
-                "[hirsel-shell] Starting Tier-2 Linux 6.1.102 AMD-SVM MicroVM...".to_string(),
-            ],
+            dev_vt,
             dev_input: String::new(),
             vm_client,
+            extra_vms: HashMap::new(),
             vm_ready: false,
+            web_bar_transform,
+            web_bar_surface: None,
+            web_bar_attached: false,
+            powerbox_toast: String::new(),
+            ink_strokes,
             js_client,
             dim_transform,
             dim_content,
@@ -744,9 +789,15 @@ impl HirselShell {
             if trimmed.is_empty() {
                 continue;
             }
-            self.dev_logs.push(trimmed.chars().take(120).collect());
-            if self.dev_logs.len() > 80 {
-                self.dev_logs.remove(0);
+            self.dev_vt.push_line(trimmed);
+        }
+    }
+
+    fn persist_ink(&self) {
+        use std::io::Write as _;
+        if let Ok(json) = serde_json::to_string(&self.ink_strokes) {
+            if let Ok(mut f) = std::fs::File::create(INK_PATH) {
+                let _ = f.write_all(json.as_bytes()).and_then(|_| f.sync_all());
             }
         }
     }
@@ -921,12 +972,17 @@ impl HirselShell {
             .await?;
             self.flatland.set_content(&self.top_bar_transform, &self.top_bar_surface.content_id)?;
         }
-        self.top_bar_surface.paint_with(|c| painter::paint_top_bar(c, &plan));
+        let toast = self.powerbox_toast.clone();
+        self.top_bar_surface.paint_with(|c| painter::paint_top_bar(c, &plan, &toast));
 
         // Detach dynamic layers cleanly before re-attaching in exact security Z-order
         if self.top_bar_attached {
             let _ = self.flatland.remove_child(&self.root_transform, &self.top_bar_transform);
             self.top_bar_attached = false;
+        }
+        if self.web_bar_attached {
+            let _ = self.flatland.remove_child(&self.root_transform, &self.web_bar_transform);
+            self.web_bar_attached = false;
         }
         if let Some(ref mut fig) = self.figments_web {
             if fig.attached {
@@ -1004,9 +1060,12 @@ impl HirselShell {
                 self.flatland.set_content(&self.dev_transform, &surf.content_id)?;
                 self.dev_surface = Some(surf);
             }
+            let cols = (rw.saturating_sub(24) / 8).max(24) as usize;
+            let rows = (rh.saturating_sub(112) / 14).max(8) as usize;
+            self.dev_vt.resize(cols, rows);
             if let Some(ref surf) = self.dev_surface {
                 surf.paint_with(|c| {
-                    painter::paint_dev_pane(c, &plan, &self.dev_logs, &self.dev_input, self.vm_ready)
+                    painter::paint_dev_pane(c, &plan, &self.dev_vt, &self.dev_input, self.vm_ready)
                 });
             }
             let col = if plan.focused == "vm_dev" {
@@ -1027,17 +1086,43 @@ impl HirselShell {
             self.dev_attached = true;
         }
 
-        // Layer 3: Isolated Untrusted Chromium Viewport #2 (Amber trust border)
+        // Layer 3: Isolated Untrusted Chromium Viewport #2 + 24px Compositor-Owned Origin Bar (Amber border)
         if let (Some(r), Some(web)) = (&plan.layout.web, &mut self.untrusted_web) {
             let col = if plan.focused == "web_untrusted" {
                 rgba_f(0.96, 0.62, 0.04, 1.0)
             } else {
                 rgba_f(0.55, 0.34, 0.05, 1.0)
             };
+            let wb_w = r.w.max(64) as u32;
+            let need_bar = self
+                .web_bar_surface
+                .as_ref()
+                .map(|s| s.width != wb_w)
+                .unwrap_or(true);
+            if need_bar {
+                let cid = self.id_gen.next_content_id();
+                let surf = painter::CpuSurface::new(
+                    "hirsel-web-origin-bar",
+                    wb_w,
+                    WEB_BAR_H,
+                    &self.flatland,
+                    cid,
+                    fland::BlendMode::Src,
+                )
+                .await?;
+                self.flatland.set_content(&self.web_bar_transform, &surf.content_id)?;
+                self.web_bar_surface = Some(surf);
+            }
+            if let Some(ref surf) = self.web_bar_surface {
+                let orig = self.untrusted_origin.clone();
+                let foc = plan.focused == "web_untrusted";
+                surf.paint_with(|c| painter::paint_web_origin_bar(c, &orig, foc));
+            }
+            let inner_h = (r.h as u32).saturating_sub(WEB_BAR_H).max(64);
             self.flatland.set_viewport_properties(
                 &web.viewport_content,
                 &fland::ViewportProperties {
-                    logical_size: Some(fmath::SizeU { width: r.w as u32, height: r.h as u32 }),
+                    logical_size: Some(fmath::SizeU { width: r.w as u32, height: inner_h }),
                     ..Default::default()
                 },
             )?;
@@ -1049,8 +1134,18 @@ impl HirselShell {
                 r,
                 col,
             )?;
+            self.flatland.set_translation(
+                &self.web_bar_transform,
+                &fmath::Vec_ { x: r.x as i32, y: r.y as i32 },
+            )?;
+            self.flatland.set_translation(
+                &web.viewport_transform,
+                &fmath::Vec_ { x: r.x as i32, y: r.y as i32 + WEB_BAR_H as i32 },
+            )?;
             self.flatland.add_child(&self.root_transform, &web.border_transform)?;
+            self.flatland.add_child(&self.root_transform, &self.web_bar_transform)?;
             self.flatland.add_child(&self.root_transform, &web.viewport_transform)?;
+            self.web_bar_attached = true;
             web.attached = true;
         }
 
@@ -1180,6 +1275,106 @@ impl HirselShell {
             }
             ShellMsg::GetBoard { reply } => {
                 let _ = reply.send(self.board.latest.clone());
+            }
+            ShellMsg::GetInk { reply } => {
+                let _ = reply.send(self.ink_strokes.clone());
+            }
+            ShellMsg::AddInk { stroke, reply } => {
+                self.ink_strokes.push(stroke);
+                if self.ink_strokes.len() > 200 {
+                    self.ink_strokes.remove(0);
+                }
+                self.persist_ink();
+                let _ = reply.send(self.ink_strokes.clone());
+            }
+            ShellMsg::ListVms { reply } => {
+                let mut vms = vec![serde_json::json!({
+                    "name": "vm-dev",
+                    "ready": self.vm_ready || self.vm_client.as_ref().map(|v| v.is_ready()).unwrap_or(false),
+                    "disk": "/data/vm-dev.img (64 MiB sparse)",
+                    "net": "zero-/svc virtio-net -> pipe -> FIDL egress_gw.cm"
+                })];
+                for (name, v) in &self.extra_vms {
+                    vms.push(serde_json::json!({
+                        "name": name,
+                        "ready": v.is_ready(),
+                        "disk": format!("/data/{name}.img (64 MiB sparse)"),
+                        "net": "zero-/svc virtio-net -> pipe -> FIDL egress_gw.cm"
+                    }));
+                }
+                let _ = reply.send(serde_json::json!({ "vms": vms }));
+            }
+            ShellMsg::SpawnNamedVm { name, reply } => {
+                let clean: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+                if clean.is_empty() || clean == "vm-dev" || self.extra_vms.contains_key(&clean) {
+                    let _ = reply.send(Ok(serde_json::json!({"ok": true, "name": clean, "already_running": true})));
+                } else {
+                    let (ev_tx, mut ev_rx) = unbounded::<VmEvent>();
+                    let eg = self.egress.clone();
+                    let conn_flag = Arc::clone(&self.agent_conn_flag);
+                    let holder: Arc<Mutex<Option<Arc<VmClient>>>> = Arc::new(Mutex::new(None));
+                    let holder_bg = Arc::clone(&holder);
+                    fasync::Task::local(async move {
+                        while let Some(ev) = ev_rx.next().await {
+                            if let VmEvent::EgressReq { id, raw_http } = ev {
+                                let allowed = conn_flag.load(Ordering::Relaxed);
+                                let eg2 = eg.clone();
+                                let vm_opt = holder_bg.lock().ok().and_then(|g| g.clone());
+                                fasync::Task::local(async move {
+                                    let first = raw_http.lines().next().unwrap_or("");
+                                    let mut parts = first.split_whitespace();
+                                    let method = parts.next().unwrap_or("GET");
+                                    let path = parts.next().unwrap_or("/");
+                                    let body = raw_http.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+                                    let (sl, jb) = if !allowed {
+                                        ("403 Forbidden", r#"{"allowed":false,"reason":"caretaker_connection_revoked"}"#.to_string())
+                                    } else if method == "GET" && path == "/health" {
+                                        match egress_health(&eg2).await {
+                                            Ok(v) => ("200 OK", v.to_string()),
+                                            Err(e) => ("502 Bad Gateway", serde_json::json!({"error": format!("{e:#}")}).to_string()),
+                                        }
+                                    } else if method == "POST" && path == "/proxy" {
+                                        match egress_proxy(&eg2, body).await {
+                                            Ok((200, v)) => ("200 OK", v.to_string()),
+                                            Ok((403, v)) => ("403 Forbidden", v.to_string()),
+                                            Ok((_, v)) => ("502 Bad Gateway", v.to_string()),
+                                            Err(e) => ("502 Bad Gateway", serde_json::json!({"error": format!("{e:#}")}).to_string()),
+                                        }
+                                    } else {
+                                        ("404 Not Found", r#"{"error":"not_found"}"#.to_string())
+                                    };
+                                    let resp = format!("HTTP/1.1 {sl}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{jb}", jb.len());
+                                    if let Some(vm) = vm_opt {
+                                        let _ = vm.send_egress_res(id, resp.as_bytes()).await;
+                                    }
+                                }).detach();
+                            }
+                        }
+                    }).detach();
+                    match VmClient::spawn_named(&clean, ev_tx).await {
+                        Ok(vm) => {
+                            let arc_vm = Arc::new(vm);
+                            if let Ok(mut h) = holder.lock() { *h = Some(Arc::clone(&arc_vm)); }
+                            self.extra_vms.insert(clean.clone(), arc_vm);
+                            let _ = reply.send(Ok(serde_json::json!({"ok": true, "name": clean, "spawned": true})));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+            }
+            ShellMsg::ExecNamedVm { name, cmd, reply } => {
+                let target = if name == "vm-dev" {
+                    self.vm_client.clone()
+                } else {
+                    self.extra_vms.get(&name).cloned()
+                };
+                let res = match target {
+                    Some(vm) => vm.exec(&cmd).await,
+                    None => Err(anyhow::anyhow!("VM `{name}` not found")),
+                };
+                let _ = reply.send(res);
             }
             ShellMsg::BoardOp { payload, reply } => {
                 let op = payload["op"].as_str().unwrap_or("put");
@@ -1418,6 +1613,9 @@ impl HirselShell {
                                     }
                                 } else {
                                     delivered = true;
+                                }
+                                if delivered {
+                                    self.powerbox_toast = format!("PB:{from}->{to} ({delivered_bytes}B)");
                                 }
                             }
                         }
@@ -1945,6 +2143,66 @@ async fn handle_http_conn(
             "text/html; charset=utf-8",
             web_content::FIGMENTS_INDEX_HTML.replace("__HIRSEL_TOKEN__", session_token),
         ),
+        ("GET", "/assets/figments-canvas.js") => {
+            match std::fs::read_to_string("/pkg/data/figments/figments-canvas.js") {
+                Ok(js) => ("200 OK", "application/javascript; charset=utf-8", js),
+                Err(_) => ("404 Not Found", "text/plain", "missing figments-canvas.js".to_string()),
+            }
+        }
+        ("GET", "/assets/themes.css") => {
+            match std::fs::read_to_string("/pkg/data/figments/themes.css") {
+                Ok(css) => ("200 OK", "text/css; charset=utf-8", css),
+                Err(_) => ("404 Not Found", "text/plain", "missing themes.css".to_string()),
+            }
+        }
+        ("GET", "/_hirsel/ink") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetInk { reply: otx });
+            match orx.await {
+                Ok(strokes) => ("200 OK", "application/json", serde_json::json!({"strokes": strokes}).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"strokes":[]}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/ink") => {
+            let stroke = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AddInk { stroke, reply: otx });
+            match orx.await {
+                Ok(strokes) => ("200 OK", "application/json", serde_json::json!({"strokes": strokes}).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"ink"}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/vms") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::ListVms { reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"vms":[]}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/vms") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let op = parsed["op"].as_str().unwrap_or("spawn");
+            let name = parsed["name"].as_str().unwrap_or("vm-test").to_string();
+            if op == "exec" {
+                let cmd = parsed["cmd"].as_str().unwrap_or("hostname && uname -r").to_string();
+                let (otx, orx) = oneshot::channel();
+                let _ = tx.unbounded_send(ShellMsg::ExecNamedVm { name, cmd, reply: otx });
+                match orx.await {
+                    Ok(Ok(r)) => ("200 OK", "application/json", serde_json::json!({"ok": r.exit_code == 0, "exit_code": r.exit_code, "stdout": r.stdout}).to_string()),
+                    Ok(Err(e)) => ("503 Service Unavailable", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                    Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+                }
+            } else {
+                let (otx, orx) = oneshot::channel();
+                let _ = tx.unbounded_send(ShellMsg::SpawnNamedVm { name, reply: otx });
+                match orx.await {
+                    Ok(Ok(v)) => ("200 OK", "application/json", v.to_string()),
+                    Ok(Err(e)) => ("500 Internal Server Error", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                    Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+                }
+            }
+        }
         ("GET", "/untrusted") => {
             ("200 OK", "text/html; charset=utf-8", web_content::UNTRUSTED_WEB_HTML.to_string())
         }

@@ -4,6 +4,7 @@
 //   - Topmost Protected Approval Ceremony / SAS Lockdown card
 
 use crate::font8x16;
+use crate::vt100::Vt100Screen;
 use crate::wm_client::ScenePlan;
 use anyhow::{Context, Result};
 use fidl::endpoints::{Proxy, create_endpoints};
@@ -227,55 +228,6 @@ impl<'a> Canvas<'a> {
         self.fill_rect(x + w.saturating_sub(t), y, t, h, rgba);
     }
 
-    pub fn draw_ansi_text(&mut self, mut x: usize, y: usize, text: &str, default_rgba: [u8; 4]) {
-        let mut color = default_rgba;
-        let bytes = text.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                // Parse ANSI CSI SGR sequence: ESC [ <codes> m
-                i += 2;
-                let start = i;
-                while i < bytes.len() && !(bytes[i] >= b'@' && bytes[i] <= b'~') {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b'm' {
-                    if let Ok(params) = std::str::from_utf8(&bytes[start..i]) {
-                        for code in params.split(';') {
-                            match code {
-                                "" | "0" => color = default_rgba,
-                                "30" => color = [71, 85, 105, 255],
-                                "31" | "91" => color = [248, 113, 113, 255],
-                                "32" | "92" => color = [74, 222, 128, 255],
-                                "33" | "93" => color = [250, 204, 21, 255],
-                                "34" | "94" => color = [96, 165, 250, 255],
-                                "35" | "95" => color = [192, 132, 252, 255],
-                                "36" | "96" => color = [34, 211, 238, 255],
-                                "37" | "97" => color = [248, 250, 252, 255],
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                i += 1;
-                continue;
-            }
-            if x + 8 > self.width {
-                break;
-            }
-            let bits = font8x16::glyph(bytes[i]);
-            for (row, &mask) in bits.iter().enumerate() {
-                for col in 0..8 {
-                    if (mask & (0x80 >> col)) != 0 {
-                        self.put_px(x + col, y + row, color[0], color[1], color[2], color[3]);
-                    }
-                }
-            }
-            x += 8;
-            i += 1;
-        }
-    }
-
     pub fn draw_text(&mut self, mut x: usize, y: usize, text: &str, scale: usize, rgba: [u8; 4]) {
         let step = 8 * scale;
         for byte in text.bytes() {
@@ -311,7 +263,7 @@ fn fmt_dollars(micros: u64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
-pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan) {
+pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan, powerbox_toast: &str) {
     let daylight = plan.room == "daylight";
     let bg = if plan.sas || plan.outbox.status == "staged" {
         [68, 16, 22, 255]
@@ -354,13 +306,19 @@ pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan) {
         x += w + 8;
     }
 
-    // Center focus + room indicator
-    let mode_txt = format!(
-        "FOCUS:{}  ROOM:{}",
-        plan.focused.to_uppercase(),
-        plan.room.to_uppercase()
-    );
-    c.draw_text(x + 8, 14, &mode_txt, 1, fg);
+    // Center focus + room indicator (or active Powerbox consent toast!)
+    if !powerbox_toast.is_empty() && !plan.sas && plan.outbox.status != "staged" {
+        let tw = (powerbox_toast.len() * 8 + 16).min(360);
+        c.fill_rect(x + 4, 7, tw, 22, [6, 95, 70, 255]);
+        c.draw_text(x + 12, 14, powerbox_toast, 1, [236, 253, 245, 255]);
+    } else {
+        let mode_txt = format!(
+            "FOCUS:{}  ROOM:{}",
+            plan.focused.to_uppercase(),
+            plan.room.to_uppercase()
+        );
+        c.draw_text(x + 8, 14, &mode_txt, 1, fg);
+    }
 
     // Right status badges: Bank + Caretaker Conn + Capture
     let bank_txt = format!(
@@ -387,31 +345,63 @@ pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan) {
     c.draw_text(rx, 14, &bank_txt, 1, muted);
 }
 
-pub fn paint_dev_pane(c: &mut Canvas<'_>, plan: &ScenePlan, lines: &[String], input_buf: &str, vm_ready: bool) {
+pub fn paint_web_origin_bar(c: &mut Canvas<'_>, origin: &str, focused: bool) {
+    let bg = if focused { [146, 64, 14, 255] } else { [88, 42, 12, 255] };
+    c.fill_rect(0, 0, c.width, c.height, bg);
+    c.fill_rect(0, c.height.saturating_sub(1), c.width, 1, [245, 158, 11, 255]);
+    let label = format!("ISOLATED WEB #2 (TRUSTED BAR) // {origin}");
+    c.draw_text(10, 8, &label, 1, [254, 243, 199, 255]);
+}
+
+pub fn paint_dev_pane(
+    c: &mut Canvas<'_>,
+    plan: &ScenePlan,
+    vt: &Vt100Screen,
+    input_buf: &str,
+    vm_ready: bool,
+) {
     c.fill_rect(0, 0, c.width, c.height, [10, 17, 24, 255]);
     c.fill_rect(0, 0, c.width, 30, [16, 78, 59, 255]);
     let header = if vm_ready {
-        "VM-DEV // LINUX 6.1.102 AMD-SVM MICROVM (LIVE /dev/hvc0 + /mnt/data)"
+        "VM-DEV // LINUX 6.1.102 AMD-SVM VT100 (64M Fxfs + FIDL virtio-net)"
     } else {
         "VM-DEV // BOOTING LINUX 6.1.102 AMD-SVM MICROVM..."
     };
     c.draw_text(12, 11, header, 1, [236, 253, 245, 255]);
 
     let status = format!(
-        "VM:{} | Powerbox:{} | Outbox:{}",
+        "VM:{} | VT100:{}x{} | Powerbox:{} | Outbox:{}",
         if vm_ready { "READY" } else { "BOOTING" },
+        vt.cols,
+        vt.rows,
         plan.powerbox_transfers,
         plan.outbox.status.to_uppercase()
     );
     c.draw_text(12, 40, &status, 1, [110, 231, 183, 255]);
     c.fill_rect(12, 54, c.width.saturating_sub(24), 1, [30, 64, 55, 255]);
 
-    let mut y = 64usize;
-    let max_lines = (c.height.saturating_sub(114)) / 14;
-    let start = lines.len().saturating_sub(max_lines);
-    for line in &lines[start..] {
-        c.draw_ansi_text(12, y, line, [209, 250, 229, 255]);
-        y += 14;
+    // Render VT100 screen cell grid with per-cell ANSI foreground colors
+    let max_rows = (c.height.saturating_sub(112)) / 14;
+    let draw_rows = vt.rows.min(max_rows);
+    for r in 0..draw_rows {
+        let py = 62 + r * 14;
+        for col in 0..vt.cols {
+            let px = 12 + col * 8;
+            if px + 8 > c.width.saturating_sub(8) {
+                break;
+            }
+            let cell = vt.cells[r * vt.cols + col];
+            if cell.ch != b' ' {
+                let bits = font8x16::glyph(cell.ch);
+                for (gy, &mask) in bits.iter().enumerate() {
+                    for gx in 0..8 {
+                        if (mask & (0x80 >> gx)) != 0 {
+                            c.put_px(px + gx, py + gy, cell.fg[0], cell.fg[1], cell.fg[2], cell.fg[3]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Live interactive prompt line when vm-dev is focused

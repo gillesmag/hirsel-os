@@ -246,12 +246,24 @@ def main() -> int:
         assert "sealed-demo-key-99" not in json.dumps(smeta), smeta
         assert any(x["host"] == "example.com" and x["len"] == 18 for x in smeta.get("secrets", [])), smeta
 
-        print("=== 4. Wait for Native Chromium 160 + Figments HTML-in-Canvas (drawElementImage LIVE) ===")
+        print("=== 4. Wait for Native Chromium 160 + Real Figments Canvas Engine (A* Elbow + Freehand + HTML-in-Canvas) ===")
         time.sleep(6.0)
         _, cdiag = http_req("GET", "/_hirsel/client-diag")
         print("  Chromium 160 client-diag:", cdiag)
         assert cdiag.get("drawElementWorked") is True, f"HTML-in-Canvas drawElementImage did not render live: {cdiag}"
+        assert cdiag.get("figmentsEngineLoaded") is True, f"Real Figments canvas engine bundle did not load: {cdiag}"
         qmp_screendump(f"{OUT}/desktop-1-initial.png")
+
+        # Persist a real freehand ink stroke to Fxfs /data/ink.json via Figments perfect-freehand engine
+        ic, ival = http_req(
+            "POST",
+            "/_hirsel/ink",
+            json.dumps({
+                "color": "#f59e0b",
+                "points": [[48, 255, 0.45], [115, 275, 0.72], [185, 252, 0.65], [250, 272, 0.45]],
+            }),
+        )
+        assert ic == 200 and len(ival.get("strokes", [])) >= 1, (ic, ival)
 
         print("=== 5. Verify Pure-Hirsel hirsel-js + hirsel-board + Linux 6.1.102 vm-dev ===")
         code, js_res = http_req(
@@ -309,6 +321,28 @@ def main() -> int:
         print("  workstation system capabilities:", sysinfo)
         assert sysinfo.get("hardware", {}).get("fxfs_data") is True, sysinfo
         assert len(sysinfo.get("places", [])) == 4, sysinfo
+
+        print("=== 5c. Verify Multi-VM Lifecycle: Spawn & Exec Secondary Named Linux 6.1.102 MicroVM (vm-test) ===")
+        sc_vm, sval_vm = http_req("POST", "/_hirsel/vms", json.dumps({"op": "spawn", "name": "vm-test"}))
+        print("  spawn vm-test:", sval_vm)
+        assert sc_vm == 200 and sval_vm.get("ok") is True, (sc_vm, sval_vm)
+        vm_test_ready = False
+        for _ in range(45):
+            vc, vlist = http_req("GET", "/_hirsel/vms", timeout=2.0)
+            if vc == 200 and any(v.get("name") == "vm-test" and v.get("ready") is True for v in vlist.get("vms", [])):
+                vm_test_ready = True
+                break
+            time.sleep(0.5)
+        assert vm_test_ready, "Secondary Linux 6.1.102 MicroVM vm-test did not reach READY"
+        ec_vm, eval_vm = http_req(
+            "POST",
+            "/_hirsel/vms",
+            json.dumps({"op": "exec", "name": "vm-test", "cmd": "hostname && nproc && uname -r"}),
+            timeout=20.0,
+        )
+        print("  vm-test exec:", eval_vm)
+        assert ec_vm == 200 and eval_vm.get("exit_code") == 0, eval_vm
+        assert "vm-test" in eval_vm.get("stdout", "") and "6.1.102" in eval_vm.get("stdout", ""), eval_vm
 
         print("=== 6. Verify Focus Anti-Spoofing + Compositor Clicks + Multi-Origin Web #2 + Powerbox ===")
         _, st = http_req("POST", "/_hirsel/spoof-focus", "web_untrusted")
@@ -396,6 +430,10 @@ def main() -> int:
         card_ids = [c["id"] for c in brd2.get("cards", [])]
         print("  persisted pure-Hirsel hirsel-board cards:", card_ids)
         assert "js-eval-1" in card_ids and "agent-run-1" in card_ids, brd2
+
+        _, ink2 = http_req("GET", "/_hirsel/ink")
+        print("  persisted Figments freehand ink strokes:", len(ink2.get("strokes", [])))
+        assert len(ink2.get("strokes", [])) >= 1, ink2
 
         # Verify isolated egress_gw.cm sealed secret persisted across cold reboot!
         for _ in range(15):

@@ -96,6 +96,10 @@ pub struct VmClient {
 
 impl VmClient {
     pub async fn spawn(on_event: UnboundedSender<VmEvent>) -> Result<Self> {
+        Self::spawn_named("vm-dev", on_event).await
+    }
+
+    pub async fn spawn_named(name: &str, on_event: UnboundedSender<VmEvent>) -> Result<Self> {
         let hyp_proxy = connect_to_protocol::<fkernel::HypervisorResourceMarker>()
             .context("connect fuchsia.kernel.HypervisorResource")?;
         let hyp_res = hyp_proxy.get().await.context("HypervisorResource.get()")?;
@@ -158,11 +162,12 @@ impl VmClient {
             ));
         }
 
+        let cname = std::ffi::CString::new(name).unwrap_or_else(|_| std::ffi::CString::new("vm-dev").unwrap());
         let process = fdio::spawn_etc(
             &job,
             fdio::SpawnOptions::DEFAULT_LOADER,
             c"/pkg/bin/hirsel-vm-host",
-            &[c"hirsel-vm-host"],
+            &[c"hirsel-vm-host", cname.as_c_str()],
             None,
             &mut actions,
         )
