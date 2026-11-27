@@ -11,9 +11,9 @@
 //   - Named-connection revocation, unified Bank ($/steps), and Effect Outbox
 //   - Per-domain private clipboards & explicit powerbox cross-domain transfer
 
-pub const TOP_BAR_H: u64 = 36u64
-pub const BORDER_PX: u64 = 3u64
-pub const GAP_PX: u64 = 6u64
+pub const TOP_BAR_H: u64 = 44u64
+pub const BORDER_PX: u64 = 2u64
+pub const GAP_PX: u64 = 10u64
 
 pub type Domain: key = Figments | VmDev | WebUntrusted | TrustedChrome
 
@@ -286,7 +286,7 @@ pub fn compute_layout(s: WmState) -> Layout {
 
     let ceremony_rect: Option[Rect] = if input_locked_to_trusted(s) {
         let cw = order.min(560u64, work_w - 40u64)
-        let ch = order.min(300u64, work_h - 40u64)
+        let ch = order.min(316u64, work_h - 40u64)
         let cx = (s.width - cw) / 2u64
         let cy = work_y + (work_h - ch) / 2u64
         Some(Rect(x: cx, y: cy, w: cw, h: ch))

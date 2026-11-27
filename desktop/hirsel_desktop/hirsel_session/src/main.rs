@@ -7,9 +7,9 @@
 
 mod agent_client;
 mod board_client;
-mod font8x16;
 mod js_client;
 mod painter;
+mod ui_fonts;
 mod vm_client;
 mod vt100;
 mod web_content;
@@ -44,12 +44,43 @@ use std::sync::{Arc, Mutex};
 use vm_client::{VmClient, VmEvent, VmExecResult};
 use wm_client::{RectJson, ScenePlan, WmClient};
 
-const TOP_BAR_H: u32 = 36;
-const WEB_BAR_H: u32 = 24;
-const BORDER_PX: i32 = 3;
+const TOP_BAR_H: u32 = 44;
+const WEB_BAR_H: u32 = 28;
+const BORDER_PX: i32 = 2;
 const STATE_PATH: &str = "/data/hirsel_state.json";
 const INK_PATH: &str = "/data/ink.json";
+const SETTINGS_PATH: &str = "/data/settings.json";
 const SAS_HOSTS: &[&str] = &["api.anthropic.com", "api.openai.com", "api.github.com", "example.com"];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkstationSettings {
+    wifi_enabled: bool,
+    wifi_ssid: String,
+    wifi_security: String,
+    wifi_saved: Vec<String>,
+    wifi_passphrase_len: usize,
+    net_mode: String,
+    dns_primary: String,
+    dns_secondary: String,
+    #[serde(skip)]
+    settings_open_seq: u64,
+}
+
+impl Default for WorkstationSettings {
+    fn default() -> Self {
+        Self {
+            wifi_enabled: true,
+            wifi_ssid: String::new(),
+            wifi_security: "WPA3-SAE".to_string(),
+            wifi_saved: Vec::new(),
+            wifi_passphrase_len: 0,
+            net_mode: "dhcp".to_string(),
+            dns_primary: "1.1.1.1".to_string(),
+            dns_secondary: "9.9.9.9".to_string(),
+            settings_open_seq: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HttpRole {
@@ -61,6 +92,8 @@ enum HttpRole {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
     room: String,
+    #[serde(default)]
+    theme: String,
     audit_log: Vec<String>,
 }
 
@@ -132,6 +165,21 @@ enum ShellMsg {
         stroke: serde_json::Value,
         reply: oneshot::Sender<Vec<serde_json::Value>>,
     },
+    GetTheme {
+        reply: oneshot::Sender<String>,
+    },
+    SetTheme {
+        theme: String,
+        reply: oneshot::Sender<String>,
+    },
+    GetSettings {
+        reply: oneshot::Sender<WorkstationSettings>,
+    },
+    UpdateSettings {
+        payload: serde_json::Value,
+        reply: oneshot::Sender<WorkstationSettings>,
+    },
+    ToggleSettingsUi,
     ListVms {
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -254,6 +302,8 @@ struct HirselShell {
     web_bar_attached: bool,
     powerbox_toast: String,
     ink_strokes: Vec<serde_json::Value>,
+    active_theme: String,
+    settings: WorkstationSettings,
 
     // Pure-Hirsel Figments js@1 sandbox Place
     js_client: Option<JsSandboxClient>,
@@ -424,14 +474,22 @@ impl HirselShell {
             }
         };
 
-        // Restore persisted Fxfs /data/hirsel_state.json (room + audit log) if present
+        // Restore persisted Fxfs /data/hirsel_state.json (room + 6-room theme + audit log) if present
         let mut audit_log = Vec::new();
+        let mut active_theme = "darkroom".to_string();
         if let Ok(raw) = std::fs::read_to_string(STATE_PATH) {
             if let Ok(persisted) = serde_json::from_str::<PersistedState>(&raw) {
-                info!("Restored persisted state from {STATE_PATH}: room={}", persisted.room);
+                info!("Restored persisted state from {STATE_PATH}: room={} theme={}", persisted.room, persisted.theme);
                 if persisted.room == "daylight" {
                     let _ = wm.send("TOGGLE_ROOM").await;
                 }
+                active_theme = if !persisted.theme.is_empty() {
+                    persisted.theme
+                } else if persisted.room == "daylight" {
+                    "paper".to_string()
+                } else {
+                    "darkroom".to_string()
+                };
                 audit_log = persisted.audit_log;
             }
         }
@@ -719,6 +777,11 @@ impl HirselShell {
             web_bar_attached: false,
             powerbox_toast: String::new(),
             ink_strokes,
+            active_theme,
+            settings: std::fs::read_to_string(SETTINGS_PATH)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<WorkstationSettings>(&raw).ok())
+                .unwrap_or_default(),
             js_client,
             dim_transform,
             dim_content,
@@ -761,6 +824,7 @@ impl HirselShell {
         use std::io::Write as _;
         let st = PersistedState {
             room: self.wm.latest.room.clone(),
+            theme: self.active_theme.clone(),
             audit_log: self.audit_log.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&st) {
@@ -797,6 +861,15 @@ impl HirselShell {
         use std::io::Write as _;
         if let Ok(json) = serde_json::to_string(&self.ink_strokes) {
             if let Ok(mut f) = std::fs::File::create(INK_PATH) {
+                let _ = f.write_all(json.as_bytes()).and_then(|_| f.sync_all());
+            }
+        }
+    }
+
+    fn persist_settings(&self) {
+        use std::io::Write as _;
+        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
+            if let Ok(mut f) = std::fs::File::create(SETTINGS_PATH) {
                 let _ = f.write_all(json.as_bytes()).and_then(|_| f.sync_all());
             }
         }
@@ -950,12 +1023,10 @@ impl HirselShell {
             }
         }
 
-        // Background color by room
-        let bg_col = if plan.room == "daylight" {
-            rgba_f(0.92, 0.94, 0.97, 1.0)
-        } else {
-            rgba_f(0.04, 0.06, 0.10, 1.0)
-        };
+        // Whole-OS 6-room palette (synced between Flatland compositor, vm-dev, and Figments!)
+        let theme = self.active_theme.clone();
+        let pal = painter::palette_for(&theme);
+        let bg_col = painter::rgba_to_f(pal.ground);
         self.flatland.set_solid_fill(&self.bg_content, &bg_col, &fmath::SizeU { width: sw, height: sh })?;
 
         // Re-create top bar surface if screen width changed
@@ -973,7 +1044,7 @@ impl HirselShell {
             self.flatland.set_content(&self.top_bar_transform, &self.top_bar_surface.content_id)?;
         }
         let toast = self.powerbox_toast.clone();
-        self.top_bar_surface.paint_with(|c| painter::paint_top_bar(c, &plan, &toast));
+        self.top_bar_surface.paint_with(|c| painter::paint_top_bar(c, &plan, &theme, &toast));
 
         // Detach dynamic layers cleanly before re-attaching in exact security Z-order
         if self.top_bar_attached {
@@ -1009,13 +1080,13 @@ impl HirselShell {
             self.ceremony_attached = false;
         }
 
-        // Layer 1: Figments Chromium Viewport #1 (Cobalt trust border)
+        // Layer 1: Figments Chromium Viewport #1 (quiet stone hairline unfocused, room accent focused)
         if let Some(ref mut fig) = self.figments_web {
             let r = &plan.layout.figments;
             let col = if plan.focused == "figments" {
-                rgba_f(0.23, 0.51, 0.96, 1.0)
+                painter::rgba_to_f(pal.cobalt)
             } else {
-                rgba_f(0.14, 0.25, 0.45, 1.0)
+                painter::rgba_to_f(pal.line_strong)
             };
             self.flatland.set_viewport_properties(
                 &fig.viewport_content,
@@ -1060,18 +1131,18 @@ impl HirselShell {
                 self.flatland.set_content(&self.dev_transform, &surf.content_id)?;
                 self.dev_surface = Some(surf);
             }
-            let cols = (rw.saturating_sub(24) / 8).max(24) as usize;
-            let rows = (rh.saturating_sub(112) / 14).max(8) as usize;
+            let cols = (rw.saturating_sub(32) / 8).max(24) as usize;
+            let rows = (rh.saturating_sub(84) / 15).max(8) as usize;
             self.dev_vt.resize(cols, rows);
             if let Some(ref surf) = self.dev_surface {
                 surf.paint_with(|c| {
-                    painter::paint_dev_pane(c, &plan, &self.dev_vt, &self.dev_input, self.vm_ready)
+                    painter::paint_dev_pane(c, &plan, &theme, &self.dev_vt, &self.dev_input, self.vm_ready)
                 });
             }
             let col = if plan.focused == "vm_dev" {
-                rgba_f(0.06, 0.72, 0.51, 1.0)
+                painter::rgba_to_f(pal.sap)
             } else {
-                rgba_f(0.06, 0.36, 0.27, 1.0)
+                painter::rgba_to_f(pal.line_strong)
             };
             Self::place_border_and_inner(
                 &self.flatland,
@@ -1086,12 +1157,12 @@ impl HirselShell {
             self.dev_attached = true;
         }
 
-        // Layer 3: Isolated Untrusted Chromium Viewport #2 + 24px Compositor-Owned Origin Bar (Amber border)
+        // Layer 3: Isolated Untrusted Chromium Viewport #2 + 28px Compositor-Owned Origin Bar (Ochre accent)
         if let (Some(r), Some(web)) = (&plan.layout.web, &mut self.untrusted_web) {
             let col = if plan.focused == "web_untrusted" {
-                rgba_f(0.96, 0.62, 0.04, 1.0)
+                painter::rgba_to_f(pal.ochre)
             } else {
-                rgba_f(0.55, 0.34, 0.05, 1.0)
+                painter::rgba_to_f(pal.line_strong)
             };
             let wb_w = r.w.max(64) as u32;
             let need_bar = self
@@ -1116,7 +1187,7 @@ impl HirselShell {
             if let Some(ref surf) = self.web_bar_surface {
                 let orig = self.untrusted_origin.clone();
                 let foc = plan.focused == "web_untrusted";
-                surf.paint_with(|c| painter::paint_web_origin_bar(c, &orig, foc));
+                surf.paint_with(|c| painter::paint_web_origin_bar(c, &theme, &orig, foc));
             }
             let inner_h = (r.h as u32).saturating_sub(WEB_BAR_H).max(64);
             self.flatland.set_viewport_properties(
@@ -1153,7 +1224,7 @@ impl HirselShell {
         self.flatland.add_child(&self.root_transform, &self.top_bar_transform)?;
         self.top_bar_attached = true;
 
-        // Layer 5 (TOPMOST): Protected Approval Ceremony / SAS Lockdown overlay
+        // Layer 5 (TOPMOST): Protected Approval Ceremony / SAS Lockdown overlay (rounded SrcOver card!)
         if let Some(ref cr) = plan.layout.ceremony {
             let cw = cr.w.max(240) as u32;
             let ch = cr.h.max(160) as u32;
@@ -1170,7 +1241,7 @@ impl HirselShell {
                     ch,
                     &self.flatland,
                     cid,
-                    fland::BlendMode::Src,
+                    fland::BlendMode::SrcOver,
                 )
                 .await?;
                 self.flatland.set_content(&self.ceremony_transform, &surf.content_id)?;
@@ -1184,7 +1255,7 @@ impl HirselShell {
             }
             self.flatland.set_solid_fill(
                 &self.dim_content,
-                &rgba_f(0.02, 0.02, 0.05, 0.65),
+                &rgba_f(0.04, 0.03, 0.02, 0.58),
                 &fmath::SizeU { width: sw, height: sh.saturating_sub(TOP_BAR_H) },
             )?;
             self.flatland
@@ -1255,9 +1326,17 @@ impl HirselShell {
     async fn handle(&mut self, msg: ShellMsg) {
         match msg {
             ShellMsg::WmCommand { cmd, reply } => {
+                let is_toggle_room = cmd.trim() == "TOGGLE_ROOM";
                 let res = self.wm.send(&cmd).await;
                 if let Ok(ref st) = res {
                     self.agent_conn_flag.store(st.agent_conn, Ordering::Relaxed);
+                    if is_toggle_room {
+                        self.active_theme = if st.room == "daylight" {
+                            "paper".to_string()
+                        } else {
+                            "darkroom".to_string()
+                        };
+                    }
                     self.persist_state();
                     if let Err(e) = self.apply_scene().await {
                         error!("apply_scene error: {e:?}");
@@ -1266,6 +1345,73 @@ impl HirselShell {
                 if let Some(tx) = reply {
                     let _ = tx.send(res);
                 }
+            }
+            ShellMsg::GetTheme { reply } => {
+                let _ = reply.send(self.active_theme.clone());
+            }
+            ShellMsg::SetTheme { theme, reply } => {
+                let valid = matches!(
+                    theme.as_str(),
+                    "darkroom" | "paper" | "folio" | "gallery" | "blueprint" | "conservatory"
+                );
+                if valid {
+                    self.active_theme = theme;
+                    let want_daylight = matches!(self.active_theme.as_str(), "paper" | "folio" | "gallery");
+                    if (want_daylight && self.wm.latest.room != "daylight")
+                        || (!want_daylight && self.wm.latest.room == "daylight")
+                    {
+                        let _ = self.wm.send("TOGGLE_ROOM").await;
+                    }
+                    self.persist_state();
+                    let _ = self.apply_scene().await;
+                }
+                let _ = reply.send(self.active_theme.clone());
+            }
+            ShellMsg::GetSettings { reply } => {
+                let _ = reply.send(self.settings.clone());
+            }
+            ShellMsg::UpdateSettings { payload, reply } => {
+                if let Some(v) = payload["wifi_enabled"].as_bool() {
+                    self.settings.wifi_enabled = v;
+                }
+                if let Some(ssid) = payload["wifi_ssid"].as_str() {
+                    let clean = ssid.trim().to_string();
+                    self.settings.wifi_ssid = clean.clone();
+                    if !clean.is_empty() && !self.settings.wifi_saved.contains(&clean) {
+                        self.settings.wifi_saved.push(clean);
+                    }
+                }
+                if let Some(sec) = payload["wifi_security"].as_str() {
+                    if matches!(sec, "WPA3-SAE" | "WPA2-PSK" | "Open") {
+                        self.settings.wifi_security = sec.to_string();
+                    }
+                }
+                if let Some(pass) = payload["wifi_passphrase"].as_str() {
+                    if !pass.is_empty() {
+                        // Store length metadata ONLY (write-only; never echo or persist plaintext!)
+                        self.settings.wifi_passphrase_len = pass.len();
+                    }
+                }
+                if let Some(mode) = payload["net_mode"].as_str() {
+                    if matches!(mode, "dhcp" | "static") {
+                        self.settings.net_mode = mode.to_string();
+                    }
+                }
+                if let Some(d1) = payload["dns_primary"].as_str() {
+                    if !d1.trim().is_empty() {
+                        self.settings.dns_primary = d1.trim().to_string();
+                    }
+                }
+                if let Some(d2) = payload["dns_secondary"].as_str() {
+                    if !d2.trim().is_empty() {
+                        self.settings.dns_secondary = d2.trim().to_string();
+                    }
+                }
+                self.persist_settings();
+                let _ = reply.send(self.settings.clone());
+            }
+            ShellMsg::ToggleSettingsUi => {
+                self.settings.settings_open_seq = self.settings.settings_open_seq.wrapping_add(1);
             }
             ShellMsg::GetState { reply } => {
                 let _ = reply.send(self.wm.latest.clone());
@@ -1615,7 +1761,7 @@ impl HirselShell {
                                     delivered = true;
                                 }
                                 if delivered {
-                                    self.powerbox_toast = format!("PB:{from}->{to} ({delivered_bytes}B)");
+                                    self.powerbox_toast = format!("{from} -> {to} ({delivered_bytes}B)");
                                 }
                             }
                         }
@@ -1743,24 +1889,26 @@ impl HirselShell {
                     }
                     return;
                 }
-                // 2. Top Trust Bar pill clicks (y < 36)
+                // 2. Floating Top Bar capsule pill clicks (y < TOP_BAR_H)
                 if y < TOP_BAR_H as f32 {
-                    if x >= 128.0 && x < 232.0 {
+                    if x >= 92.0 && x < 198.0 {
                         let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
                             cmd: "FOCUS figments".into(),
                             reply: None,
                         });
-                    } else if x >= 232.0 && x < 330.0 {
+                    } else if x >= 198.0 && x < 290.0 {
                         let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
                             cmd: "TOGGLE_DEV".into(),
                             reply: None,
                         });
-                    } else if x >= 330.0 && x < 410.0 {
+                    } else if x >= 290.0 && x < 378.0 {
                         let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
                             cmd: "TOGGLE_WEB".into(),
                             reply: None,
                         });
-                    } else if x >= (plan.w as f32) - 210.0 && x <= (plan.w as f32) - 90.0 {
+                    } else if x >= (plan.w as f32) - 62.0 {
+                        let _ = self.tx.unbounded_send(ShellMsg::ToggleSettingsUi);
+                    } else if x >= (plan.w as f32) - 180.0 && x < (plan.w as f32) - 62.0 {
                         let cmd = if plan.agent_conn { "REVOKE" } else { "RESTORE" };
                         let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
                             cmd: cmd.into(),
@@ -2070,6 +2218,36 @@ async fn handle_http_conn(
     let raw_body = req.split("\r\n\r\n").nth(1).unwrap_or("");
     let body = raw_body.trim();
 
+    // Read-only self-hosted font serving (Host Grotesk + Fragment Mono WOFF2) for both :7711 and :7712
+    if method == "GET" && path.starts_with("/assets/fonts/") {
+        let fname = &path["/assets/fonts/".len()..];
+        let safe = matches!(
+            fname,
+            "fonts.css"
+                | "host-grotesk-latin.woff2"
+                | "host-grotesk-latin-ext.woff2"
+                | "fragment-mono-latin.woff2"
+        );
+        if safe {
+            let fpath = format!("/pkg/data/figments/fonts/{fname}");
+            if let Ok(bytes) = std::fs::read(&fpath) {
+                let ctype = if fname.ends_with(".css") {
+                    "text/css; charset=utf-8"
+                } else {
+                    "font/woff2"
+                };
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(hdr.as_bytes()).await?;
+                stream.write_all(&bytes).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+        }
+    }
+
     // Isolated Untrusted Web Server (:7712): ZERO privileged /_hirsel/* routes!
     if role == HttpRole::UntrustedWeb {
         let (status, content_type, payload) = match (method, path) {
@@ -2134,6 +2312,92 @@ async fn handle_http_conn(
     }
 
     let (status, content_type, payload): (&str, &str, String) = match (method, path) {
+        ("GET", "/_hirsel/settings") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetSettings { reply: otx });
+            match orx.await {
+                Ok(st) => (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({
+                        "wifi_enabled": st.wifi_enabled,
+                        "wifi_ssid": st.wifi_ssid,
+                        "wifi_security": st.wifi_security,
+                        "wifi_saved": st.wifi_saved,
+                        "wifi_passphrase_len": st.wifi_passphrase_len,
+                        "net_mode": st.net_mode,
+                        "dns_primary": st.dns_primary,
+                        "dns_secondary": st.dns_secondary,
+                        "settings_open_seq": st.settings_open_seq,
+                    })
+                    .to_string(),
+                ),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"settings"}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/settings") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::UpdateSettings { payload: parsed, reply: otx });
+            match orx.await {
+                Ok(st) => (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({
+                        "ok": true,
+                        "wifi_enabled": st.wifi_enabled,
+                        "wifi_ssid": st.wifi_ssid,
+                        "wifi_security": st.wifi_security,
+                        "wifi_saved": st.wifi_saved,
+                        "wifi_passphrase_len": st.wifi_passphrase_len,
+                        "net_mode": st.net_mode,
+                        "dns_primary": st.dns_primary,
+                        "dns_secondary": st.dns_secondary,
+                    })
+                    .to_string(),
+                ),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"settings"}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/network") => {
+            let eg = egress_health(&egress).await.ok();
+            let tls_roots = eg.as_ref().and_then(|v| v["tls_roots"].as_u64()).unwrap_or(99);
+            let wlan_present = std::path::Path::new("/svc/fuchsia.wlan.policy.ClientProvider").exists();
+            (
+                "200 OK",
+                "application/json",
+                serde_json::json!({
+                    "ethernet": "virtio-net · up",
+                    "vm_subnet": "10.0.3.2/24 -> FIDL",
+                    "tls_roots": tls_roots,
+                    "wlan_hardware": wlan_present,
+                    "wlan_note": if wlan_present {
+                        "WLAN hardware detected · ready to connect."
+                    } else {
+                        "QEMU virtio-net active · Wi-Fi config persisted on Fxfs for bare-metal WLAN."
+                    }
+                })
+                .to_string(),
+            )
+        }
+        ("GET", "/_hirsel/theme") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetTheme { reply: otx });
+            match orx.await {
+                Ok(theme) => ("200 OK", "application/json", serde_json::json!({ "theme": theme }).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"theme":"darkroom"}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/theme") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let theme = parsed["theme"].as_str().unwrap_or("darkroom").to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::SetTheme { theme, reply: otx });
+            match orx.await {
+                Ok(t) => ("200 OK", "application/json", serde_json::json!({ "theme": t }).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"theme"}"#.into()),
+            }
+        }
         ("GET", "/_hirsel/diag") => {
             let log_lines = diag.lock().map(|g| g.clone()).unwrap_or_default();
             ("200 OK", "application/json", serde_json::json!({ "diag": log_lines }).to_string())

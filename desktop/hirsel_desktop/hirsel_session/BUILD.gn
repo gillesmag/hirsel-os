@@ -66,6 +66,26 @@ resource("figments_themes_css") {
   outputs = [ "data/figments/themes.css" ]
 }
 
+resource("figments_fonts_css") {
+  sources = [ "assets/fonts/fonts.css" ]
+  outputs = [ "data/figments/fonts/fonts.css" ]
+}
+
+resource("figments_font_grotesk_latin") {
+  sources = [ "assets/fonts/host-grotesk-latin.woff2" ]
+  outputs = [ "data/figments/fonts/host-grotesk-latin.woff2" ]
+}
+
+resource("figments_font_grotesk_ext") {
+  sources = [ "assets/fonts/host-grotesk-latin-ext.woff2" ]
+  outputs = [ "data/figments/fonts/host-grotesk-latin-ext.woff2" ]
+}
+
+resource("figments_font_mono") {
+  sources = [ "assets/fonts/fragment-mono-latin.woff2" ]
+  outputs = [ "data/figments/fonts/fragment-mono-latin.woff2" ]
+}
+
 rustc_binary("egress_gw_bin") {
   output_name = "egress_gw"
   edition = "2024"
@@ -92,10 +112,10 @@ rustc_binary("hirsel_shell_bin") {
   sources = [
     "src/agent_client.rs",
     "src/board_client.rs",
-    "src/font8x16.rs",
     "src/js_client.rs",
     "src/main.rs",
     "src/painter.rs",
+    "src/ui_fonts.rs",
     "src/vm_client.rs",
     "src/vt100.rs",
     "src/web_content.rs",
@@ -159,6 +179,10 @@ fuchsia_component("hirsel_shell_component") {
   cm_label = ":hirsel_shell_manifest"
   deps = [
     ":figments_canvas_js",
+    ":figments_font_grotesk_ext",
+    ":figments_font_grotesk_latin",
+    ":figments_font_mono",
+    ":figments_fonts_css",
     ":figments_themes_css",
     ":hirsel_agent_bin",
     ":hirsel_board_bin",

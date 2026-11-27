@@ -246,13 +246,39 @@ def main() -> int:
         assert "sealed-demo-key-99" not in json.dumps(smeta), smeta
         assert any(x["host"] == "example.com" and x["len"] == 18 for x in smeta.get("secrets", [])), smeta
 
-        print("=== 4. Wait for Native Chromium 160 + Real Figments Canvas Engine (A* Elbow + Freehand + HTML-in-Canvas) ===")
+        print("=== 4. Wait for Native Chromium 160 + Real Figments Canvas Engine (Host Grotesk + Fragment Mono + HTML-in-Canvas) ===")
         time.sleep(6.0)
         _, cdiag = http_req("GET", "/_hirsel/client-diag")
         print("  Chromium 160 client-diag:", cdiag)
         assert cdiag.get("drawElementWorked") is True, f"HTML-in-Canvas drawElementImage did not render live: {cdiag}"
         assert cdiag.get("figmentsEngineLoaded") is True, f"Real Figments canvas engine bundle did not load: {cdiag}"
+        assert cdiag.get("hostGroteskLoaded") is True, f"Host Grotesk font did not load in Chromium: {cdiag}"
+        assert cdiag.get("fragmentMonoLoaded") is True, f"Fragment Mono font did not load in Chromium: {cdiag}"
         qmp_screendump(f"{OUT}/desktop-1-initial.png")
+
+        # Verify Top-Right Settings panel + Wi-Fi / Network config persistence on Fxfs (write-only passphrase!)
+        sc_set, sval_set = http_req(
+            "POST",
+            "/_hirsel/settings",
+            json.dumps({
+                "wifi_enabled": True,
+                "wifi_ssid": "Studio-5G",
+                "wifi_security": "WPA3-SAE",
+                "wifi_passphrase": "super-secret-wifi-key",
+                "net_mode": "dhcp",
+                "dns_primary": "1.1.1.1",
+                "dns_secondary": "9.9.9.9",
+            }),
+        )
+        print("  saved network/wifi settings:", sval_set)
+        assert sc_set == 200 and sval_set.get("wifi_ssid") == "Studio-5G" and sval_set.get("wifi_passphrase_len") == 21, sval_set
+        assert "super-secret-wifi-key" not in json.dumps(sval_set), sval_set
+        # Open Top-Right Settings panel via Top Bar `sys` pill click, capture screenshot, then close
+        http_req("POST", "/_hirsel/click", json.dumps({"x": 1246, "y": 20}))
+        time.sleep(1.5)
+        qmp_screendump(f"{OUT}/desktop-settings.png")
+        http_req("POST", "/_hirsel/click", json.dumps({"x": 1246, "y": 20}))
+        time.sleep(1.2)
 
         # Persist a real freehand ink stroke to Fxfs /data/ink.json via Figments perfect-freehand engine
         ic, ival = http_req(
@@ -422,6 +448,12 @@ def main() -> int:
     try:
         st2 = wait_for_desktop(proc2, "BOOT2")
         assert st2["room"] == "daylight", f"Expected persisted room=daylight after reboot, got {st2}"
+        _, th2 = http_req("GET", "/_hirsel/theme")
+        print("  persisted whole-OS Figments theme:", th2)
+        assert th2.get("theme") == "paper", th2
+        _, set2 = http_req("GET", "/_hirsel/settings")
+        print("  persisted network/wifi settings after cold reboot:", set2)
+        assert set2.get("wifi_ssid") == "Studio-5G" and "Studio-5G" in set2.get("wifi_saved", []), set2
         _, aud = http_req("GET", "/_hirsel/audit")
         print("  persisted audit log:", aud)
         assert any("egress_gw.cm" in e and "HTTP 200" in e for e in aud.get("audit", [])), aud
@@ -452,7 +484,12 @@ def main() -> int:
         assert "POWERBOX_SECRET_42_FROM_FIGMENTS" in pchk.get("stdout", "")
         assert "TYPED_INTERACTIVELY" in pchk.get("stdout", "")
 
-        time.sleep(4.0)
+        for _ in range(20):
+            _, cd2 = http_req("GET", "/_hirsel/client-diag")
+            if cd2 and cd2.get("drawElementWorked") is True:
+                break
+            time.sleep(0.5)
+        time.sleep(1.5)
         qmp_screendump(f"{OUT}/desktop-4-reboot-daylight.png")
         print("\n=== ALL MILESTONE 1-5 + MULTI-ORIGIN + ANSI E2E & PERSISTENCE CHECKS PASSED! ===")
         return 0

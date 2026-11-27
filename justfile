@@ -1098,8 +1098,14 @@ bundle-figments figments_dir="/workspace/figments-hirsel":
     npx --yes esbuild "$TMP_ENTRY" --bundle --minify --format=iife --global-name=FigmentsCanvas \
       --outfile="$ASSETS/figments-canvas.js"
     cp "{{figments_dir}}/shell/themes.css" "$ASSETS/themes.css"
-    cp "$ASSETS/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
-    ls -lh "$ASSETS/"
+    mkdir -p "$ASSETS/fonts" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/fonts"
+    cp "{{figments_dir}}/shell/fonts/fonts.css" \
+       "{{figments_dir}}/shell/fonts/host-grotesk-latin.woff2" \
+       "{{figments_dir}}/shell/fonts/host-grotesk-latin-ext.woff2" \
+       "{{figments_dir}}/shell/fonts/fragment-mono-latin.woff2" \
+       "$ASSETS/fonts/"
+    cp -r "$ASSETS/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
+    ls -lh "$ASSETS/" "$ASSETS/fonts/"
 
 # Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + real Figments canvas + hirsel-wm + hirsel-js + Linux 6.1.102 vm-dev)
 build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ssh-initrd
@@ -1115,7 +1121,7 @@ build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ss
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/fidl/"*.fidl "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
-    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
+    cp -r "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
     cp "{{out_dir}}/linux/vmlinux.stripped" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/vmlinux.stripped"
     cp "{{out_dir}}/linux/initramfs-ssh.cpio" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/initramfs-ssh.cpio"

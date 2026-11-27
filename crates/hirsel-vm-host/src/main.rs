@@ -101,18 +101,32 @@ mod fuchsia_impl {
                 let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 3, 1)), 24));
             });
 
+            struct ConnSlot {
+                handle: smoltcp::iface::SocketHandle,
+                in_flight_id: Option<u64>,
+                req_buf: Vec<u8>,
+                resp_buf: Vec<u8>,
+                resp_ready: bool,
+            }
+
             let mut sockets = SocketSet::new(vec![]);
-            let tcp_rx = TcpSocketBuffer::new(vec![0u8; 16384]);
-            let tcp_tx = TcpSocketBuffer::new(vec![0u8; 16384]);
-            let mut sock = TcpSocket::new(tcp_rx, tcp_tx);
-            let _ = sock.listen(7781);
-            let handle = sockets.add(sock);
+            let mut slots = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let tcp_rx = TcpSocketBuffer::new(vec![0u8; 16384]);
+                let tcp_tx = TcpSocketBuffer::new(vec![0u8; 16384]);
+                let mut sock = TcpSocket::new(tcp_rx, tcp_tx);
+                let _ = sock.listen(7781);
+                let handle = sockets.add(sock);
+                slots.push(ConnSlot {
+                    handle,
+                    in_flight_id: None,
+                    req_buf: Vec::new(),
+                    resp_buf: Vec::new(),
+                    resp_ready: false,
+                });
+            }
 
             let mut next_req_id = 1u64;
-            let mut in_flight_id: Option<u64> = None;
-            let mut req_buf = Vec::<u8>::new();
-            let mut resp_buf = Vec::<u8>::new();
-            let mut resp_ready = false;
             let mut tmp = [0u8; 4096];
 
             while !ctrl.is_stop_requested() {
@@ -123,54 +137,56 @@ mod fuchsia_impl {
                 }
                 iface.poll(now_ms(), &mut dev, &mut sockets);
 
-                let sock = sockets.get_mut::<TcpSocket>(handle);
-                if sock.is_active() {
-                    if in_flight_id.is_none() && !resp_ready && sock.can_recv() {
-                        if let Ok(n) = sock.recv_slice(&mut tmp) {
-                            if n > 0 {
-                                req_buf.extend_from_slice(&tmp[..n]);
+                for slot in &mut slots {
+                    let sock = sockets.get_mut::<TcpSocket>(slot.handle);
+                    if sock.is_active() {
+                        if slot.in_flight_id.is_none() && !slot.resp_ready && sock.can_recv() {
+                            if let Ok(n) = sock.recv_slice(&mut tmp) {
+                                if n > 0 {
+                                    slot.req_buf.extend_from_slice(&tmp[..n]);
+                                    did_work = true;
+                                }
+                            }
+                            if http_request_complete(&slot.req_buf) {
+                                let id = next_req_id;
+                                next_req_id += 1;
+                                let b64 = b64_encode(&slot.req_buf);
+                                slot.req_buf.clear();
+                                emit_line(&out, &format!("EGRESS_REQ {id} {b64}"));
+                                slot.in_flight_id = Some(id);
                                 did_work = true;
                             }
                         }
-                        if http_request_complete(&req_buf) {
-                            let id = next_req_id;
-                            next_req_id += 1;
-                            let b64 = b64_encode(&req_buf);
-                            req_buf.clear();
-                            emit_line(&out, &format!("EGRESS_REQ {id} {b64}"));
-                            in_flight_id = Some(id);
-                            did_work = true;
-                        }
-                    }
-                    if let Some(id) = in_flight_id {
-                        if let Ok(mut map) = egress_replies.lock() {
-                            if let Some(bytes) = map.remove(&id) {
-                                resp_buf = bytes;
-                                resp_ready = true;
-                                in_flight_id = None;
-                                did_work = true;
+                        if let Some(id) = slot.in_flight_id {
+                            if let Ok(mut map) = egress_replies.lock() {
+                                if let Some(bytes) = map.remove(&id) {
+                                    slot.resp_buf = bytes;
+                                    slot.resp_ready = true;
+                                    slot.in_flight_id = None;
+                                    did_work = true;
+                                }
                             }
                         }
-                    }
-                    if resp_ready && !resp_buf.is_empty() && sock.can_send() {
-                        if let Ok(n) = sock.send_slice(&resp_buf) {
-                            if n > 0 {
-                                resp_buf.drain(..n);
-                                did_work = true;
+                        if slot.resp_ready && !slot.resp_buf.is_empty() && sock.can_send() {
+                            if let Ok(n) = sock.send_slice(&slot.resp_buf) {
+                                if n > 0 {
+                                    slot.resp_buf.drain(..n);
+                                    did_work = true;
+                                }
                             }
                         }
-                    }
-                    if resp_ready && resp_buf.is_empty() {
-                        sock.close();
-                        resp_ready = false;
-                    }
-                } else {
-                    in_flight_id = None;
-                    req_buf.clear();
-                    resp_buf.clear();
-                    resp_ready = false;
-                    if !sock.is_listening() {
-                        let _ = sock.listen(7781);
+                        if slot.resp_ready && slot.resp_buf.is_empty() {
+                            sock.close();
+                            slot.resp_ready = false;
+                        }
+                    } else {
+                        slot.in_flight_id = None;
+                        slot.req_buf.clear();
+                        slot.resp_buf.clear();
+                        slot.resp_ready = false;
+                        if !sock.is_listening() {
+                            let _ = sock.listen(7781);
+                        }
                     }
                 }
 
