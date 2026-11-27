@@ -11,6 +11,7 @@
 
 use crate::caps::DirBackend;
 use crate::runner::{BootContext, Tier1LaunchOpts};
+use crate::vm_manager::{ActiveVmGateway, VmManager};
 use core::arch::asm;
 use hirsel_proto::crypto::{
     DEFAULT_DEV_KEY_STR, SessionCipher, compute_client_auth_mac, compute_server_auth_mac, ct_eq,
@@ -217,6 +218,7 @@ impl SessionState {
 struct NodeState {
     cache: HashMap<[u8; 32], CachedImage>,
     dir_backend: Arc<Mutex<DirBackend>>,
+    vm_manager: VmManager,
     auth_key: [u8; 32],
     has_net: bool,
     has_blk: bool,
@@ -321,6 +323,7 @@ pub fn serve_control_plane(ctx: Arc<BootContext>, initial_t1: u64, initial_t2: u
     let state = Arc::new(Mutex::new(NodeState {
         cache,
         dir_backend,
+        vm_manager: VmManager::new(),
         auth_key,
         has_net,
         has_blk,
@@ -509,11 +512,43 @@ fn serve_tcp_control_plane(
     );
 
     let mut scratch = [0u8; 16 * 1024];
+    let mut vm_gateways: HashMap<String, ActiveVmGateway> = HashMap::new();
 
     loop {
         let now = smol_now();
+
+        // Sync active managed VM virtual Ethernet gateways + L4 TCP port-forwarders.
+        let active_atts = {
+            let st = state.lock().unwrap();
+            st.vm_manager.active_net_attachments()
+        };
+        let active_ids: std::collections::HashSet<&str> =
+            active_atts.iter().map(|a| a.vm_id.as_str()).collect();
+        let stale_ids: Vec<String> = vm_gateways
+            .keys()
+            .filter(|id| !active_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in stale_ids {
+            if let Some(gw) = vm_gateways.remove(&id) {
+                gw.teardown(&mut sockets);
+            }
+        }
+        for att in &active_atts {
+            if !vm_gateways.contains_key(&att.vm_id) {
+                let gw = ActiveVmGateway::new(att, &mut sockets, now);
+                vm_gateways.insert(att.vm_id.clone(), gw);
+            }
+        }
+
         let poll_res = iface.poll(now, &mut net, &mut sockets);
         let mut active = !matches!(poll_res, smoltcp::iface::PollResult::None);
+
+        for gw in vm_gateways.values_mut() {
+            if gw.poll(&mut sockets, now) {
+                active = true;
+            }
+        }
 
         for slot in &mut conns {
             let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
@@ -601,7 +636,7 @@ fn serve_tcp_control_plane(
 /// Enforces mutual authentication + AEAD encryption before dispatching RPCs.
 /// Returns `(Response, force_plaintext_reply)`.
 fn dispatch_session_frame(
-    ctx: &BootContext,
+    ctx: &Arc<BootContext>,
     state: &Mutex<NodeState>,
     session: &mut SessionState,
     msg_type: u8,
@@ -694,7 +729,7 @@ fn dispatch_session_frame(
 }
 
 fn handle_request(
-    ctx: &BootContext,
+    ctx: &Arc<BootContext>,
     state: &Mutex<NodeState>,
     session: &mut SessionState,
     req: Request,
@@ -1114,6 +1149,88 @@ fn handle_request(
                         bells: report.bell_count,
                     })
                 }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmStart(spec) => {
+            let resolve_bytes = |t: &RunTarget| -> Result<Vec<u8>, String> {
+                match t {
+                    RunTarget::Bootfs(path) => ctx.read_bootfs_bytes(path),
+                    RunTarget::Digest(digest) => {
+                        let bytes = {
+                            let st = state.lock().unwrap();
+                            st.cache.get(digest).map(|img| img.bytes.clone())
+                        };
+                        bytes.ok_or_else(|| {
+                            format!("image not in cache: sha256:{}", hex_encode(digest))
+                        })
+                    }
+                }
+            };
+            let kernel_bytes = match resolve_bytes(&spec.kernel) {
+                Ok(b) => b,
+                Err(e) => return Response::Error { message: e },
+            };
+            let initrd_bytes = match spec.initrd.as_ref() {
+                Some(rd) => match resolve_bytes(rd) {
+                    Ok(b) => Some(b),
+                    Err(e) => return Response::Error { message: e },
+                },
+                None => None,
+            };
+            let mut st = state.lock().unwrap();
+            match st.vm_manager.start_vm(ctx, spec, kernel_bytes, initrd_bytes) {
+                Ok(summary) => {
+                    st.tier2_runs += 1;
+                    Response::VmInfo(summary)
+                }
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmList => {
+            let st = state.lock().unwrap();
+            Response::VmList(st.vm_manager.list_vms())
+        }
+        Request::VmInspect { id } => {
+            let st = state.lock().unwrap();
+            match st.vm_manager.inspect_vm(&id) {
+                Ok(summary) => Response::VmInfo(summary),
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmLogs {
+            id,
+            offset,
+            max_bytes,
+        } => {
+            let st = state.lock().unwrap();
+            match st.vm_manager.read_logs(&id, offset, max_bytes) {
+                Ok((data, next_offset, status)) => Response::VmLogs {
+                    data,
+                    next_offset,
+                    status,
+                },
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmConsoleWrite { id, data } => {
+            let st = state.lock().unwrap();
+            match st.vm_manager.write_console(&id, &data) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmStop { id } => {
+            let st = state.lock().unwrap();
+            match st.vm_manager.stop_vm(&id) {
+                Ok(summary) => Response::VmInfo(summary),
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        Request::VmRemove { id } => {
+            let mut st = state.lock().unwrap();
+            match st.vm_manager.remove_vm(&id) {
+                Ok(()) => Response::Ok,
                 Err(e) => Response::Error { message: e },
             }
         }

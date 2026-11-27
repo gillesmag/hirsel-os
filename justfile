@@ -157,6 +157,133 @@ build-linux-initrd:
     PY
     ls -lh "{{out_dir}}/linux/initramfs.cpio"
 
+# Fetch and statically compile Dropbear SSH server for Linux MicroVM initramfs
+build-dropbear:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OUT="{{out_dir}}/linux"
+    mkdir -p "$OUT"
+    if [[ -x "$OUT/dropbear" && -x "$OUT/dropbearkey" ]]; then
+      ls -lh "$OUT/dropbear" "$OUT/dropbearkey"
+      exit 0
+    fi
+    VER="2025.89"
+    TAR="$OUT/dropbear-${VER}.tar.bz2"
+    SRC="$OUT/dropbear-${VER}"
+    if [[ ! -f "$TAR" ]]; then
+      curl -fSL "https://matt.ucc.asn.au/dropbear/releases/dropbear-${VER}.tar.bz2" -o "$TAR"
+    fi
+    rm -rf "$SRC"
+    tar -xjf "$TAR" -C "$OUT"
+    (
+      cd "$SRC"
+      ./configure \
+        --enable-static \
+        --disable-zlib \
+        --disable-lastlog \
+        --disable-utmp \
+        --disable-utmpx \
+        --disable-wtmp \
+        --disable-wtmpx \
+        --disable-pututline \
+        --disable-pututxline \
+        --disable-pam \
+        LDFLAGS="-static" \
+        CFLAGS="-Os"
+      make -j"$(nproc)" PROGRAMS="dropbear dropbearkey" STATIC=1
+      cp dropbear dropbearkey "$OUT/"
+    )
+    strip "$OUT/dropbear" "$OUT/dropbearkey" || true
+    ls -lh "$OUT/dropbear" "$OUT/dropbearkey"
+
+# Build SSH-enabled BusyBox + Dropbear Linux MicroVM initramfs (out/linux/initramfs-ssh.cpio)
+build-linux-ssh-initrd: build-dropbear
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OUT="{{out_dir}}/linux"
+    mkdir -p "$OUT"
+    if [[ ! -f "$OUT/id_ed25519" ]]; then
+      ssh-keygen -t ed25519 -N "" -f "$OUT/id_ed25519" -C "hirsel-os-dev" >/dev/null
+      chmod 600 "$OUT/id_ed25519"
+    fi
+    if [[ ! -f "$OUT/dropbear_ed25519_host_key" ]]; then
+      "$OUT/dropbearkey" -t ed25519 -f "$OUT/dropbear_ed25519_host_key" >/dev/null
+    fi
+    AUTH_KEYS="$OUT/authorized_keys"
+    cat "$OUT/id_ed25519.pub" > "$AUTH_KEYS"
+    if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+      cat "$HOME/.ssh/id_ed25519.pub" >> "$AUTH_KEYS"
+    fi
+    if [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+      cat "$HOME/.ssh/id_rsa.pub" >> "$AUTH_KEYS"
+    fi
+    python3 - \
+      "{{root}}/examples/linux-vm/init.sh" \
+      "/usr/bin/busybox" \
+      "$OUT/dropbear" \
+      "$OUT/dropbear_ed25519_host_key" \
+      "$AUTH_KEYS" \
+      "$OUT/initramfs-ssh.cpio" <<'PY'
+    import sys, stat, subprocess
+
+    init_sh = open(sys.argv[1], "rb").read()
+    busybox = open(sys.argv[2], "rb").read()
+    dropbear = open(sys.argv[3], "rb").read()
+    host_key = open(sys.argv[4], "rb").read()
+    auth_keys = open(sys.argv[5], "rb").read()
+    out_path = sys.argv[6]
+
+    applets = subprocess.check_output([sys.argv[2], "--list"], text=True).split()
+    out = bytearray()
+    ino = 1
+
+    def entry(name, mode, data=b"", rdev_maj=0, rdev_min=0):
+        global ino
+        ino += 1
+        nb = name.encode() + b"\x00"
+        hdr = (
+            f"070701{ino:08x}{mode:08x}{0:08x}{0:08x}{1:08x}{0:08x}"
+            f"{len(data):08x}{0:08x}{0:08x}{rdev_maj:08x}{rdev_min:08x}"
+            f"{len(nb):08x}{0:08x}"
+        ).encode()
+        out.extend(hdr); out.extend(nb)
+        while len(out) % 4: out.append(0)
+        out.extend(data)
+        while len(out) % 4: out.append(0)
+
+    for d in ["bin", "sbin", "usr", "usr/bin", "usr/sbin", "dev", "dev/pts", "proc", "sys",
+              "etc", "etc/dropbear", "root", "root/.ssh", "tmp", "run", "var", "var/log"]:
+        mode = stat.S_IFDIR | (0o700 if d.startswith("root") else 0o755)
+        entry(d, mode)
+
+    entry("dev/console", stat.S_IFCHR | 0o600, rdev_maj=5, rdev_min=1)
+    entry("dev/null", stat.S_IFCHR | 0o666, rdev_maj=1, rdev_min=3)
+    entry("dev/zero", stat.S_IFCHR | 0o666, rdev_maj=1, rdev_min=5)
+    entry("dev/tty", stat.S_IFCHR | 0o666, rdev_maj=5, rdev_min=0)
+    entry("dev/ptmx", stat.S_IFCHR | 0o666, rdev_maj=5, rdev_min=2)
+    entry("dev/urandom", stat.S_IFCHR | 0o666, rdev_maj=1, rdev_min=9)
+
+    entry("init", stat.S_IFREG | 0o755, data=init_sh)
+    entry("bin/busybox", stat.S_IFREG | 0o755, data=busybox)
+    for app in applets:
+        if app in ("busybox", "init", "linuxrc", "[", "[["):
+            continue
+        entry(f"bin/{app}", stat.S_IFLNK | 0o777, data=b"busybox")
+    entry("sbin/dropbear", stat.S_IFREG | 0o755, data=dropbear)
+    entry("etc/dropbear/dropbear_ed25519_host_key", stat.S_IFREG | 0o600, data=host_key)
+    entry("etc/passwd", stat.S_IFREG | 0o644, data=b"root:x:0:0:root:/root:/bin/sh\n")
+    entry("etc/group", stat.S_IFREG | 0o644, data=b"root:x:0:\n")
+    entry("etc/shadow", stat.S_IFREG | 0o600, data=b"root:*:19000:0:99999:7:::\n")
+    entry("etc/shells", stat.S_IFREG | 0o644, data=b"/bin/sh\n/bin/ash\n")
+    entry("etc/nsswitch.conf", stat.S_IFREG | 0o644, data=b"passwd: files\ngroup: files\nhosts: files\n")
+    entry("etc/hosts", stat.S_IFREG | 0o644, data=b"127.0.0.1 localhost\n")
+    entry("root/.ssh/authorized_keys", stat.S_IFREG | 0o600, data=auth_keys)
+    entry("TRAILER!!!", 0)
+    while len(out) % 512: out.append(0)
+    open(out_path, "wb").write(out)
+    PY
+    ls -lh "$OUT/initramfs-ssh.cpio" "$OUT/id_ed25519"
+
 # Fetch and strip Firecracker's upstream Linux 6.1.102 x86-64 vmlinux for Tier 2 Linux MicroVM tests
 fetch-linux-kernel:
     #!/usr/bin/env bash
@@ -203,7 +330,7 @@ build-os: build-init build-guest build-linux-shim
       --entry="userboot.next=bin/hirsel-init"
     ls -lh "{{out_dir}}/hirsel-os.zbi"
 
-# Boot hirsel-os.zbi on Zircon in QEMU with virtio-net (TCP 4444), virtio-blk (out/hirsel-store.img), and COM2 fallback
+# Boot hirsel-os.zbi on Zircon in QEMU with virtio-net (TCP 4444 + VM SSH 2222/2223), virtio-blk (64M), and COM2 fallback
 boot-os extra_cmdline="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -213,14 +340,14 @@ boot-os extra_cmdline="":
     DISK="{{out_dir}}/hirsel-store.img"
     mkdir -p "{{out_dir}}"
     if [[ ! -f "$DISK" ]]; then
-      truncate -s 32M "$DISK"
+      truncate -s 64M "$DISK"
     fi
     QEMU_ARGS=(
       -L "{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/share/qemu"
       -machine q35,smbios-entry-point-type=32,i8042=off
       -device isa-debug-exit,iobase=0xf4,iosize=0x04
       -device virtio-rng-pci
-      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:4444-:4444"
+      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:4444-:4444,hostfwd=tcp:127.0.0.1:2222-:2222,hostfwd=tcp:127.0.0.1:2223-:2223"
       -device "virtio-net-pci,netdev=net0"
       -drive "file=${DISK},format=raw,if=none,id=blk0"
       -device "virtio-blk-pci,drive=blk0"
@@ -683,6 +810,109 @@ test-linux-vm: build-os build-linux-initrd fetch-linux-kernel
     grep -q "REAL LINUX KERNEL BOOTED TO PID 1!" <<<"$OUT2"
     grep -q "uname:     Linux 6.1.102 x86_64" <<<"$OUT2"
     echo "=== PASS: Upstream Linux 6.1.102 microVM booted cleanly to PID 1 twice inside Zircon AMD SVM! ==="
+
+# End-to-end KVM test: start persistent Linux 6.1.102 MicroVM from vm.spec, set up virtio-net eth0, and SSH into it!
+test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -q -p hirsel-os-ctl
+    CTL="{{root}}/target/debug/hirsel-os-ctl"
+    BUILD_DIR="{{fuchsia}}/$(cat "{{fuchsia}}/.fx-build-dir")"
+    QEMU="{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/bin/qemu-system-x86_64"
+    DISK="{{out_dir}}/test-vm-ssh.img"
+    LOG="{{out_dir}}/test-vm-ssh.log"
+    CTL_PORT=14447
+    SSH_PORT=12222
+    rm -f "$DISK" "$LOG"
+    truncate -s 64M "$DISK"
+
+    QEMU_PID=""
+    stop_qemu() {
+      if [[ -n "$QEMU_PID" ]]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+      fi
+      pkill -f "hostfwd=tcp:127.0.0.1:${CTL_PORT}-:4444" 2>/dev/null || true
+      QEMU_PID=""
+      sleep 0.2
+    }
+    trap stop_qemu EXIT
+
+    ENTROPY="$(head -c 32 /dev/urandom | sha256sum | awk '{print $1}')"
+    QEMU_ARGS=(
+      -L "{{fuchsia}}/prebuilt/third_party/qemu/linux-x64/share/qemu"
+      -machine q35,smbios-entry-point-type=32,i8042=off
+      -device isa-debug-exit,iobase=0xf4,iosize=0x04
+      -device virtio-rng-pci
+      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${CTL_PORT}-:4444,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:2222"
+      -device "virtio-net-pci,netdev=net0"
+      -drive "file=${DISK},format=raw,if=none,id=blk0"
+      -device "virtio-blk-pci,drive=blk0"
+      -enable-kvm -cpu "host,migratable=no,+invtsc"
+      -m 1024
+      -smp 2
+      -vga none
+      -display none
+      -serial "file:${LOG}"
+      -monitor none
+      -kernel "${BUILD_DIR}/kernel.phys_x64/linux-x86-boot-shim.bin"
+      -initrd "{{out_dir}}/hirsel-os.zbi"
+      -append "kernel.serial=legacy kernel.entropy-mixin=${ENTROPY} kernel.halt-on-panic=true"
+    )
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      "$QEMU" "${QEMU_ARGS[@]}" &
+    else
+      sg kvm -c "$(printf '%q ' "$QEMU" "${QEMU_ARGS[@]}")" &
+    fi
+    QEMU_PID=$!
+    for _ in $(seq 1 80); do
+      if grep -qa "Control Plane TCP API listening" "$LOG" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    grep -qa "Control Plane TCP API listening" "$LOG" || { tr -d '\000' < "$LOG" | tail -n 40; exit 1; }
+
+    echo "=== 1. Start persistent Linux 6.1.102 VM from examples/linux-vm/vm.spec ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm start --spec "{{root}}/examples/linux-vm/vm.spec"
+
+    echo "=== 2. Wait for VM boot & SSH daemon readiness via live vm logs ==="
+    for _ in $(seq 1 80); do
+      LOGS="$("$CTL" --addr "127.0.0.1:${CTL_PORT}" vm logs dev-1)"
+      if grep -q "SSH daemon listening on 0.0.0.0:22" <<<"$LOGS"; then
+        printf '%s\n' "$LOGS"
+        break
+      fi
+      sleep 0.2
+    done
+
+    echo "=== 3. List & inspect running persistent VM ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm inspect dev-1
+
+    echo "=== 4. REAL SSH into Linux 6.1.102 MicroVM over virtio-net MMIO -> smoltcp gateway! ==="
+    SSH_OUT="$(
+      ssh \
+        -i "{{out_dir}}/linux/id_ed25519" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        -o LogLevel=ERROR \
+        -p "${SSH_PORT}" \
+        root@127.0.0.1 \
+        "echo '[ssh] CONNECTED TO:' \$(hostname) && uname -a && ip -o -4 addr show eth0 && ping -c 2 -W 2 10.0.3.1 && id"
+    )"
+    printf '%s\n' "$SSH_OUT"
+    grep -q "CONNECTED TO: dev-1" <<<"$SSH_OUT"
+    grep -q "Linux dev-1 6.1.102" <<<"$SSH_OUT"
+    grep -q "10.0.3.2/24" <<<"$SSH_OUT"
+    grep -q "2 packets received" <<<"$SSH_OUT"
+
+    echo "=== 5. Verify live network packet counters & stop/remove VM cleanly ==="
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm inspect dev-1
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm stop dev-1
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm rm dev-1
+    "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
+    echo "=== PASS: Managed persistent Linux 6.1.102 VM + virtio-net + real SSH verified end-to-end! ==="
 
 # Run host Rust unit tests (zbi, zx-sys, hirsel-proto, hirsel-vmm, hirsel-virtio)
 test:

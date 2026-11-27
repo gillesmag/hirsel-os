@@ -11,7 +11,7 @@ pub const GPA_ACPI_RSDP: u64 = 0x000E_0000;
 pub const GPA_ACPI_XSDT: u64 = 0x000E_0040;
 pub const GPA_ACPI_FADT: u64 = 0x000E_0100;
 pub const GPA_ACPI_DSDT: u64 = 0x000E_0280;
-pub const GPA_ACPI_MADT: u64 = 0x000E_0300;
+pub const GPA_ACPI_MADT: u64 = 0x000E_0400;
 pub const GPA_KERNEL_DEFAULT: u64 = 0x0100_0000; // 16 MiB standard 64-bit load address
 
 pub const BOOT_FLAG_MAGIC: u16 = 0xAA55;
@@ -236,16 +236,84 @@ fn write_acpi_header(buf: &mut [u8], sig: &[u8; 4], rev: u8) {
     buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator revision
 }
 
+fn aml_pkg_len(body_len: usize) -> Vec<u8> {
+    if body_len + 1 < 64 {
+        vec![(body_len + 1) as u8]
+    } else {
+        let total = body_len + 2;
+        vec![0x40 | ((total & 0x0f) as u8), ((total >> 4) & 0xff) as u8]
+    }
+}
+
+fn build_virtio_net_dsdt_aml() -> Vec<u8> {
+    // ResourceTemplate(): Memory32Fixed(RW, 0xD0000000, 0x1000) + ExtendedInterrupt(IRQ 5) + EndTag
+    let mut crs_data = Vec::new();
+    // Memory32Fixed (0x86, len=9, RW=1, base=0xD0000000, size=0x1000)
+    crs_data.extend_from_slice(&[0x86, 0x09, 0x00, 0x01]);
+    crs_data.extend_from_slice(&0xD000_0000u32.to_le_bytes());
+    crs_data.extend_from_slice(&0x0000_1000u32.to_le_bytes());
+    // Extended Interrupt Descriptor (0x89, len=6, flags=0x03 Consumer|Edge|ActiveHigh|Exclusive, count=1, gsi=5)
+    crs_data.extend_from_slice(&[0x89, 0x06, 0x00, 0x03, 0x01]);
+    crs_data.extend_from_slice(&5u32.to_le_bytes());
+    // EndTag
+    crs_data.extend_from_slice(&[0x79, 0x00]);
+
+    let mut crs_buf = Vec::new();
+    crs_buf.push(0x11); // BufferOp
+    let mut buf_inner = Vec::new();
+    buf_inner.push(0x0A); // BytePrefix
+    buf_inner.push(crs_data.len() as u8);
+    buf_inner.extend_from_slice(&crs_data);
+    crs_buf.extend_from_slice(&aml_pkg_len(buf_inner.len()));
+    crs_buf.extend_from_slice(&buf_inner);
+
+    let mut dev_body = Vec::new();
+    dev_body.extend_from_slice(b"VNET");
+    // Name (_HID, "LNRO0005")
+    dev_body.push(0x08);
+    dev_body.extend_from_slice(b"_HID");
+    dev_body.push(0x0D);
+    dev_body.extend_from_slice(b"LNRO0005\0");
+    // Name (_UID, 0)
+    dev_body.push(0x08);
+    dev_body.extend_from_slice(b"_UID");
+    dev_body.push(0x00);
+    // Name (_CRS, Buffer(...))
+    dev_body.push(0x08);
+    dev_body.extend_from_slice(b"_CRS");
+    dev_body.extend_from_slice(&crs_buf);
+
+    let mut dev = Vec::new();
+    dev.extend_from_slice(&[0x5B, 0x82]); // DeviceOp
+    dev.extend_from_slice(&aml_pkg_len(dev_body.len()));
+    dev.extend_from_slice(&dev_body);
+
+    let mut scope_body = Vec::new();
+    scope_body.extend_from_slice(b"\\_SB_");
+    scope_body.extend_from_slice(&dev);
+
+    let mut scope = Vec::new();
+    scope.push(0x10); // ScopeOp
+    scope.extend_from_slice(&aml_pkg_len(scope_body.len()));
+    scope.extend_from_slice(&scope_body);
+    scope
+}
+
 fn install_minimal_acpi(ram: &mut [u8]) -> Result<(), String> {
     if ram.len() < 0x000F_0000 {
         return Err("guest RAM too small for ACPI tables".into());
     }
     ram[GPA_ACPI_RSDP as usize..GPA_ACPI_RSDP as usize + 0x1000].fill(0);
 
-    // 1. DSDT (36-byte empty AML definition block)
+    // 1. DSDT: 36-byte ACPI header + minimal AML declaring `\_SB_.VNET` (`LNRO0005`,
+    //    Virtio-MMIO at 0xD000_0000, size 4 KiB, ISA/GSI IRQ 5) so Linux discovers
+    //    `virtio-net` via standard ACPI even if `virtio_mmio.device=` is absent.
     {
-        let dsdt = &mut ram[GPA_ACPI_DSDT as usize..GPA_ACPI_DSDT as usize + 36];
+        let aml = build_virtio_net_dsdt_aml();
+        let total = 36 + aml.len();
+        let dsdt = &mut ram[GPA_ACPI_DSDT as usize..GPA_ACPI_DSDT as usize + total];
         write_acpi_header(dsdt, b"DSDT", 2);
+        dsdt[36..total].copy_from_slice(&aml);
         dsdt[9] = acpi_checksum(dsdt);
     }
 
@@ -370,7 +438,13 @@ mod tests {
         assert_eq!(sum(GPA_ACPI_RSDP, 36), 0);
         assert_eq!(sum(GPA_ACPI_XSDT, 52), 0);
         assert_eq!(sum(GPA_ACPI_FADT, 276), 0);
-        assert_eq!(sum(GPA_ACPI_DSDT, 36), 0);
+        let dsdt_len = u32::from_le_bytes(
+            ram[GPA_ACPI_DSDT as usize + 4..GPA_ACPI_DSDT as usize + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(dsdt_len > 36);
+        assert_eq!(sum(GPA_ACPI_DSDT, dsdt_len), 0);
         assert_eq!(sum(GPA_ACPI_MADT, 52), 0);
     }
 

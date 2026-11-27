@@ -10,9 +10,15 @@
 //!   KVM pvclock, and in-kernel x2APIC timer virtualization.
 
 pub mod linux_boot;
+pub mod mmio;
+pub mod virtio_net_mmio;
 
 use core::mem::size_of;
 use core::ptr;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use virtio_net_mmio::VirtioNetChannel;
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -90,6 +96,122 @@ pub struct VmRunReport {
     pub mmio_exits: u64,
     pub bell_count: u64,
     pub elapsed_us: u64,
+}
+
+const MAX_CONSOLE_RING_BYTES: usize = 256 * 1024;
+
+struct ConsoleRing {
+    base_offset: u64,
+    buf: VecDeque<u8>,
+}
+
+/// Live control & telemetry handle shared between a persistent managed Linux MicroVM
+/// and `hirsel-init`'s VM manager / network stack.
+pub struct ManagedVmControl {
+    console_out: Mutex<ConsoleRing>,
+    console_in: Mutex<VecDeque<u8>>,
+    pub net_channel: Option<Arc<VirtioNetChannel>>,
+    stop_requested: AtomicBool,
+    pub io_exits: AtomicU64,
+    pub mmio_exits: AtomicU64,
+    #[cfg(target_os = "fuchsia")]
+    vcpu_dup: Mutex<zx_sys::zx_handle_t>,
+}
+
+impl ManagedVmControl {
+    pub fn new(net_channel: Option<Arc<VirtioNetChannel>>) -> Arc<Self> {
+        Arc::new(Self {
+            console_out: Mutex::new(ConsoleRing {
+                base_offset: 0,
+                buf: VecDeque::with_capacity(16 * 1024),
+            }),
+            console_in: Mutex::new(VecDeque::with_capacity(256)),
+            net_channel,
+            stop_requested: AtomicBool::new(false),
+            io_exits: AtomicU64::new(0),
+            mmio_exits: AtomicU64::new(0),
+            #[cfg(target_os = "fuchsia")]
+            vcpu_dup: Mutex::new(zx_sys::ZX_HANDLE_INVALID),
+        })
+    }
+
+    pub fn push_console_out(&self, byte: u8) {
+        let mut ring = self.console_out.lock().unwrap();
+        if ring.buf.len() >= MAX_CONSOLE_RING_BYTES {
+            ring.buf.pop_front();
+            ring.base_offset = ring.base_offset.saturating_add(1);
+        }
+        ring.buf.push_back(byte);
+    }
+
+    /// Reads up to `max_bytes` starting at logical stream `offset`, returning `(bytes, next_offset)`.
+    pub fn read_console_logs(&self, offset: u64, max_bytes: usize) -> (Vec<u8>, u64) {
+        let ring = self.console_out.lock().unwrap();
+        let end_offset = ring.base_offset + ring.buf.len() as u64;
+        let start = offset.max(ring.base_offset).min(end_offset);
+        let rel_start = (start - ring.base_offset) as usize;
+        let avail = ring.buf.len().saturating_sub(rel_start);
+        let take = avail.min(max_bytes.max(1));
+        let mut out = Vec::with_capacity(take);
+        for b in ring.buf.iter().skip(rel_start).take(take) {
+            out.push(*b);
+        }
+        let next = start + out.len() as u64;
+        (out, next)
+    }
+
+    pub fn write_console_in(&self, bytes: &[u8]) {
+        {
+            let mut q = self.console_in.lock().unwrap();
+            for &b in bytes {
+                if q.len() >= 4096 {
+                    q.pop_front();
+                }
+                q.push_back(b);
+            }
+        }
+        self.kick();
+    }
+
+    pub fn drain_console_in(&self, dst: &mut VecDeque<u8>) -> bool {
+        let mut q = self.console_in.lock().unwrap();
+        if q.is_empty() {
+            return false;
+        }
+        while let Some(b) = q.pop_front() {
+            dst.push_back(b);
+        }
+        true
+    }
+
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
+
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.kick();
+    }
+
+    #[cfg(target_os = "fuchsia")]
+    pub fn kick(&self) {
+        let h = *self.vcpu_dup.lock().unwrap();
+        if h != zx_sys::ZX_HANDLE_INVALID {
+            unsafe { zx_sys::zx_vcpu_kick(h) };
+        }
+    }
+
+    #[cfg(not(target_os = "fuchsia"))]
+    pub fn kick(&self) {}
+
+    #[cfg(target_os = "fuchsia")]
+    fn set_vcpu_dup(&self, handle: zx_sys::zx_handle_t) {
+        let mut guard = self.vcpu_dup.lock().unwrap();
+        if *guard != zx_sys::ZX_HANDLE_INVALID {
+            unsafe { zx_sys::zx_handle_close(*guard) };
+        }
+        *guard = handle;
+    }
 }
 
 /// Writes x86-64 4-level identity page tables (2 MiB pages) at offsets `0x0000..0x4000`
@@ -251,6 +373,8 @@ pub fn load_linux_kernel_into_ram(
 #[cfg(target_os = "fuchsia")]
 mod fuchsia_vmm {
     use super::*;
+    use crate::mmio::{MmioAccess, decode_mmio_inst, fetch_guest_inst_bytes, get_gpr, set_gpr};
+    use crate::virtio_net_mmio::{GPA_VIRTIO_NET_MMIO, VIRTIO_NET_IRQ, VirtioNetMmio};
     use std::thread;
     use zx_sys::*;
 
@@ -260,6 +384,7 @@ mod fuchsia_vmm {
     const TRAP_KEY_MMIO_BELL: u64 = 4;
     const TRAP_KEY_VIRTIO_CON: u64 = 5;
     const TRAP_KEY_ALL_IO: u64 = 6;
+    const TRAP_KEY_VIRTIO_NET: u64 = 7;
 
     struct LaunchSpec {
         entry_gpa: u64,
@@ -267,6 +392,11 @@ mod fuchsia_vmm {
         rdi: u64,
         rsi: u64,
         trap_all_io: bool,
+    }
+
+    struct ManagedLaunch {
+        ctrl: Arc<ManagedVmControl>,
+        mac: Option<[u8; 6]>,
     }
 
     /// Minimal 16550A UART state so Linux's `8250` serial driver probes and opens COM1 cleanly.
@@ -279,7 +409,7 @@ mod fuchsia_vmm {
         dlm: u8,
         fcr: u8,
         thr_ipending: bool,
-        loopback_byte: Option<u8>,
+        rx_queue: VecDeque<u8>,
     }
 
     impl Uart16550 {
@@ -293,7 +423,7 @@ mod fuchsia_vmm {
                 dlm: 0,
                 fcr: 0,
                 thr_ipending: false,
-                loopback_byte: None,
+                rx_queue: VecDeque::with_capacity(64),
             }
         }
 
@@ -307,7 +437,7 @@ mod fuchsia_vmm {
                     if self.dlab() {
                         self.dll
                     } else {
-                        self.loopback_byte.take().unwrap_or(0)
+                        self.rx_queue.pop_front().unwrap_or(0)
                     }
                 }
                 1 => {
@@ -320,7 +450,7 @@ mod fuchsia_vmm {
                 2 => {
                     // IIR: bit 0 = 0 if interrupt pending, 1 if none; bits 6..7 = FIFO enabled.
                     let fifo = if (self.fcr & 1) != 0 { 0xC0 } else { 0x00 };
-                    if self.loopback_byte.is_some() && (self.ier & 0x01) != 0 {
+                    if !self.rx_queue.is_empty() && (self.ier & 0x01) != 0 {
                         fifo | 0x04 // RDA interrupt pending
                     } else if self.thr_ipending && (self.ier & 0x02) != 0 {
                         self.thr_ipending = false;
@@ -332,8 +462,8 @@ mod fuchsia_vmm {
                 3 => self.lcr,
                 4 => self.mcr,
                 5 => {
-                    // LSR: THRE (0x20) | TEMT (0x40), plus DR (0x01) if loopback byte queued.
-                    if self.loopback_byte.is_some() { 0x61 } else { 0x60 }
+                    // LSR: THRE (0x20) | TEMT (0x40), plus DR (0x01) if RX byte queued.
+                    if !self.rx_queue.is_empty() { 0x61 } else { 0x60 }
                 }
                 6 => {
                     // MSR: in loopback mode (MCR bit 4), reflect MCR[3:0] into MSR[7:4].
@@ -361,16 +491,20 @@ mod fuchsia_vmm {
             }
         }
 
-        fn write(&mut self, reg: u16, val: u8, stdout: &mut Vec<u8>) {
+        fn write(&mut self, reg: u16, val: u8, stdout: &mut Vec<u8>, managed: Option<&ManagedVmControl>) {
             match reg {
                 0 => {
                     if self.dlab() {
                         self.dll = val;
                     } else if (self.mcr & 0x10) != 0 {
                         // Hardware loopback self-test (MCR bit 4): route TX back to RBR.
-                        self.loopback_byte = Some(val);
+                        self.rx_queue.push_back(val);
                     } else {
-                        stdout.push(val);
+                        if let Some(ctrl) = managed {
+                            ctrl.push_console_out(val);
+                        } else {
+                            stdout.push(val);
+                        }
                         if (self.ier & 0x02) != 0 {
                             self.thr_ipending = true;
                         }
@@ -398,7 +532,7 @@ mod fuchsia_vmm {
             // Gate COM1 IRQ 4 through OUT2 (MCR bit 3) and suppress during loopback (MCR bit 4).
             (self.mcr & 0x18) == 0x08
                 && ((self.thr_ipending && (self.ier & 0x02) != 0)
-                    || (self.loopback_byte.is_some() && (self.ier & 0x01) != 0))
+                    || (!self.rx_queue.is_empty() && (self.ier & 0x01) != 0))
         }
     }
 
@@ -546,7 +680,7 @@ mod fuchsia_vmm {
         config: MicroVmConfig,
     ) -> Result<VmRunReport, String> {
         let ram_bytes = config.ram_bytes;
-        run_microvm_inner(hypervisor_resource, vmex_resource, config, |ram, _| {
+        run_microvm_inner(hypervisor_resource, vmex_resource, config, None, |ram, _| {
             let entry_gpa = load_elf_into_ram(elf_bytes, ram)?;
             Ok(LaunchSpec {
                 entry_gpa,
@@ -572,39 +706,45 @@ mod fuchsia_vmm {
             cfg.ram_bytes = 16 * 1024 * 1024;
         }
         let ram_bytes = cfg.ram_bytes;
-        run_microvm_inner(hypervisor_resource, vmex_resource, cfg, |ram, boot_info| {
-            let aux_start = GPA_AUX_PAYLOAD as usize;
-            let aux_end = aux_start
-                .checked_add(linux_user_elf.len())
-                .ok_or_else(|| "Linux ELF size overflow".to_string())?;
-            if aux_end > 0x0040_0000 {
-                return Err(format!(
-                    "Linux static ELF ({} bytes) exceeds 2 MiB staging window",
-                    linux_user_elf.len()
-                ));
-            }
-            ram[aux_start..aux_end].copy_from_slice(linux_user_elf);
-            boot_info.aux_gpa = GPA_AUX_PAYLOAD;
-            boot_info.aux_bytes = linux_user_elf.len() as u64;
-            let _ = linux_boot::install_linux_boot_params(
-                ram,
-                "console=ttyS0 hirsel.tier=2",
-                None,
-                None,
-            );
-            let entry_gpa = load_elf_into_ram(shim_elf, ram)?;
-            Ok(LaunchSpec {
-                entry_gpa,
-                rsp: (ram_bytes as u64 - 0x1000) & !0xf,
-                rdi: GPA_BOOT_INFO,
-                rsi: 0,
-                trap_all_io: false,
-            })
-        })
+        run_microvm_inner(
+            hypervisor_resource,
+            vmex_resource,
+            cfg,
+            None,
+            |ram, boot_info| {
+                let aux_start = GPA_AUX_PAYLOAD as usize;
+                let aux_end = aux_start
+                    .checked_add(linux_user_elf.len())
+                    .ok_or_else(|| "Linux ELF size overflow".to_string())?;
+                if aux_end > 0x0040_0000 {
+                    return Err(format!(
+                        "Linux static ELF ({} bytes) exceeds 2 MiB staging window",
+                        linux_user_elf.len()
+                    ));
+                }
+                ram[aux_start..aux_end].copy_from_slice(linux_user_elf);
+                boot_info.aux_gpa = GPA_AUX_PAYLOAD;
+                boot_info.aux_bytes = linux_user_elf.len() as u64;
+                let _ = linux_boot::install_linux_boot_params(
+                    ram,
+                    "console=ttyS0 hirsel.tier=2",
+                    None,
+                    None,
+                );
+                let entry_gpa = load_elf_into_ram(shim_elf, ram)?;
+                Ok(LaunchSpec {
+                    entry_gpa,
+                    rsp: (ram_bytes as u64 - 0x1000) & !0xf,
+                    rdi: GPA_BOOT_INFO,
+                    rsi: 0,
+                    trap_all_io: false,
+                })
+            },
+        )
     }
 
     /// Boots a REAL upstream Linux x86-64 kernel (`vmlinux` ELF or `bzImage`) + optional
-    /// `initramfs` inside a hardware-isolated Zircon hypervisor microVM!
+    /// `initramfs` inside a hardware-isolated Zircon hypervisor microVM (one-shot).
     pub fn run_linux_kernel(
         hypervisor_resource: zx_handle_t,
         vmex_resource: zx_handle_t,
@@ -625,8 +765,9 @@ mod fuchsia_vmm {
         } else {
             cmdline
         };
-        run_microvm_inner(hypervisor_resource, vmex_resource, cfg, |ram, _| {
-            let entry_gpa = load_linux_kernel_into_ram(kernel_bytes, initrd_bytes, cmdline_eff, ram)?;
+        run_microvm_inner(hypervisor_resource, vmex_resource, cfg, None, |ram, _| {
+            let entry_gpa =
+                load_linux_kernel_into_ram(kernel_bytes, initrd_bytes, cmdline_eff, ram)?;
             Ok(LaunchSpec {
                 entry_gpa,
                 rsp: 0x0000_6000,
@@ -635,6 +776,48 @@ mod fuchsia_vmm {
                 trap_all_io: true,
             })
         })
+    }
+
+    /// Runs a persistent, operator-managed upstream Linux x86-64 MicroVM with live
+    /// console streaming/input, optional Virtio-MMIO `virtio-net` networking (IRQ 5),
+    /// and clean remote stop via `ManagedVmControl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_managed_linux_vm(
+        hypervisor_resource: zx_handle_t,
+        vmex_resource: zx_handle_t,
+        kernel_bytes: &[u8],
+        initrd_bytes: Option<&[u8]>,
+        cmdline: &str,
+        ram_bytes: usize,
+        mac: Option<[u8; 6]>,
+        ctrl: Arc<ManagedVmControl>,
+    ) -> Result<VmRunReport, String> {
+        let cfg = MicroVmConfig {
+            ram_bytes: ram_bytes.max(64 * 1024 * 1024),
+            max_vm_exits: u64::MAX,
+        };
+        let cmdline_eff = if cmdline.is_empty() {
+            "console=ttyS0 reboot=k panic=1 pci=off nomodules"
+        } else {
+            cmdline
+        };
+        run_microvm_inner(
+            hypervisor_resource,
+            vmex_resource,
+            cfg,
+            Some(ManagedLaunch { ctrl, mac }),
+            |ram, _| {
+                let entry_gpa =
+                    load_linux_kernel_into_ram(kernel_bytes, initrd_bytes, cmdline_eff, ram)?;
+                Ok(LaunchSpec {
+                    entry_gpa,
+                    rsp: 0x0000_6000,
+                    rdi: 0,
+                    rsi: linux_boot::GPA_ZERO_PAGE,
+                    trap_all_io: true,
+                })
+            },
+        )
     }
 
     /// Runs raw x86-64 machine code placed at `entry_gpa` inside a hardware-isolated
@@ -647,7 +830,7 @@ mod fuchsia_vmm {
         config: MicroVmConfig,
     ) -> Result<VmRunReport, String> {
         let ram_bytes = config.ram_bytes;
-        run_microvm_inner(hypervisor_resource, vmex_resource, config, |ram, _| {
+        run_microvm_inner(hypervisor_resource, vmex_resource, config, None, |ram, _| {
             let start = entry_gpa as usize;
             if start < 0x5000 || start + code.len() > ram.len() {
                 return Err("raw guest code out of guest RAM bounds".into());
@@ -667,6 +850,7 @@ mod fuchsia_vmm {
         hypervisor_resource: zx_handle_t,
         vmex_resource: zx_handle_t,
         config: MicroVmConfig,
+        managed: Option<ManagedLaunch>,
         load_guest: F,
     ) -> Result<VmRunReport, String>
     where
@@ -792,7 +976,7 @@ mod fuchsia_vmm {
             }
         };
 
-        // 4. Register hardware traps: I/O ports + MMIO heartbeat, async bell, virtio console.
+        // 4. Register hardware traps: I/O ports + MMIO devices.
         let mut bell_port = ZX_HANDLE_INVALID;
         let setup_traps = check(unsafe { zx_port_create(0, &mut bell_port) }, "zx_port_create")
             .and_then(|()| {
@@ -810,6 +994,21 @@ mod fuchsia_vmm {
                         },
                         "zx_guest_set_trap(ALL_IO)",
                     )
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_MEM,
+                                    GPA_VIRTIO_NET_MMIO as usize,
+                                    PAGE_SIZE,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_VIRTIO_NET,
+                                )
+                            },
+                            "zx_guest_set_trap(VIRTIO_NET)",
+                        )
+                    })
                 } else {
                     check(
                         unsafe {
@@ -839,52 +1038,52 @@ mod fuchsia_vmm {
                             "zx_guest_set_trap(PV)",
                         )
                     })
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_MEM,
+                                    GPA_MMIO_HEARTBEAT as usize,
+                                    PAGE_SIZE,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_MMIO_HEARTBEAT,
+                                )
+                            },
+                            "zx_guest_set_trap(MMIO_HEARTBEAT)",
+                        )
+                    })
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_BELL,
+                                    GPA_MMIO_BELL as usize,
+                                    PAGE_SIZE,
+                                    bell_port,
+                                    TRAP_KEY_MMIO_BELL,
+                                )
+                            },
+                            "zx_guest_set_trap(MMIO_BELL)",
+                        )
+                    })
+                    .and_then(|()| {
+                        check(
+                            unsafe {
+                                zx_guest_set_trap(
+                                    guest,
+                                    ZX_GUEST_TRAP_MEM,
+                                    GPA_VIRTIO_CON as usize,
+                                    PAGE_SIZE,
+                                    ZX_HANDLE_INVALID,
+                                    TRAP_KEY_VIRTIO_CON,
+                                )
+                            },
+                            "zx_guest_set_trap(VIRTIO_CON)",
+                        )
+                    })
                 }
-            })
-            .and_then(|()| {
-                check(
-                    unsafe {
-                        zx_guest_set_trap(
-                            guest,
-                            ZX_GUEST_TRAP_MEM,
-                            GPA_MMIO_HEARTBEAT as usize,
-                            PAGE_SIZE,
-                            ZX_HANDLE_INVALID,
-                            TRAP_KEY_MMIO_HEARTBEAT,
-                        )
-                    },
-                    "zx_guest_set_trap(MMIO_HEARTBEAT)",
-                )
-            })
-            .and_then(|()| {
-                check(
-                    unsafe {
-                        zx_guest_set_trap(
-                            guest,
-                            ZX_GUEST_TRAP_BELL,
-                            GPA_MMIO_BELL as usize,
-                            PAGE_SIZE,
-                            bell_port,
-                            TRAP_KEY_MMIO_BELL,
-                        )
-                    },
-                    "zx_guest_set_trap(MMIO_BELL)",
-                )
-            })
-            .and_then(|()| {
-                check(
-                    unsafe {
-                        zx_guest_set_trap(
-                            guest,
-                            ZX_GUEST_TRAP_MEM,
-                            GPA_VIRTIO_CON as usize,
-                            PAGE_SIZE,
-                            ZX_HANDLE_INVALID,
-                            TRAP_KEY_VIRTIO_CON,
-                        )
-                    },
-                    "zx_guest_set_trap(VIRTIO_CON)",
-                )
             });
 
         if let Err(err) = setup_traps {
@@ -902,6 +1101,7 @@ mod fuchsia_vmm {
 
         // 5. Run the VCPU on a dedicated thread (Zircon binds each VCPU to its creator thread).
         let max_exits = config.max_vm_exits;
+        let ram_bytes_len = config.ram_bytes;
         let vcpu_res = thread::spawn(move || -> Result<VmRunReport, String> {
             let mut vcpu = ZX_HANDLE_INVALID;
             check(
@@ -932,6 +1132,31 @@ mod fuchsia_vmm {
                 return Err(e);
             }
 
+            let managed_ctrl = managed.as_ref().map(|m| Arc::clone(&m.ctrl));
+            let mut virtio_net = managed.as_ref().and_then(|m| {
+                m.ctrl.net_channel.as_ref().map(|ch| {
+                    let mac = m.mac.unwrap_or([0x02, 0x48, 0x52, 0x53, 0x4c, 0x01]);
+                    VirtioNetMmio::new(mac, Arc::clone(ch))
+                })
+            });
+
+            if let Some(ctrl) = managed_ctrl.as_ref() {
+                let mut vcpu_dup = ZX_HANDLE_INVALID;
+                if unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut vcpu_dup) }
+                    == ZX_OK
+                {
+                    ctrl.set_vcpu_dup(vcpu_dup);
+                }
+                if let Some(ch) = ctrl.net_channel.as_ref() {
+                    let ctrl_w = Arc::clone(ctrl);
+                    ch.set_wake_guest(Some(Box::new(move || ctrl_w.kick())));
+                }
+            }
+
+            let ram_slice = unsafe {
+                core::slice::from_raw_parts_mut(host_ram_base as *mut u8, ram_bytes_len)
+            };
+
             let mut stdout = Vec::new();
             let mut uart = Uart16550::new();
             let mut legacy = PcLegacyIo::new();
@@ -940,9 +1165,9 @@ mod fuchsia_vmm {
             let mut latched_mono: u64 = 0;
             let mut exit_code: Option<i32> = None;
 
-            // Watchdog for Linux kernel boots: kick VCPU after 12s if guest hangs in HLT/loop.
+            // Watchdog for one-shot Linux kernel boots only (managed VMs run persistently).
             let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut watchdog = if spec.trap_all_io {
+            let mut watchdog = if spec.trap_all_io && managed_ctrl.is_none() {
                 let done_c = std::sync::Arc::clone(&done_flag);
                 let mut vcpu_dup = ZX_HANDLE_INVALID;
                 let _ = unsafe { zx_handle_duplicate(vcpu, ZX_RIGHT_SAME_RIGHTS, &mut vcpu_dup) };
@@ -966,11 +1191,42 @@ mod fuchsia_vmm {
             };
 
             let mut loop_err: Option<String> = None;
-            for _ in 0..max_exits {
+            let mut total_exits: u64 = 0;
+            while total_exits < max_exits {
+                // Before entering the VCPU, deliver any host-queued console input or Virtio-Net RX frames.
+                if let Some(ctrl) = managed_ctrl.as_deref() {
+                    if ctrl.is_stop_requested() {
+                        exit_code = Some(0);
+                        break;
+                    }
+                    if ctrl.drain_console_in(&mut uart.rx_queue) && uart.irq_pending() {
+                        if let Some(vec) = legacy.pic_master.try_deliver(4) {
+                            let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                        }
+                    }
+                }
+                if let Some(vnet) = virtio_net.as_mut() {
+                    if vnet.process_rx(ram_slice) && vnet.irq_pending() {
+                        if let Some(vec) = legacy.pic_master.try_deliver(VIRTIO_NET_IRQ) {
+                            let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                        }
+                    }
+                }
+
                 let mut pkt = zx_port_packet_t::default();
                 let st = unsafe { zx_vcpu_enter(vcpu, &mut pkt) };
+                if st == ZX_ERR_CANCELED {
+                    if let Some(ctrl) = managed_ctrl.as_deref() {
+                        if ctrl.is_stop_requested() {
+                            exit_code = Some(0);
+                            break;
+                        }
+                        // Wakeup kick for incoming Virtio-Net RX packet or console stdin!
+                        continue;
+                    }
+                }
                 if st != ZX_OK {
-                    if spec.trap_all_io && st == ZX_ERR_BAD_STATE && !stdout.is_empty() {
+                    if spec.trap_all_io && st == ZX_ERR_BAD_STATE && (!stdout.is_empty() || managed_ctrl.is_some()) {
                         // Triple-fault / VMEXIT_SHUTDOWN during Linux reboot fallback.
                         exit_code = Some(0);
                         break;
@@ -985,21 +1241,21 @@ mod fuchsia_vmm {
                         )
                     };
                     loop_err = Some(format!(
-                        "zx_vcpu_enter exited with zx_status={st} (io_exits={io_exits}, stdout_bytes={}, rsp={:#x}, rax={:#x}, rbx={:#x}, rcx={:#x}, rdx={:#x}, rflags={:#x})",
-                        stdout.len(),
+                        "zx_vcpu_enter exited with zx_status={st} (io_exits={io_exits}, mmio_exits={mmio_exits}, rsp={:#x}, rax={:#x}, rflags={:#x})",
                         st_regs.rsp,
                         st_regs.rax,
-                        st_regs.rbx,
-                        st_regs.rcx,
-                        st_regs.rdx,
                         st_regs.rflags
                     ));
                     break;
                 }
+                total_exits = total_exits.saturating_add(1);
 
                 match pkt.packet_type {
                     ZX_PKT_TYPE_GUEST_IO => {
                         io_exits += 1;
+                        if let Some(ctrl) = managed_ctrl.as_deref() {
+                            ctrl.io_exits.store(io_exits, Ordering::Relaxed);
+                        }
                         let io: zx_packet_guest_io_t = read_packet(&pkt);
                         let is_in = io.input != 0;
                         let mut reply: Option<zx_vcpu_io_t> = None;
@@ -1016,7 +1272,7 @@ mod fuchsia_vmm {
                                         data: [b, 0, 0, 0],
                                     });
                                 } else {
-                                    uart.write(reg, io.data[0], &mut stdout);
+                                    uart.write(reg, io.data[0], &mut stdout, managed_ctrl.as_deref());
                                 }
                             }
                             // Dual 8259A PIC (Master 0x20/0x21, Slave 0xA0/0xA1)
@@ -1225,16 +1481,109 @@ mod fuchsia_vmm {
                                 "zx_vcpu_write_state(ZX_VCPU_IO)",
                             )?;
                         }
-                        // Deliver COM1 IRQ 4 via 8259A master PIC whenever UART THRE/RDA is pending.
-                        if spec.trap_all_io && uart.irq_pending() {
-                            if let Some(vec) = legacy.pic_master.try_deliver(4) {
-                                let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                        // Deliver pending COM1 IRQ 4 and Virtio-Net IRQ 5 via 8259A master PIC.
+                        if spec.trap_all_io {
+                            if uart.irq_pending() {
+                                if let Some(vec) = legacy.pic_master.try_deliver(4) {
+                                    let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                                }
+                            }
+                            if let Some(vnet) = virtio_net.as_ref() {
+                                if vnet.irq_pending() {
+                                    if let Some(vec) = legacy.pic_master.try_deliver(VIRTIO_NET_IRQ) {
+                                        let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                                    }
+                                }
                             }
                         }
                     }
                     ZX_PKT_TYPE_GUEST_MEM => {
                         mmio_exits += 1;
+                        if let Some(ctrl) = managed_ctrl.as_deref() {
+                            ctrl.mmio_exits.store(mmio_exits, Ordering::Relaxed);
+                        }
                         let mem: zx_packet_guest_mem_t = read_packet(&pkt);
+                        if pkt.key == TRAP_KEY_VIRTIO_NET
+                            && mem.addr >= GPA_VIRTIO_NET_MMIO
+                            && mem.addr < GPA_VIRTIO_NET_MMIO + PAGE_SIZE as u64
+                        {
+                            let mut inst_buf = [0u8; 15];
+                            let n = fetch_guest_inst_bytes(ram_slice, mem.cr3, mem.rip, &mut inst_buf);
+                            match decode_mmio_inst(&inst_buf[..n]) {
+                                Ok(access) => {
+                                    let off = mem.addr - GPA_VIRTIO_NET_MMIO;
+                                    let mut regs = zx_vcpu_state_t::default();
+                                    let _ = unsafe {
+                                        zx_vcpu_read_state(
+                                            vcpu,
+                                            ZX_VCPU_STATE,
+                                            ptr::from_mut(&mut regs).cast(),
+                                            size_of::<zx_vcpu_state_t>(),
+                                        )
+                                    };
+                                    if let Some(vnet) = virtio_net.as_mut() {
+                                        match access {
+                                            MmioAccess::Read {
+                                                reg,
+                                                size,
+                                                zero_extend,
+                                            } => {
+                                                let val = u64::from(vnet.read(off, size));
+                                                set_gpr(&mut regs, reg, size, zero_extend, val);
+                                                let _ = unsafe {
+                                                    zx_vcpu_write_state(
+                                                        vcpu,
+                                                        ZX_VCPU_STATE,
+                                                        ptr::from_ref(&regs).cast(),
+                                                        size_of::<zx_vcpu_state_t>(),
+                                                    )
+                                                };
+                                            }
+                                            MmioAccess::WriteReg { reg, .. } => {
+                                                let val = get_gpr(&regs, reg) as u32;
+                                                vnet.write(off, val, ram_slice);
+                                            }
+                                            MmioAccess::WriteImm { value, .. } => {
+                                                vnet.write(off, value as u32, ram_slice);
+                                            }
+                                        }
+                                        if vnet.irq_pending() {
+                                            if let Some(vec) =
+                                                legacy.pic_master.try_deliver(VIRTIO_NET_IRQ)
+                                            {
+                                                let _ = unsafe { zx_vcpu_interrupt(vcpu, vec) };
+                                            }
+                                        }
+                                    } else if let MmioAccess::Read {
+                                        reg,
+                                        size,
+                                        zero_extend,
+                                    } = access
+                                    {
+                                        // No virtio-net attached: return 0 (invalid magic) so Linux skips probe.
+                                        set_gpr(&mut regs, reg, size, zero_extend, 0);
+                                        let _ = unsafe {
+                                            zx_vcpu_write_state(
+                                                vcpu,
+                                                ZX_VCPU_STATE,
+                                                ptr::from_ref(&regs).cast(),
+                                                size_of::<zx_vcpu_state_t>(),
+                                            )
+                                        };
+                                    }
+                                }
+                                Err(e) => {
+                                    loop_err = Some(format!(
+                                        "virtio-net MMIO decode error at addr={:#x} rip={:#x} bytes={:02x?}: {e}",
+                                        mem.addr,
+                                        mem.rip,
+                                        &inst_buf[..n.min(8)]
+                                    ));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         let in_hb = pkt.key == TRAP_KEY_MMIO_HEARTBEAT
                             && mem.addr >= GPA_MMIO_HEARTBEAT
                             && mem.addr < GPA_MMIO_HEARTBEAT + PAGE_SIZE as u64;
@@ -1259,6 +1608,12 @@ mod fuchsia_vmm {
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(w) = watchdog.take() {
                 let _ = w.join();
+            }
+            if let Some(ctrl) = managed_ctrl.as_ref() {
+                if let Some(ch) = ctrl.net_channel.as_ref() {
+                    ch.set_wake_guest(None);
+                }
+                ctrl.set_vcpu_dup(ZX_HANDLE_INVALID);
             }
             unsafe { zx_handle_close(vcpu) };
 
@@ -1307,7 +1662,9 @@ mod fuchsia_vmm {
 }
 
 #[cfg(target_os = "fuchsia")]
-pub use fuchsia_vmm::{run_elf_microvm, run_linux_kernel, run_linux_user_elf, run_raw_microvm};
+pub use fuchsia_vmm::{
+    run_elf_microvm, run_linux_kernel, run_linux_user_elf, run_managed_linux_vm, run_raw_microvm,
+};
 
 #[cfg(test)]
 mod tests {

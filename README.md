@@ -6,7 +6,7 @@ Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirs
 
 - **Tier 1 — Native Hirsel Processes in Hardened Zircon Jobs**: Compiles Hirsel programs natively for `x86_64-unknown-fuchsia`, streams them content-addressed by SHA-256, seals them into immutable executable VMOs (`vmex`), and executes them in ~2–3 ms inside policy-locked `zx::Job`s (`ZX_POL_VMAR_WX`, `ZX_POL_AMBIENT_MARK_VMO_EXEC`, and `ZX_POL_NEW_PROCESS` all `DENY`). Supports per-job `Args`, attenuated `Env`, wall-clock kill timeouts (`zx_task_kill`), and a Zircon-channel `Dir` capability backed by persistent `virtio-blk` storage (`HRSLFS01`).
 - **Tier 2 — Hardware-Isolated AMD SVM / Intel VMX MicroVMs**: Uses Zircon's kernel hypervisor (`zx_guest_create`, `zx_vcpu_create`, `zx_vcpu_enter`, `zx_guest_set_trap`, `zx_vcpu_interrupt`) in three modes:
-  1. **Full Upstream Linux x86-64 MicroVMs (`--linux-kernel`)**: Boots unmodified upstream Linux x86-64 kernels (`vmlinux` ELF or `bzImage`) + `initramfs` all the way to real PID 1 (`/init`) with minimal ACPI 2.0 tables (`RSDP`/`XSDT`/`FADT`/`DSDT`/`MADT`), x2APIC MSR + `IA32_TSC_DEADLINE` timer virtualization, KVM `pvclock`, 16550A COM1 UART + dual 8259A PIC (IRQ 4), and clean `reboot=k` exit (~469 ms to PID 1 / ~630 ms total microVM runtime on cache hit).
+  1. **Persistent Managed Linux x86-64 MicroVMs with Virtio-Net & SSH (`vm start --spec`)**: Boots unmodified upstream Linux x86-64 kernels (`vmlinux` ELF or `bzImage`) + `initramfs` persistently in background threads with minimal ACPI 2.0 tables (`RSDP`/`XSDT`/`FADT`/`DSDT` with `LNRO0005`/`MADT`), x2APIC MSR + `IA32_TSC_DEADLINE` timer virtualization, KVM `pvclock`, 16550A COM1 UART + dual 8259A PIC (IRQ 4 & IRQ 5), **Virtio 1.0 MMIO v2 `virtio-net`** (`eth0`), and a per-VM `smoltcp` virtual Ethernet gateway + L4 TCP port forwarder so you can manage VMs remotely (`vm ls`/`inspect`/`logs`/`send`/`stop`/`rm`) and **`ssh` directly into running Linux MicroVMs** (~0.85 ms gateway ping, ~800 ms boot to SSH ready).
   2. **Unmodified Linux x86-64 Static ELFs in Ring 3 (`--linux-elf`)**: Runs static Linux binaries inside `bin/hirsel-linux-shim.elf` with zero-exit `SYSCALL`/`SYSRET` via AMD SVM MSRPM passthrough in ~5.5 ms cold-to-exit.
   3. **Freestanding 64-bit Ring-0 ELF Guests**: Direct bare-metal Ring-0 microVMs with paravirt I/O, MMIO traps, and async doorbells.
 
@@ -43,8 +43,8 @@ Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirs
 
 | Crate | Purpose |
 |---|---|
-| [`crates/hirsel-init`](crates/hirsel-init) | Root Zircon process (`userboot.next=bin/hirsel-init`): BOOTFS loader, `fuchsia.ldsvc.Loader`, Tier 1 job runner, Tier 1 `Dir` Zircon-channel server (`caps.rs`), encrypted multi-transport control plane (`api.rs`). |
-| [`crates/hirsel-vmm`](crates/hirsel-vmm) | Tier 2 hardware microVM VMM on `zx_guest_*` / `zx_vcpu_*`, 4-level identity page tables, full 16550A COM1 UART + 8259A PIC (IRQ 4), legacy PC I/O (i8042 `reboot=k`, CMOS/RTC, PIT), minimal ACPI 2.0 (`RSDP`/`XSDT`/`FADT`/`DSDT`/`MADT`), Linux x86-64 `boot_params` / `vmlinux` / `bzImage` loader (`linux_boot.rs`), and Ring-3 Linux static ELF runner. |
+| [`crates/hirsel-init`](crates/hirsel-init) | Root Zircon process (`userboot.next=bin/hirsel-init`): BOOTFS loader, `fuchsia.ldsvc.Loader`, Tier 1 job runner, Tier 1 `Dir` Zircon-channel server (`caps.rs`), encrypted multi-transport control plane (`api.rs`), and persistent Tier 2 VM manager + per-VM `smoltcp` virtual Ethernet gateway & L4 TCP port-forwarder (`vm_manager.rs`). |
+| [`crates/hirsel-vmm`](crates/hirsel-vmm) | Tier 2 hardware microVM VMM on `zx_guest_*` / `zx_vcpu_*`, 4-level identity page tables, x86-64 MMIO instruction decoder (`mmio.rs`), Virtio 1.0 MMIO v2 `virtio-net` device (`virtio_net_mmio.rs`), 16550A COM1 UART + dual 8259A PIC (IRQ 4/5), minimal ACPI 2.0 + `LNRO0005` DSDT (`linux_boot.rs`), persistent `ManagedVmControl`, and Ring-3 Linux static ELF runner. |
 | [`crates/hirsel-virtio`](crates/hirsel-virtio) | Ring-3 Virtio 1.0 Modern PCI drivers (`virtio-blk`, `virtio-net`), Zircon IOMMU/BTI contiguous DMA, GPR inline-asm MMIO, `HRSLBLK1` image store, `HRSLFS01` persistent file store, and `HRSLAB01` A/B ZBI upgrade slots. |
 | [`crates/hirsel-proto`](crates/hirsel-proto) | Zero-dependency binary RPC protocol (`HRSL`), IEEE CRC32, SHA-256, RFC 2104 HMAC-SHA256, HKDF-SHA256, and RFC 8439 ChaCha20-Poly1305 AEAD (`crypto.rs`). |
 | [`crates/hirsel-os-ctl`](crates/hirsel-os-ctl) | Operator CLI: `ping`, `info`, `images`, `run`, `run-bootfs`, `upgrade`, `upgrade-status`. Compiles Hirsel packages, deduplicates by SHA-256, and streams over authenticated AEAD sessions. |
@@ -60,6 +60,7 @@ Zircon's `userboot` launches `bin/hirsel-init` directly (`userboot.next=bin/hirs
 - [`examples/linux-shim`](examples/linux-shim): 14 KiB Ring-0 -> Ring-3 Linux x86-64 compatibility shim (`bin/hirsel-linux-shim.elf`) setting up GDT/TSS/user page tables and zero-exit `SYSCALL`/`SYSRET`.
 - [`examples/linux-workload`](examples/linux-workload): Unmodified Linux x86-64 static ELF (`hello-linux`) using raw Linux `syscall`s (`uname`, `clock_gettime`, `getrandom`, `brk`, `write`, `exit_group`) that runs identically natively on Linux and inside Hirsel-OS Tier 2 AMD SVM Ring 3.
 - [`examples/linux-init`](examples/linux-init): Minimal static Linux x86-64 PID 1 (`/init`) packed into `out/linux/initramfs.cpio` (with `/dev/console` and `/dev/null`), booted by Firecracker's upstream **Linux 6.1.102** `vmlinux` inside Zircon AMD SVM.
+- [`examples/linux-vm`](examples/linux-vm): Declarative VM spec ([`vm.spec`](examples/linux-vm/vm.spec)) + BusyBox/Dropbear `/init` ([`init.sh`](examples/linux-vm/init.sh)) for persistent SSH-accessible Linux 6.1.102 MicroVMs with `virtio-net` `eth0`.
 
 ## Upstreamable Patches
 
@@ -93,18 +94,38 @@ just test-all
 
 # Boot a REAL upstream Linux 6.1.102 x86-64 kernel + initramfs to PID 1 inside Zircon AMD SVM!
 just test-linux-vm
+
+# Start a persistent Linux 6.1.102 MicroVM from examples/linux-vm/vm.spec,
+# configure virtio-net eth0 (10.0.3.2/24), and SSH directly into it!
+just test-vm-ssh
 ```
 
 ### 3. Boot Interactively & Operate with `hirsel-os-ctl`
 
 ```bash
-# Terminal 1: boot Zircon + Hirsel-OS under KVM (TCP :4444 + COM2 :4445 + 32 MiB disk)
+# Terminal 1: boot Zircon + Hirsel-OS under KVM (TCP :4444 API + :2222/:2223 VM SSH + 64 MiB disk)
 just boot-os
 
 # Terminal 2: operate the shell-less node via encrypted RPC
 just ctl ping
 just ctl info
 just ctl images
+
+# Build SSH-ready Linux 6.1.102 kernel + BusyBox/Dropbear initramfs, then launch a persistent VM
+just fetch-linux-kernel build-linux-ssh-initrd
+just ctl vm start --spec examples/linux-vm/vm.spec
+just ctl vm ls
+just ctl vm inspect dev-1
+just ctl vm logs dev-1
+
+# SSH directly into the running Linux 6.1.102 MicroVM!
+just ctl vm ssh dev-1
+# or with standard OpenSSH directly:
+ssh -i out/linux/id_ed25519 -p 2222 root@127.0.0.1
+
+# Stop and remove the VM cleanly when done
+just ctl vm stop dev-1
+just ctl vm rm dev-1
 
 # Compile, upload, and run a Tier 1 Hirsel program with capability grants
 just ctl run --tier 1 \
@@ -142,5 +163,6 @@ just ctl upgrade-status
 | Tier 1 native Hirsel Job cold-to-exit (policy-locked `zx::Job` + `Dir` RPC) | **~2.9–3.4 ms** |
 | Tier 2 unmodified Linux x86-64 static ELF cold-to-exit (AMD SVM Ring 3) | **~5.5 ms** |
 | Tier 2 **real upstream Linux 6.1.102** kernel + initramfs boot to PID 1 (cache hit, quiet) | **469 ms to PID 1 / 630 ms cold-to-exit** |
+| Tier 2 persistent Linux 6.1.102 VM boot to Dropbear SSH ready + `virtio-net` `eth0` ping | **~800 ms to SSH ready / 0.85 ms ping RTT** |
 | Cold reboot image hydration from `virtio-blk` (`HRSLBLK1`) | **~14 ms** |
 | 4.4 MiB A/B ZBI upgrade streaming + SHA-256 verification + `virtio-blk` write | **1.26 s** |

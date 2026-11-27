@@ -4,6 +4,8 @@
 //! RPC traffic with RFC 8439 ChaCha20-Poly1305 AEAD over TCP (`virtio-net`) or
 //! Unix socket (COM2 serial fallback).
 
+mod vm;
+
 use hirsel_proto::crypto::{
     DEFAULT_DEV_KEY_STR, SessionCipher, compute_client_auth_mac, compute_server_auth_mac, ct_eq,
     derive_cluster_key,
@@ -26,7 +28,7 @@ enum Stream {
     Unix(UnixStream),
 }
 
-struct Transport {
+pub(crate) struct Transport {
     stream: Stream,
     cipher: Option<SessionCipher>,
 }
@@ -112,7 +114,7 @@ impl Transport {
         }
     }
 
-    fn call(&mut self, req: &Request) -> Result<Response, String> {
+    pub(crate) fn call(&mut self, req: &Request) -> Result<Response, String> {
         let wire = match self.cipher.as_mut() {
             Some(c) => req.encode_encrypted(c)?,
             None => req.encode()?,
@@ -142,6 +144,7 @@ fn usage() {
            upgrade-status                               Show A/B boot slot state & staged ZBI digest\n\
            run [options] <path>                         Compile (if Hirsel dir), upload & run\n\
            run-bootfs [options] <bootfs-path>           Run a built-in BOOTFS image\n\
+           vm <start|ls|inspect|logs|send|ssh|stop|rm>  Manage persistent Linux MicroVMs & SSH\n\
          \n\
          Run options:\n\
            --tier 1|2                                   Execution tier (default: 1)\n\
@@ -209,7 +212,7 @@ fn compile_hirsel_package(pkg_dir: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn ensure_uploaded(tx: &mut Transport, name: &str, bytes: &[u8]) -> Result<[u8; 32], String> {
+pub(crate) fn ensure_uploaded(tx: &mut Transport, name: &str, bytes: &[u8]) -> Result<[u8; 32], String> {
     let digest = sha256(bytes);
     let short = &hex_encode(&digest)[..12];
 
@@ -656,6 +659,7 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        "vm" => vm::handle_vm_command(&mut tx, &addr, args),
         other => Err(format!("unknown command `{other}`")),
     };
 

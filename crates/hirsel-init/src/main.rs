@@ -9,6 +9,8 @@ mod api;
 mod caps;
 #[cfg(target_os = "fuchsia")]
 mod runner;
+#[cfg(target_os = "fuchsia")]
+mod vm_manager;
 
 #[cfg(target_os = "fuchsia")]
 mod fuchsia_main {

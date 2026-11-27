@@ -33,6 +33,7 @@ pub const ZX_ERR_WRONG_TYPE: zx_status_t = -12;
 pub const ZX_ERR_BAD_STATE: zx_status_t = -20;
 pub const ZX_ERR_TIMED_OUT: zx_status_t = -21;
 pub const ZX_ERR_SHOULD_WAIT: zx_status_t = -22;
+pub const ZX_ERR_CANCELED: zx_status_t = -23;
 pub const ZX_ERR_PEER_CLOSED: zx_status_t = -24;
 pub const ZX_ERR_NOT_FOUND: zx_status_t = -25;
 pub const ZX_ERR_ACCESS_DENIED: zx_status_t = -30;

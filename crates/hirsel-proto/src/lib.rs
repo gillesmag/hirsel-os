@@ -40,6 +40,13 @@ const REQ_UPGRADE_START: u8 = 0x0C;
 const REQ_UPGRADE_CHUNK: u8 = 0x0D;
 const REQ_UPGRADE_FINISH: u8 = 0x0E;
 const REQ_UPGRADE_STATUS: u8 = 0x0F;
+const REQ_VM_START: u8 = 0x10;
+const REQ_VM_LIST: u8 = 0x11;
+const REQ_VM_INSPECT: u8 = 0x12;
+const REQ_VM_LOGS: u8 = 0x13;
+const REQ_VM_CONSOLE_WRITE: u8 = 0x14;
+const REQ_VM_STOP: u8 = 0x15;
+const REQ_VM_REMOVE: u8 = 0x16;
 
 // Response message types (0x81..0xFF)
 const RESP_PONG: u8 = 0x81;
@@ -52,6 +59,9 @@ const RESP_AUTH_CHALLENGE: u8 = 0x87;
 const RESP_AUTH_OK: u8 = 0x88;
 const RESP_IMAGE_LIST: u8 = 0x89;
 const RESP_UPGRADE_INFO: u8 = 0x8A;
+const RESP_VM_INFO: u8 = 0x8B;
+const RESP_VM_LIST: u8 = 0x8C;
+const RESP_VM_LOGS: u8 = 0x8D;
 const RESP_ERROR: u8 = 0xFF;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +80,68 @@ pub enum Tier2Mode {
     LinuxUserElf = 1,
     /// Full upstream Linux x86-64 kernel (`vmlinux` ELF or `bzImage`) + optional `initramfs`.
     LinuxKernel = 2,
+}
+
+/// L4 TCP port forward from Hirsel-OS node `host_port` to guest VM `guest_port`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortForward {
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+/// Virtual Ethernet + IPv4 + port-forwarding configuration for a managed Linux MicroVM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmNetSpec {
+    pub guest_ip: [u8; 4],
+    pub gateway_ip: [u8; 4],
+    pub prefix_len: u8,
+    pub mac: [u8; 6],
+    pub ports: Vec<PortForward>,
+}
+
+/// Declarative specification for launching a persistent managed Tier 2 Linux MicroVM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmSpec {
+    pub name: String,
+    pub kernel: RunTarget,
+    pub initrd: Option<RunTarget>,
+    pub ram_mib: u32,
+    pub cmdline: String,
+    pub net: Option<VmNetSpec>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmStatus {
+    Running = 0,
+    Exited = 1,
+    Failed = 2,
+}
+
+impl VmStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VmStatus::Running => "running",
+            VmStatus::Exited => "exited",
+            VmStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Live runtime status and counters for a managed Tier 2 MicroVM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmSummary {
+    pub id: String,
+    pub name: String,
+    pub status: VmStatus,
+    pub exit_code: i32,
+    pub error: String,
+    pub ram_mib: u32,
+    pub uptime_ms: u64,
+    pub io_exits: u64,
+    pub mmio_exits: u64,
+    pub net_rx_packets: u64,
+    pub net_tx_packets: u64,
+    pub net: Option<VmNetSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +201,26 @@ pub enum Request {
         digest: [u8; 32],
     },
     UpgradeStatus,
+    VmStart(VmSpec),
+    VmList,
+    VmInspect {
+        id: String,
+    },
+    VmLogs {
+        id: String,
+        offset: u64,
+        max_bytes: u32,
+    },
+    VmConsoleWrite {
+        id: String,
+        data: Vec<u8>,
+    },
+    VmStop {
+        id: String,
+    },
+    VmRemove {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +292,13 @@ pub enum Response {
     },
     RunResult(RunResult),
     UpgradeInfo(UpgradeInfo),
+    VmInfo(VmSummary),
+    VmList(Vec<VmSummary>),
+    VmLogs {
+        data: Vec<u8>,
+        next_offset: u64,
+        status: VmStatus,
+    },
     Error {
         message: String,
     },
@@ -341,8 +440,14 @@ impl<'a> Cursor<'a> {
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
     fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i32(&mut self) -> Result<i32, String> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
@@ -376,6 +481,87 @@ impl<'a> Cursor<'a> {
             tag => Err(format!("unknown RunTarget tag {tag}")),
         }
     }
+    fn vm_net_spec(&mut self) -> Result<Option<VmNetSpec>, String> {
+        if self.u8()? == 0 {
+            return Ok(None);
+        }
+        let guest_ip: [u8; 4] = self.take(4)?.try_into().unwrap();
+        let gateway_ip: [u8; 4] = self.take(4)?.try_into().unwrap();
+        let prefix_len = self.u8()?;
+        let mac: [u8; 6] = self.take(6)?.try_into().unwrap();
+        let port_count = self.u32()? as usize;
+        let mut ports = Vec::with_capacity(port_count);
+        for _ in 0..port_count {
+            ports.push(PortForward {
+                host_port: self.u16()?,
+                guest_port: self.u16()?,
+            });
+        }
+        Ok(Some(VmNetSpec {
+            guest_ip,
+            gateway_ip,
+            prefix_len,
+            mac,
+            ports,
+        }))
+    }
+    fn vm_status(&mut self) -> Result<VmStatus, String> {
+        match self.u8()? {
+            0 => Ok(VmStatus::Running),
+            1 => Ok(VmStatus::Exited),
+            2 => Ok(VmStatus::Failed),
+            other => Err(format!("unknown VmStatus {other}")),
+        }
+    }
+    fn vm_summary(&mut self) -> Result<VmSummary, String> {
+        Ok(VmSummary {
+            id: self.string()?,
+            name: self.string()?,
+            status: self.vm_status()?,
+            exit_code: self.i32()?,
+            error: self.string()?,
+            ram_mib: self.u32()?,
+            uptime_ms: self.u64()?,
+            io_exits: self.u64()?,
+            mmio_exits: self.u64()?,
+            net_rx_packets: self.u64()?,
+            net_tx_packets: self.u64()?,
+            net: self.vm_net_spec()?,
+        })
+    }
+}
+
+fn put_vm_net_spec(out: &mut Vec<u8>, net: &Option<VmNetSpec>) {
+    match net {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            out.extend_from_slice(&n.guest_ip);
+            out.extend_from_slice(&n.gateway_ip);
+            out.push(n.prefix_len);
+            out.extend_from_slice(&n.mac);
+            out.extend_from_slice(&(n.ports.len() as u32).to_le_bytes());
+            for pf in &n.ports {
+                out.extend_from_slice(&pf.host_port.to_le_bytes());
+                out.extend_from_slice(&pf.guest_port.to_le_bytes());
+            }
+        }
+    }
+}
+
+fn put_vm_summary(out: &mut Vec<u8>, s: &VmSummary) {
+    put_string(out, &s.id);
+    put_string(out, &s.name);
+    out.push(s.status as u8);
+    out.extend_from_slice(&s.exit_code.to_le_bytes());
+    put_string(out, &s.error);
+    out.extend_from_slice(&s.ram_mib.to_le_bytes());
+    out.extend_from_slice(&s.uptime_ms.to_le_bytes());
+    out.extend_from_slice(&s.io_exits.to_le_bytes());
+    out.extend_from_slice(&s.mmio_exits.to_le_bytes());
+    out.extend_from_slice(&s.net_rx_packets.to_le_bytes());
+    out.extend_from_slice(&s.net_tx_packets.to_le_bytes());
+    put_vm_net_spec(out, &s.net);
 }
 
 fn put_bytes(out: &mut Vec<u8>, data: &[u8]) {
@@ -537,6 +723,49 @@ impl Request {
                 REQ_UPGRADE_FINISH
             }
             Request::UpgradeStatus => REQ_UPGRADE_STATUS,
+            Request::VmStart(spec) => {
+                put_string(&mut p, &spec.name);
+                put_target(&mut p, &spec.kernel);
+                match &spec.initrd {
+                    Some(rd) => {
+                        p.push(1);
+                        put_target(&mut p, rd);
+                    }
+                    None => p.push(0),
+                }
+                p.extend_from_slice(&spec.ram_mib.to_le_bytes());
+                put_string(&mut p, &spec.cmdline);
+                put_vm_net_spec(&mut p, &spec.net);
+                REQ_VM_START
+            }
+            Request::VmList => REQ_VM_LIST,
+            Request::VmInspect { id } => {
+                put_string(&mut p, id);
+                REQ_VM_INSPECT
+            }
+            Request::VmLogs {
+                id,
+                offset,
+                max_bytes,
+            } => {
+                put_string(&mut p, id);
+                p.extend_from_slice(&offset.to_le_bytes());
+                p.extend_from_slice(&max_bytes.to_le_bytes());
+                REQ_VM_LOGS
+            }
+            Request::VmConsoleWrite { id, data } => {
+                put_string(&mut p, id);
+                put_bytes(&mut p, data);
+                REQ_VM_CONSOLE_WRITE
+            }
+            Request::VmStop { id } => {
+                put_string(&mut p, id);
+                REQ_VM_STOP
+            }
+            Request::VmRemove { id } => {
+                put_string(&mut p, id);
+                REQ_VM_REMOVE
+            }
         };
         (ty, p)
     }
@@ -618,6 +847,39 @@ impl Request {
             }),
             REQ_UPGRADE_FINISH => Ok(Request::UpgradeFinish { digest: c.digest()? }),
             REQ_UPGRADE_STATUS => Ok(Request::UpgradeStatus),
+            REQ_VM_START => {
+                let name = c.string()?;
+                let kernel = c.target()?;
+                let initrd = if c.u8()? != 0 {
+                    Some(c.target()?)
+                } else {
+                    None
+                };
+                let ram_mib = c.u32()?;
+                let cmdline = c.string()?;
+                let net = c.vm_net_spec()?;
+                Ok(Request::VmStart(VmSpec {
+                    name,
+                    kernel,
+                    initrd,
+                    ram_mib,
+                    cmdline,
+                    net,
+                }))
+            }
+            REQ_VM_LIST => Ok(Request::VmList),
+            REQ_VM_INSPECT => Ok(Request::VmInspect { id: c.string()? }),
+            REQ_VM_LOGS => Ok(Request::VmLogs {
+                id: c.string()?,
+                offset: c.u64()?,
+                max_bytes: c.u32()?,
+            }),
+            REQ_VM_CONSOLE_WRITE => Ok(Request::VmConsoleWrite {
+                id: c.string()?,
+                data: c.bytes()?,
+            }),
+            REQ_VM_STOP => Ok(Request::VmStop { id: c.string()? }),
+            REQ_VM_REMOVE => Ok(Request::VmRemove { id: c.string()? }),
             other => Err(format!("unknown Request type {other:#x}")),
         }
     }
@@ -695,6 +957,27 @@ impl Response {
                 p.extend_from_slice(&u.staged_size.to_le_bytes());
                 p.extend_from_slice(&u.boot_attempts.to_le_bytes());
                 RESP_UPGRADE_INFO
+            }
+            Response::VmInfo(s) => {
+                put_vm_summary(&mut p, s);
+                RESP_VM_INFO
+            }
+            Response::VmList(list) => {
+                p.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                for item in list {
+                    put_vm_summary(&mut p, item);
+                }
+                RESP_VM_LIST
+            }
+            Response::VmLogs {
+                data,
+                next_offset,
+                status,
+            } => {
+                put_bytes(&mut p, data);
+                p.extend_from_slice(&next_offset.to_le_bytes());
+                p.push(*status as u8);
+                RESP_VM_LOGS
             }
             Response::Error { message } => {
                 put_string(&mut p, message);
@@ -777,6 +1060,20 @@ impl Response {
                 staged_size: c.u64()?,
                 boot_attempts: c.u32()?,
             })),
+            RESP_VM_INFO => Ok(Response::VmInfo(c.vm_summary()?)),
+            RESP_VM_LIST => {
+                let count = c.u32()? as usize;
+                let mut list = Vec::with_capacity(count);
+                for _ in 0..count {
+                    list.push(c.vm_summary()?);
+                }
+                Ok(Response::VmList(list))
+            }
+            RESP_VM_LOGS => Ok(Response::VmLogs {
+                data: c.bytes()?,
+                next_offset: c.u64()?,
+                status: c.vm_status()?,
+            }),
             RESP_ERROR => Ok(Response::Error {
                 message: c.string()?,
             }),
@@ -920,5 +1217,28 @@ mod tests {
         let dec = read_frame_with_cipher(&mut slice, Some(&mut srv)).unwrap();
         assert_eq!(dec.flags & FLAG_ENCRYPTED, FLAG_ENCRYPTED);
         assert_eq!(Request::decode_body(dec.msg_type, &dec.payload).unwrap(), req);
+
+        // Also verify managed VM spec + summary wire roundtrip.
+        let vm_req = Request::VmStart(VmSpec {
+            name: "dev-1".into(),
+            kernel: RunTarget::Digest(sha256(b"vmlinux")),
+            initrd: Some(RunTarget::Digest(sha256(b"initrd"))),
+            ram_mib: 128,
+            cmdline: "console=ttyS0".into(),
+            net: Some(VmNetSpec {
+                guest_ip: [10, 0, 3, 2],
+                gateway_ip: [10, 0, 3, 1],
+                prefix_len: 24,
+                mac: [0x02, 0x48, 0x52, 0x53, 0x4c, 0x01],
+                ports: vec![PortForward {
+                    host_port: 2222,
+                    guest_port: 22,
+                }],
+            }),
+        });
+        let wire2 = vm_req.encode_encrypted(&mut cli).unwrap();
+        let mut slice2 = wire2.as_slice();
+        let dec2 = read_frame_with_cipher(&mut slice2, Some(&mut srv)).unwrap();
+        assert_eq!(Request::decode_body(dec2.msg_type, &dec2.payload).unwrap(), vm_req);
     }
 }
