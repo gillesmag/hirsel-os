@@ -11,11 +11,168 @@
 mod fuchsia_impl {
     use hirsel_vmm::ManagedVmControl;
     use hirsel_vmm::virtio_blk_mmio::{BLK_SECTOR_SIZE, MemBlockBackend, VmBlockBackend};
+    use hirsel_vmm::virtio_net_mmio::VirtioNetChannel;
+    use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+    use smoltcp::time::Instant as SmolInstant;
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+    use std::collections::VecDeque;
     use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::net::TcpStream;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use zx_sys::*;
+
+    struct BridgeNetDev {
+        ch: Arc<VirtioNetChannel>,
+        rx_buf: VecDeque<Vec<u8>>,
+    }
+    struct BridgeRx(Vec<u8>);
+    impl RxToken for BridgeRx {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R { f(&self.0) }
+    }
+    struct BridgeTx(Arc<VirtioNetChannel>);
+    impl TxToken for BridgeTx {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut buf = vec![0u8; len];
+            let r = f(&mut buf);
+            self.0.host_push_tx(buf);
+            r
+        }
+    }
+    impl Device for BridgeNetDev {
+        type RxToken<'a> = BridgeRx where Self: 'a;
+        type TxToken<'a> = BridgeTx where Self: 'a;
+        fn receive(&mut self, _: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let frame = self.rx_buf.pop_front()?;
+            Some((BridgeRx(frame), BridgeTx(Arc::clone(&self.ch))))
+        }
+        fn transmit(&mut self, _: SmolInstant) -> Option<Self::TxToken<'_>> {
+            Some(BridgeTx(Arc::clone(&self.ch)))
+        }
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ethernet;
+            caps.max_transmission_unit = 1514;
+            caps.max_burst_size = Some(16);
+            caps
+        }
+    }
+
+    fn spawn_egress_net_bridge(ch: Arc<VirtioNetChannel>, ctrl: Arc<ManagedVmControl>) {
+        thread::spawn(move || {
+            let mut dev = BridgeNetDev { ch: Arc::clone(&ch), rx_buf: VecDeque::new() };
+            let gw_mac = EthernetAddress([0x52, 0x54, 0x00, 0x48, 0x52, 0x00]);
+            let cfg = IfaceConfig::new(HardwareAddress::Ethernet(gw_mac));
+            let now_ms = || -> SmolInstant {
+                let ns = unsafe { zx_clock_get_monotonic() };
+                SmolInstant::from_millis((ns / 1_000_000) as i64)
+            };
+            let mut iface = Interface::new(cfg, &mut dev, now_ms());
+            iface.update_ip_addrs(|addrs| {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 3, 1)), 24));
+            });
+
+            let mut sockets = SocketSet::new(vec![]);
+            let tcp_rx = TcpSocketBuffer::new(vec![0u8; 16384]);
+            let tcp_tx = TcpSocketBuffer::new(vec![0u8; 16384]);
+            let mut sock = TcpSocket::new(tcp_rx, tcp_tx);
+            let _ = sock.listen(7781);
+            let handle = sockets.add(sock);
+
+            let mut host_conn: Option<TcpStream> = None;
+            let mut to_host_buf = Vec::<u8>::new();
+            let mut to_guest_buf = Vec::<u8>::new();
+            let mut tmp = [0u8; 4096];
+
+            while !ctrl.is_stop_requested() {
+                let mut did_work = false;
+                while let Some(frame) = ch.host_pop_rx() {
+                    dev.rx_buf.push_back(frame);
+                    did_work = true;
+                }
+                let t = now_ms();
+                iface.poll(t, &mut dev, &mut sockets);
+
+                let sock = sockets.get_mut::<TcpSocket>(handle);
+                if sock.is_active() {
+                    if host_conn.is_none() {
+                        match TcpStream::connect("127.0.0.1:7781") {
+                            Ok(s) => {
+                                let _ = s.set_nonblocking(true);
+                                host_conn = Some(s);
+                                to_host_buf.clear();
+                                to_guest_buf.clear();
+                            }
+                            Err(_) => {
+                                sock.abort();
+                            }
+                        }
+                    }
+                    if sock.can_recv() {
+                        if let Ok(n) = sock.recv_slice(&mut tmp) {
+                            if n > 0 {
+                                to_host_buf.extend_from_slice(&tmp[..n]);
+                                did_work = true;
+                            }
+                        }
+                    }
+                    let mut host_eof = false;
+                    if let Some(ref mut hc) = host_conn {
+                        if !to_host_buf.is_empty() {
+                            match hc.write(&to_host_buf) {
+                                Ok(n) if n > 0 => {
+                                    to_host_buf.drain(..n);
+                                    did_work = true;
+                                }
+                                Ok(_) => {}
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => host_eof = true,
+                            }
+                        }
+                        if to_guest_buf.len() < 16384 {
+                            match hc.read(&mut tmp) {
+                                Ok(0) => host_eof = true,
+                                Ok(n) => {
+                                    to_guest_buf.extend_from_slice(&tmp[..n]);
+                                    did_work = true;
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => host_eof = true,
+                            }
+                        }
+                    }
+                    if !to_guest_buf.is_empty() && sock.can_send() {
+                        if let Ok(n) = sock.send_slice(&to_guest_buf) {
+                            if n > 0 {
+                                to_guest_buf.drain(..n);
+                                did_work = true;
+                            }
+                        }
+                    }
+                    if host_eof && to_guest_buf.is_empty() {
+                        sock.close();
+                        host_conn = None;
+                    }
+                } else {
+                    host_conn = None;
+                    to_host_buf.clear();
+                    to_guest_buf.clear();
+                    if !sock.is_listening() {
+                        let _ = sock.listen(7781);
+                    }
+                }
+
+                iface.poll(now_ms(), &mut dev, &mut sockets);
+                if !did_work {
+                    let now = unsafe { zx_clock_get_monotonic() };
+                    unsafe { zx_nanosleep(now.saturating_add(2_000_000)) };
+                }
+            }
+        });
+    }
 
     struct FileBlockBackend {
         file: File,
@@ -172,7 +329,10 @@ mod fuchsia_impl {
             initrd.len() / 1024,
         ));
 
-        let ctrl = ManagedVmControl::new(None);
+        let net_ch = VirtioNetChannel::new();
+        let ctrl = ManagedVmControl::new(Some(Arc::clone(&net_ch)));
+        spawn_egress_net_bridge(Arc::clone(&net_ch), Arc::clone(&ctrl));
+        emit_log("[hirsel-vm-host] attached capability-gated virtio-net eth0 (10.0.3.2 -> gw 10.0.3.1:7781 egress_gw.cm ONLY)");
 
         // Background thread: stream guest COM1 console output to hirsel_shell and detect READY.
         let ctrl_log = Arc::clone(&ctrl);
@@ -268,10 +428,10 @@ mod fuchsia_impl {
             vmex_res,
             &kernel,
             Some(&initrd),
-            "console=ttyS0 reboot=k panic=1 pci=off nomodules hirsel.name=vm-dev",
+            "console=ttyS0 reboot=k panic=1 pci=off nomodules hirsel.name=vm-dev hirsel.ip=10.0.3.2/24 hirsel.gw=10.0.3.1",
             128 * 1024 * 1024,
             2,
-            None,
+            Some([0x52, 0x54, 0x00, 0x48, 0x52, 0x01]),
             Some(blk_backend),
             ctrl,
         )?;

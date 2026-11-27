@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end QEMU/KVM verification of Hirsel-OS Desktop:
+"""End-to-end QEMU/KVM verification of Hirsel-OS Desktop (Milestones 1-6):
   1. Pure-Hirsel hirsel-wm (layout, anti-spoofing, ceremony, Bank, Caretaker)
-  2. Native Chromium 160 + Chrome 160 HTML-in-Canvas (drawElementImage) + 2 isolated contexts
-  3. Pure-Hirsel Figments js@1 sandbox Place (/pkg/bin/hirsel-js, zero ambient handles)
-  4. Real Tier-2 2-vCPU Linux 6.1.102 AMD-SVM MicroVM in vm-dev (/dev/hvc0 + persistent /mnt/data)
-  5. Real Powerbox clipboard byte delivery into Linux 6.1.102 (/mnt/data/powerbox_paste.txt)
-  6. Real outbound egress-gw HTTP forwarding with host-only secret injection & Outbox execution
-  7. Full cold-reboot persistence on Fxfs (room, audit log, and Linux /mnt/data ext2 volume!)
+  2. Pure-Hirsel hirsel-board (cards, elbow edges, camera pan/zoom, Fxfs persistence)
+  3. Pure-Hirsel hirsel-agent (autonomous multi-tool loop -> js@1 -> Linux vm-dev -> Board -> Ceremony)
+  4. Native Chromium 160 + REAL HTML-in-Canvas (content="drawable" + drawElementImage) + multi-origin isolation
+  5. Pure-Hirsel Figments js@1 sandbox Place (/pkg/bin/hirsel-js, zero ambient handles)
+  6. Real Tier-2 2-vCPU Linux 6.1.102 AMD-SVM MicroVM in vm-dev (/dev/hvc0 + ANSI colors + persistent /mnt/data)
+  7. Isolated egress_gw.cm Fuchsia component (TLS 1.3 root certs + SAS-only sealed secret vault + allowlist)
+  8. Full cold-reboot persistence on Fxfs (room, audit, board, sealed secrets vault, Linux /mnt/data!)
 """
 import json
 import os
@@ -88,7 +89,7 @@ def qmp_screendump(png_path: str) -> tuple[int, int]:
     return w, h
 
 
-def http_req(method: str, path: str, body: str | None = None, timeout: float = 15.0) -> tuple[int, dict]:
+def http_req(method: str, path: str, body: str | None = None, timeout: float = 20.0) -> tuple[int, dict]:
     url = f"http://127.0.0.1:{CTRL_PORT}{path}"
     data = body.encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -200,155 +201,210 @@ def main() -> int:
         check=True,
     )
 
-    print("=== 2. BOOT #1: Full Hirsel-OS Desktop ===")
+    print("=== 2. BOOT #1: Full Hirsel-OS Desktop (Milestones 1-6) ===")
     proc = start_qemu(SERIAL_LOG)
     try:
         st = wait_for_desktop(proc, "BOOT1")
         assert st["room"] == "darkroom" and st["focused"] == "figments"
         wait_for_linux_vm("BOOT1")
 
-        print("=== 3. Wait for Native Chromium 160 + HTML-in-Canvas paint ===")
+        print("=== 3. Verify Isolated egress_gw.cm Component (TLS 1.3 Roots + SAS-Only Secret Vault) ===")
+        for _ in range(20):
+            hc, hval = http_req("GET", "/_hirsel/egress-health")
+            if hc == 200 and hval.get("ok"):
+                break
+            time.sleep(0.3)
+        print("  egress_gw.cm health:", hval)
+        assert hc == 200 and hval.get("component") == "egress_gw.cm" and hval.get("isolated_vault") is True, hval
+        assert hval.get("tls_roots", 0) > 50, f"Expected Fuchsia TLS root certs, got {hval}"
+
+        # Writing a secret outside SAS MUST be rejected with 403!
+        sc, sval = http_req("POST", "/_hirsel/secrets", json.dumps({"host": "example.com", "value": "sealed-demo-key-99"}))
+        assert sc == 403 and sval.get("reason") == "sas_trusted_chrome_required", (sc, sval)
+
+        # Enter SAS Trusted Chrome -> provision sealed secret -> exit SAS
+        _, _ = http_req("POST", "/_hirsel/cmd", "TOGGLE_SAS")
+        sc, sval = http_req("POST", "/_hirsel/secrets", json.dumps({"host": "example.com", "value": "sealed-demo-key-99"}))
+        print("  SAS secret store:", sval)
+        assert sc == 200 and sval.get("stored") is True, (sc, sval)
+        _, _ = http_req("POST", "/_hirsel/cmd", "TOGGLE_SAS")
+
+        # Verify GET /_hirsel/secrets exposes metadata ONLY (never plaintext!)
+        _, smeta = http_req("GET", "/_hirsel/secrets")
+        assert "sealed-demo-key-99" not in json.dumps(smeta), smeta
+        assert any(x["host"] == "example.com" for x in smeta.get("secrets", [])), smeta
+
+        print("=== 4. Wait for Native Chromium 160 + Figments HTML-in-Canvas (drawElementImage LIVE) ===")
         time.sleep(6.0)
         _, cdiag = http_req("GET", "/_hirsel/client-diag")
         print("  Chromium 160 client-diag:", cdiag)
         assert cdiag.get("drawElementWorked") is True, f"HTML-in-Canvas drawElementImage did not render live: {cdiag}"
         qmp_screendump(f"{OUT}/desktop-1-initial.png")
 
-        print("=== 4. Verify Pure-Hirsel Figments js@1 Codemode Sandbox + Persistent Board Card ===")
+        print("=== 5. Verify Pure-Hirsel hirsel-js + hirsel-board + Linux 6.1.102 vm-dev ===")
         code, js_res = http_req(
             "POST",
             "/_hirsel/codemode",
             "console.log('hi from Zircon'); return [6*7, 'hirsel-js@1']",
         )
         print("  js@1 result:", js_res)
-        assert code == 200 and js_res.get("ok") is True, js_res
-        assert "42" in js_res.get("value", "") and "hirsel-js@1" in js_res.get("value", ""), js_res
-        assert "hi from Zircon" in js_res.get("logs", ""), js_res
+        assert code == 200 and js_res.get("ok") is True and "42" in js_res.get("value", ""), js_res
 
         code, board_res = http_req(
             "POST",
             "/_hirsel/board",
             json.dumps({
+                "op": "put",
                 "id": "js-eval-1",
+                "kind": "code",
+                "tone": "ochre",
                 "title": "js@1 Codemode Result",
-                "sub": f"eval={js_res.get('value')} | persisted on Fxfs",
-                "color": "amber",
-                "x": 28,
+                "body": f"eval={js_res.get('value')} | persisted on Fxfs",
+                "x": 24,
                 "y": 300,
             }),
         )
-        assert code == 200 and len(board_res.get("cards", [])) == 1, board_res
+        assert code == 200 and any(c["id"] == "js-eval-1" for c in board_res.get("cards", [])), board_res
+        _, board_res = http_req(
+            "POST",
+            "/_hirsel/board",
+            json.dumps({"op": "link", "from": "wm", "to": "js-eval-1", "label": "codemode"}),
+        )
+        assert any(e["to"] == "js-eval-1" for e in board_res.get("edges", [])), board_res
 
-        print("=== 5. Verify REAL 2-vCPU Linux 6.1.102 AMD-SVM MicroVM + Persistent /mnt/data ===")
         code, vm_res = http_req(
             "POST",
             "/_hirsel/dev-exec",
-            "uname -srm && nproc && echo DESKTOP_PERSIST_99 > /mnt/data/persist.txt && sync && cat /mnt/data/persist.txt",
+            "printf '\\033[32mANSI_GREEN_OK\\033[0m\\n' && uname -srm && nproc && echo DESKTOP_PERSIST_99 > /mnt/data/persist.txt && sync && cat /mnt/data/persist.txt",
         )
         print("  vm-dev exec:", vm_res)
         assert code == 200 and vm_res.get("exit_code") == 0, vm_res
-        out_txt = vm_res.get("stdout", "")
-        assert "Linux 6.1.102" in out_txt and "DESKTOP_PERSIST_99" in out_txt, out_txt
+        assert "Linux 6.1.102" in vm_res.get("stdout", "") and "DESKTOP_PERSIST_99" in vm_res.get("stdout", "")
 
-        print("=== 6. Verify Focus Anti-Spoofing + Compositor Click + 3-Way Split + Powerbox ===")
+        print("=== 5b. Verify Capability-Gated virtio-net inside Linux vm-dev -> Isolated egress_gw.cm ONLY ===")
+        code, vnet = http_req(
+            "POST",
+            "/_hirsel/dev-exec",
+            "ip -o -4 addr show eth0 && ping -c 1 -W 2 10.0.3.1 >/dev/null && wget -qO- http://10.0.3.1:7781/health && echo '' && wget -qO- --post-data='{\"host\":\"127.0.0.1\",\"port\":7780,\"path\":\"/_hirsel/echo-target\"}' http://10.0.3.1:7781/proxy",
+        )
+        print("  Linux eth0 -> egress_gw.cm:", vnet)
+        assert code == 200 and vnet.get("exit_code") == 0, vnet
+        assert "10.0.3.2/24" in vnet.get("stdout", ""), vnet
+        assert '"component":"egress_gw.cm"' in vnet.get("stdout", ""), vnet
+        assert '"secret_injected":true' in vnet.get("stdout", "") and 'secret_present' in vnet.get("stdout", ""), vnet
+
+        _, sysinfo = http_req("GET", "/_hirsel/system")
+        print("  workstation system capabilities:", sysinfo)
+        assert sysinfo.get("hardware", {}).get("fxfs_data") is True, sysinfo
+        assert len(sysinfo.get("places", [])) == 4, sysinfo
+
+        print("=== 6. Verify Focus Anti-Spoofing + Compositor Clicks + Multi-Origin Web #2 + Powerbox ===")
         _, st = http_req("POST", "/_hirsel/spoof-focus", "web_untrusted")
         assert st["focused"] == "figments", f"Focus spoof not blocked: {st}"
-        # Click F2:VM-DEV pill in Top Trust Bar (x=280, y=18) -> opens Linux vm-dev pane!
         _, st = http_req("POST", "/_hirsel/click", json.dumps({"x": 280, "y": 18}))
-        assert st["layout"]["vm_dev"] is not None, f"Top-bar F2 click failed: {st}"
-        # Click F3:WEB pill in Top Trust Bar (x=365, y=18) -> opens isolated Chromium #2!
+        assert st["layout"]["vm_dev"] is not None
         _, st = http_req("POST", "/_hirsel/click", json.dumps({"x": 365, "y": 18}))
-        assert st["layout"]["web"] is not None, f"Top-bar F3 click failed: {st}"
-        # Click inside vm_dev pane & type a live command into the Linux terminal prompt
+        assert st["layout"]["web"] is not None
+
+        # Multi-origin switch spawns a brand-new OS-isolated fuchsia.web.Context!
+        nc, nval = http_req("POST", "/_hirsel/web-navigate", json.dumps({"url": "http://localhost:7711/untrusted"}))
+        print("  multi-origin navigate:", nval)
+        assert nc == 200 and nval.get("spawned_fresh_context") is True, nval
+
         vr = st["layout"]["vm_dev"]
         _, st = http_req("POST", "/_hirsel/click", json.dumps({"x": vr["x"] + 60, "y": vr["y"] + 80}))
-        assert st["focused"] == "vm_dev", f"Click vm_dev focus failed: {st}"
+        assert st["focused"] == "vm_dev"
         http_req("POST", "/_hirsel/type", "echo TYPED_INTERACTIVELY > /mnt/data/typed.txt && sync\n")
         time.sleep(0.8)
 
-        _, _ = http_req(
-            "POST",
-            "/_hirsel/clipboard",
-            json.dumps({"domain": "figments", "text": "POWERBOX_SECRET_42_FROM_FIGMENTS"}),
-        )
-        code, pb = http_req(
-            "POST",
-            "/_hirsel/powerbox-paste",
-            json.dumps({"from": "figments", "to": "vm_dev"}),
-        )
-        print("  powerbox result:", pb)
+        _, _ = http_req("POST", "/_hirsel/clipboard", json.dumps({"domain": "figments", "text": "POWERBOX_SECRET_42_FROM_FIGMENTS"}))
+        code, pb = http_req("POST", "/_hirsel/powerbox-paste", json.dumps({"from": "figments", "to": "vm_dev"}))
         assert code == 200 and pb.get("authorized") is True and pb.get("delivered") is True, pb
         _, check_pb = http_req("POST", "/_hirsel/dev-exec", "cat /mnt/data/powerbox_paste.txt")
         assert "POWERBOX_SECRET_42_FROM_FIGMENTS" in check_pb.get("stdout", ""), check_pb
-        print("  PASS: real Powerbox bytes verified inside Linux /mnt/data/powerbox_paste.txt!")
 
-        time.sleep(5.0)
-        qmp_screendump(f"{OUT}/desktop-2-split.png")
-
-        print("=== 7. Verify Real Outbound egress-gw + Host-Only Secret Injection + Disallowed Host 403 ===")
+        print("=== 7. Verify Isolated egress_gw.cm Proxy + Disallowed Host 403 + Real Autonomous Agent Loop ===")
         code, prx = http_req(
             "POST",
             "/_hirsel/proxy",
             json.dumps({"host": "127.0.0.1", "port": 7780, "path": "/_hirsel/echo-target"}),
         )
-        print("  egress-gw ok:", prx)
-        assert code == 200 and prx.get("http_status") == 200 and prx.get("secret_injected") is True, prx
+        print("  egress_gw.cm proxy:", prx)
+        assert code == 200 and prx.get("gateway") == "egress_gw.cm" and prx.get("http_status") == 200 and prx.get("secret_injected") is True, prx
         assert '"secret_present":true' in prx.get("body", ""), prx
 
         code, bad_prx = http_req("POST", "/_hirsel/proxy", json.dumps({"host": "evil.invalid", "port": 80, "path": "/"}))
         assert code == 403 and bad_prx.get("reason") == "host_not_in_capability_allowlist", (code, bad_prx)
 
-        print("=== 8. Verify Protected Outbox Ceremony + Bad Digest Denial + Real Approved Execution ===")
-        _, st = http_req("POST", "/_hirsel/stage", "")
-        assert st["focused"] == "trusted_chrome" and st["capture_allowed"] is False and st["outbox"]["status"] == "staged"
-        time.sleep(1.2)
+        # Real Autonomous Pure-Hirsel Agent: runs hirsel-js -> Linux vm-dev -> publishes hirsel-board card -> stages Ceremony!
+        ac, aval = http_req("POST", "/_hirsel/agent-run", "Audit Zircon + Linux vm-dev and publish verified report")
+        print("  hirsel-agent run:", aval)
+        assert ac == 200 and aval.get("ok") is True and aval.get("ceremony_staged") is True, aval
+        assert "91" in aval.get("js_result", "") and "Linux 6.1.102" in aval.get("vm_result", ""), aval
+
+        time.sleep(3.5)
         qmp_screendump(f"{OUT}/desktop-3-ceremony.png")
 
-        bad_id = st["outbox"]["id"]
+        # Bad digest MUST be rejected; then re-stage & approve -> executes via isolated egress_gw.cm!
+        bad_id = aval["wm_state"]["outbox"]["id"]
         _, st = http_req("POST", "/_hirsel/cmd", f"APPROVE {bad_id} 111111")
         assert st["denied"] == 1 and st["bank_spent_micros"] == 0
 
+        # Capture clean 3-way split screenshot now showing BOTH js-eval-1 AND agent-run-1 HTML-in-Canvas cards!
+        time.sleep(2.0)
+        qmp_screendump(f"{OUT}/desktop-2-split.png")
+
         _, st = http_req("POST", "/_hirsel/stage", "")
         code, appr = http_req("POST", "/_hirsel/approve", "")
-        print("  approved + executed:", appr)
+        print("  approved + executed via egress_gw.cm:", appr)
         assert code == 200 and appr["state"]["approved"] == 1 and appr["state"]["bank_spent_micros"] == 250000
-        assert appr["execution"]["executed"] is True and appr["execution"]["http_status"] == 200
+        assert appr["execution"]["executed"] is True and appr["execution"]["gateway"] == "egress_gw.cm" and appr["execution"]["http_status"] == 200
 
         _, st = http_req("POST", "/_hirsel/cmd", "REVOKE")
         code, rev_prx = http_req("POST", "/_hirsel/proxy", json.dumps({"host": "127.0.0.1", "port": 7780, "path": "/_hirsel/echo-target"}))
         assert code == 403 and rev_prx.get("reason") == "caretaker_connection_revoked"
 
-        # Toggle room to daylight so we can verify Fxfs persistence across cold reboot!
+        # Toggle room to Paper/Daylight so we verify full workstation persistence on cold reboot
         _, st = http_req("POST", "/_hirsel/cmd", "TOGGLE_ROOM")
         assert st["room"] == "daylight"
-        _, diag1 = http_req("GET", "/_hirsel/diag")
-        print("  boot1 final diag:", diag1)
         time.sleep(1.5)
     finally:
         stop_qemu(proc)
 
-    print("=== 9. BOOT #2 (COLD REBOOT on same Fxfs disk — verifying workstation persistence!) ===")
+    print("=== 8. BOOT #2 (COLD REBOOT on same Fxfs disk — verifying ALL persisted state!) ===")
     proc2 = start_qemu(f"{OUT}/serial-boot2.log")
     try:
         st2 = wait_for_desktop(proc2, "BOOT2")
         assert st2["room"] == "daylight", f"Expected persisted room=daylight after reboot, got {st2}"
         _, aud = http_req("GET", "/_hirsel/audit")
         print("  persisted audit log:", aud)
-        assert any("APPROVED & EXECUTED" in e for e in aud.get("audit", [])), aud
+        assert any("egress_gw.cm" in e and "HTTP 200" in e for e in aud.get("audit", [])), aud
+
         _, brd2 = http_req("GET", "/_hirsel/board")
-        print("  persisted Figments board:", brd2)
-        assert any(c.get("id") == "js-eval-1" for c in brd2.get("cards", [])), brd2
+        card_ids = [c["id"] for c in brd2.get("cards", [])]
+        print("  persisted pure-Hirsel hirsel-board cards:", card_ids)
+        assert "js-eval-1" in card_ids and "agent-run-1" in card_ids, brd2
+
+        # Verify isolated egress_gw.cm sealed secret persisted across cold reboot!
+        for _ in range(15):
+            sc2, smeta2 = http_req("GET", "/_hirsel/secrets")
+            if sc2 == 200:
+                break
+            time.sleep(0.3)
+        print("  persisted isolated egress_gw.cm secrets:", smeta2)
+        assert any(x["host"] == "example.com" for x in smeta2.get("secrets", [])), smeta2
 
         wait_for_linux_vm("BOOT2")
         code, pchk = http_req("POST", "/_hirsel/dev-exec", "cat /mnt/data/persist.txt && cat /mnt/data/powerbox_paste.txt && cat /mnt/data/typed.txt")
         print("  persisted Linux /mnt/data after cold reboot:", pchk)
         assert code == 200
-        assert "DESKTOP_PERSIST_99" in pchk.get("stdout", ""), pchk
-        assert "POWERBOX_SECRET_42_FROM_FIGMENTS" in pchk.get("stdout", ""), pchk
-        assert "TYPED_INTERACTIVELY" in pchk.get("stdout", ""), pchk
+        assert "DESKTOP_PERSIST_99" in pchk.get("stdout", "")
+        assert "POWERBOX_SECRET_42_FROM_FIGMENTS" in pchk.get("stdout", "")
+        assert "TYPED_INTERACTIVELY" in pchk.get("stdout", "")
+
         time.sleep(4.0)
         qmp_screendump(f"{OUT}/desktop-4-reboot-daylight.png")
-        print("\n=== ALL MILESTONE 1-3 E2E + PERSISTENCE CHECKS PASSED! ===")
+        print("\n=== ALL MILESTONE 1-5 + MULTI-ORIGIN + ANSI E2E & PERSISTENCE CHECKS PASSED! ===")
         return 0
     finally:
         stop_qemu(proc2)

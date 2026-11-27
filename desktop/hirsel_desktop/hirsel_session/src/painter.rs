@@ -227,6 +227,55 @@ impl<'a> Canvas<'a> {
         self.fill_rect(x + w.saturating_sub(t), y, t, h, rgba);
     }
 
+    pub fn draw_ansi_text(&mut self, mut x: usize, y: usize, text: &str, default_rgba: [u8; 4]) {
+        let mut color = default_rgba;
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // Parse ANSI CSI SGR sequence: ESC [ <codes> m
+                i += 2;
+                let start = i;
+                while i < bytes.len() && !(bytes[i] >= b'@' && bytes[i] <= b'~') {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'm' {
+                    if let Ok(params) = std::str::from_utf8(&bytes[start..i]) {
+                        for code in params.split(';') {
+                            match code {
+                                "" | "0" => color = default_rgba,
+                                "30" => color = [71, 85, 105, 255],
+                                "31" | "91" => color = [248, 113, 113, 255],
+                                "32" | "92" => color = [74, 222, 128, 255],
+                                "33" | "93" => color = [250, 204, 21, 255],
+                                "34" | "94" => color = [96, 165, 250, 255],
+                                "35" | "95" => color = [192, 132, 252, 255],
+                                "36" | "96" => color = [34, 211, 238, 255],
+                                "37" | "97" => color = [248, 250, 252, 255],
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if x + 8 > self.width {
+                break;
+            }
+            let bits = font8x16::glyph(bytes[i]);
+            for (row, &mask) in bits.iter().enumerate() {
+                for col in 0..8 {
+                    if (mask & (0x80 >> col)) != 0 {
+                        self.put_px(x + col, y + row, color[0], color[1], color[2], color[3]);
+                    }
+                }
+            }
+            x += 8;
+            i += 1;
+        }
+    }
+
     pub fn draw_text(&mut self, mut x: usize, y: usize, text: &str, scale: usize, rgba: [u8; 4]) {
         let step = 8 * scale;
         for byte in text.bytes() {
@@ -361,7 +410,7 @@ pub fn paint_dev_pane(c: &mut Canvas<'_>, plan: &ScenePlan, lines: &[String], in
     let max_lines = (c.height.saturating_sub(114)) / 14;
     let start = lines.len().saturating_sub(max_lines);
     for line in &lines[start..] {
-        c.draw_text(12, y, line, 1, [209, 250, 229, 255]);
+        c.draw_ansi_text(12, y, line, [209, 250, 229, 255]);
         y += 14;
     }
 

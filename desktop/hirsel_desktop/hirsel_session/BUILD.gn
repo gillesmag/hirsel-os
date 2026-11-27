@@ -1,8 +1,11 @@
 # Hirsel-OS Desktop Session package:
-#   - hirsel_session.cm: root session realm hosting hirsel_shell + web_engine context_provider
-#   - hirsel_shell: thin Rust Flatland presenter, Chromium 160 launcher, trusted chrome painter, egress-gw
-#   - bin/hirsel-wm: prebuilt pure-Hirsel deterministic window manager & security policy brain
-#   - bin/hirsel-js: prebuilt pure-Hirsel Figments js@1 deterministic JS sandbox Place
+#   - hirsel_session.cm: root session realm hosting hirsel_shell + isolated egress_gw + web_engine context_provider
+#   - egress_gw.cm: isolated Fuchsia component owning sealed Fxfs secret vault + TLS 1.3 HTTPS outbound gateway
+#   - hirsel_shell: thin Rust Flatland presenter, Chromium 160 launcher, trusted chrome painter
+#   - bin/hirsel-wm: pure-Hirsel deterministic window manager & security policy brain
+#   - bin/hirsel-board: pure-Hirsel Figments spatial board state Place (std.model.explore verified)
+#   - bin/hirsel-agent: pure-Hirsel autonomous agent planner Place (std.model.explore verified)
+#   - bin/hirsel-js: pure-Hirsel Figments js@1 deterministic JS sandbox Place
 #   - bin/hirsel-vm-host + data/vm/*: real Tier-2 Linux 6.1.102 AMD-SVM MicroVM host for vm-dev
 
 import("//build/bazel/bazel_inputs.gni")
@@ -14,6 +17,18 @@ import("//build/rust/rustc_binary.gni")
 resource("hirsel_wm_bin") {
   sources = [ "prebuilt/hirsel-wm" ]
   outputs = [ "bin/hirsel-wm" ]
+  allow_binary_output_dir = true
+}
+
+resource("hirsel_board_bin") {
+  sources = [ "prebuilt/hirsel-board" ]
+  outputs = [ "bin/hirsel-board" ]
+  allow_binary_output_dir = true
+}
+
+resource("hirsel_agent_bin") {
+  sources = [ "prebuilt/hirsel-agent" ]
+  outputs = [ "bin/hirsel-agent" ]
   allow_binary_output_dir = true
 }
 
@@ -39,11 +54,30 @@ resource("vm_linux_initrd") {
   outputs = [ "data/vm/initramfs-ssh.cpio" ]
 }
 
+rustc_binary("egress_gw_bin") {
+  output_name = "egress_gw"
+  edition = "2024"
+  source_root = "src/egress_gw.rs"
+  sources = [ "src/egress_gw.rs" ]
+  deps = [
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-async",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:log",
+    "//third_party/rust_crates:rustls",
+    "//third_party/rust_crates:rustls-pemfile",
+    "//third_party/rust_crates:serde_json",
+  ]
+}
+
 rustc_binary("hirsel_shell_bin") {
   output_name = "hirsel_shell"
   edition = "2024"
   source_root = "src/main.rs"
   sources = [
+    "src/agent_client.rs",
+    "src/board_client.rs",
     "src/font8x16.rs",
     "src/js_client.rs",
     "src/main.rs",
@@ -90,6 +124,16 @@ fuchsia_component("hirsel_session_component") {
   cm_label = ":hirsel_session_manifest"
 }
 
+fuchsia_component_manifest("egress_gw_manifest") {
+  manifest = "meta/egress_gw.cml"
+  component_name = "egress_gw"
+}
+
+fuchsia_component("egress_gw_component") {
+  cm_label = ":egress_gw_manifest"
+  deps = [ ":egress_gw_bin" ]
+}
+
 fuchsia_component_manifest("hirsel_shell_manifest") {
   manifest = "meta/hirsel_shell.cml"
   component_name = "hirsel_shell"
@@ -98,6 +142,8 @@ fuchsia_component_manifest("hirsel_shell_manifest") {
 fuchsia_component("hirsel_shell_component") {
   cm_label = ":hirsel_shell_manifest"
   deps = [
+    ":hirsel_agent_bin",
+    ":hirsel_board_bin",
     ":hirsel_js_bin",
     ":hirsel_shell_bin",
     ":hirsel_vm_host_bin",
@@ -110,6 +156,7 @@ fuchsia_component("hirsel_shell_component") {
 fuchsia_package("hirsel_session") {
   package_name = "hirsel_session"
   deps = [
+    ":egress_gw_component",
     ":hirsel_session_component",
     ":hirsel_shell_component",
   ]

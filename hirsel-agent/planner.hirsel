@@ -1,0 +1,313 @@
+// Pure-Hirsel Autonomous Agent Planner Place (zero ambient capabilities).
+// Formally verified by `std.model.explore` in `tests.hirsel`:
+//   1. Strict step bound (steps <= max_steps = 8)
+//   2. Host always in static capability allowlist
+//   3. External mutations ALWAYS stage through Protected Outbox Ceremony
+//   4. Per-effect cost bounded <= $1.00
+
+pub type Phase: key = Idle | RunningJs | RunningVm | PublishingCard | AwaitingCeremony | Done
+
+pub type AgentState: key {
+    phase: Phase,
+    steps: u64,
+    max_steps: u64,
+    goal: String,
+    js_result: String,
+    vm_result: String,
+    ceremony_staged: bool,
+    proposed_host: String,
+    proposed_action: String,
+    cost_micros: u64,
+}
+
+pub type AgentEvent = StartGoal(goal: String)
+    | JsCompleted(output: String)
+    | VmCompleted(output: String)
+    | CardPublished
+    | CeremonyFinished(approved: bool)
+
+pub fn is_allowed_host(host: String) -> bool {
+    if host == "127.0.0.1" { return true }
+    if host == "api.github.com" { return true }
+    if host == "api.anthropic.com" { return true }
+    if host == "api.openai.com" { return true }
+    if host == "example.com" { return true }
+    false
+}
+
+pub fn initial() -> AgentState {
+    AgentState(
+        phase: Idle,
+        steps: 0u64,
+        max_steps: 8u64,
+        goal: "",
+        js_result: "",
+        vm_result: "",
+        ceremony_staged: false,
+        proposed_host: "127.0.0.1",
+        proposed_action: "",
+        cost_micros: 0u64,
+    )
+}
+
+pub fn clone_state(s: AgentState) -> AgentState {
+    AgentState(
+        phase: s.phase,
+        steps: s.steps,
+        max_steps: s.max_steps,
+        goal: string.from(s.goal),
+        js_result: string.from(s.js_result),
+        vm_result: string.from(s.vm_result),
+        ceremony_staged: s.ceremony_staged,
+        proposed_host: string.from(s.proposed_host),
+        proposed_action: string.from(s.proposed_action),
+        cost_micros: s.cost_micros,
+    )
+}
+
+pub fn step(take s: AgentState, take ev: AgentEvent) -> AgentState {
+    let AgentState(
+        phase: s_phase,
+        steps: s_steps,
+        max_steps: s_max_steps,
+        goal: take s_goal,
+        js_result: take s_js,
+        vm_result: take s_vm,
+        ceremony_staged: s_staged,
+        proposed_host: take s_host,
+        proposed_action: take s_action,
+        cost_micros: s_cost,
+    ) = take s
+    if s_steps >= s_max_steps {
+        return AgentState(
+            phase: Done,
+            steps: s_steps,
+            max_steps: s_max_steps,
+            goal: take s_goal,
+            js_result: take s_js,
+            vm_result: take s_vm,
+            ceremony_staged: s_staged,
+            proposed_host: take s_host,
+            proposed_action: take s_action,
+            cost_micros: s_cost,
+        )
+    }
+    match take ev {
+        StartGoal(goal: take goal) => AgentState(
+            phase: RunningJs,
+            steps: 1u64,
+            max_steps: s_max_steps,
+            goal: take goal,
+            js_result: "",
+            vm_result: "",
+            ceremony_staged: false,
+            proposed_host: "127.0.0.1",
+            proposed_action: "POST_/repos/Ascending-AI/figments/agent-report",
+            cost_micros: 150000u64,
+        ),
+        JsCompleted(output: take output) => match s_phase {
+            RunningJs => AgentState(
+                phase: RunningVm,
+                steps: s_steps + 1u64,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take output,
+                vm_result: take s_vm,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+            _ => AgentState(
+                phase: s_phase,
+                steps: s_steps,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+        },
+        VmCompleted(output: take output) => match s_phase {
+            RunningVm => AgentState(
+                phase: PublishingCard,
+                steps: s_steps + 1u64,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take output,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+            _ => AgentState(
+                phase: s_phase,
+                steps: s_steps,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+        },
+        CardPublished => match s_phase {
+            PublishingCard => AgentState(
+                phase: AwaitingCeremony,
+                steps: s_steps + 1u64,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: true,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+            _ => AgentState(
+                phase: s_phase,
+                steps: s_steps,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+        },
+        CeremonyFinished(approved: _) => match s_phase {
+            AwaitingCeremony => AgentState(
+                phase: Done,
+                steps: s_steps + 1u64,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: true,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+            _ => AgentState(
+                phase: s_phase,
+                steps: s_steps,
+                max_steps: s_max_steps,
+                goal: take s_goal,
+                js_result: take s_js,
+                vm_result: take s_vm,
+                ceremony_staged: s_staged,
+                proposed_host: take s_host,
+                proposed_action: take s_action,
+                cost_micros: s_cost,
+            ),
+        },
+    }
+}
+
+pub fn invariants_hold(s: AgentState) -> bool {
+    if s.steps > s.max_steps {
+        return false
+    }
+    if !is_allowed_host(string.from(s.proposed_host)) {
+        return false
+    }
+    match s.phase {
+        AwaitingCeremony => {
+            if !s.ceremony_staged {
+                return false
+            }
+        },
+        _ => {},
+    }
+    if s.cost_micros > 1000000u64 {
+        return false
+    }
+    true
+}
+
+fn phase_str(p: Phase) -> String {
+    match p {
+        Idle => "idle",
+        RunningJs => "running_js",
+        RunningVm => "running_vm",
+        PublishingCard => "publishing_card",
+        AwaitingCeremony => "awaiting_ceremony",
+        Done => "done",
+    }
+}
+
+fn push_escaped(mut out: String, raw: String) {
+    let raw_bytes = string.as_bytes(raw)
+    let n = list.len(raw_bytes)
+    let mut i: u64 = 0u64
+    while i < n {
+        let b = raw_bytes[i]
+        if b == 34u8 {
+            string.push(mut out, "\\\"")
+        } else if b == 92u8 {
+            string.push(mut out, "\\\\")
+        } else if b == 10u8 {
+            string.push(mut out, "\\n")
+        } else if b == 13u8 {
+            string.push(mut out, "")
+        } else {
+            let mut one: List[u8] = list.new()
+            list.push(mut one, b)
+            match string.from_utf8(take one) {
+                Ok(take ch) => string.push(mut out, ch),
+                Error(_) => {},
+            }
+        }
+        i = i + 1u64
+    }
+}
+
+pub fn render_action_json(s: AgentState) -> String {
+    let mut out = string.new()
+    string.push(mut out, "{\"phase\":\"")
+    string.push(mut out, phase_str(s.phase))
+    string.push(mut out, "\",\"steps\":")
+    string.push_u64(mut out, s.steps)
+    string.push(mut out, ",\"ceremony_staged\":")
+    string.push(mut out, if s.ceremony_staged { "true" } else { "false" })
+    string.push(mut out, ",\"goal\":\"")
+    push_escaped(mut out, string.from(s.goal))
+    string.push(mut out, "\",\"next_tool\":")
+    match s.phase {
+        RunningJs => {
+            string.push(mut out, "{\"tool\":\"js_eval\",\"code\":\"console.log('agent js step'); return [7*13, 'hirsel-agent@1'];\"}")
+        },
+        RunningVm => {
+            string.push(mut out, "{\"tool\":\"vm_exec\",\"cmd\":\"uname -sr && nproc\"}")
+        },
+        PublishingCard => {
+            string.push(mut out, "{\"tool\":\"board_put\",\"id\":\"agent-run-1\",\"kind\":\"agent\",\"tone\":\"iris\",\"title\":\"Agent Verified Report\",\"body\":\"js=")
+            push_escaped(mut out, string.from(s.js_result))
+            string.push(mut out, " | vm=")
+            push_escaped(mut out, string.from(s.vm_result))
+            string.push(mut out, "\"}")
+        },
+        AwaitingCeremony => {
+            string.push(mut out, "{\"tool\":\"stage_outbox\",\"host\":\"")
+            push_escaped(mut out, string.from(s.proposed_host))
+            string.push(mut out, "\",\"port\":7780,\"path\":\"/_hirsel/echo-target\",\"method\":\"POST\",\"cost_micros\":")
+            string.push_u64(mut out, s.cost_micros)
+            string.push(mut out, ",\"summary\":\"")
+            push_escaped(mut out, string.from(s.proposed_action))
+            string.push(mut out, "\"}")
+        },
+        _ => {
+            string.push(mut out, "null")
+        },
+    }
+    string.push(mut out, "}\n")
+    take out
+}

@@ -5,6 +5,8 @@
 // Policy & layout geometry live strictly inside the zero-ambient pure-Hirsel
 // child process `/pkg/bin/hirsel-wm` (wm_client.rs).
 
+mod agent_client;
+mod board_client;
 mod font8x16;
 mod js_client;
 mod painter;
@@ -12,7 +14,9 @@ mod vm_client;
 mod web_content;
 mod wm_client;
 
+use agent_client::AgentClient;
 use anyhow::{Context, Result};
+use board_client::{BoardClient, BoardSnapshot};
 use fidl::endpoints::{Proxy, create_proxy};
 use fidl_fuchsia_input as finput;
 use fidl_fuchsia_io as fio;
@@ -32,7 +36,7 @@ use js_client::JsSandboxClient;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use vm_client::{VmClient, VmEvent, VmExecResult};
 use wm_client::{RectJson, ScenePlan, WmClient};
@@ -40,23 +44,12 @@ use wm_client::{RectJson, ScenePlan, WmClient};
 const TOP_BAR_H: u32 = 36;
 const BORDER_PX: i32 = 3;
 const STATE_PATH: &str = "/data/hirsel_state.json";
-const BOARD_PATH: &str = "/data/board.json";
-const SECRETS_PATH: &str = "/data/egress_secrets.json";
+const EGRESS_GW_PORT: u16 = 7781;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
     room: String,
     audit_log: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BoardCard {
-    id: String,
-    title: String,
-    sub: String,
-    color: String,
-    x: i32,
-    y: i32,
 }
 
 struct IdGen(u64);
@@ -97,6 +90,7 @@ fn new_view_identity() -> Result<(fviews::ViewIdentityOnCreation, fviews::ViewRe
 struct StagedHttpEffect {
     host: String,
     port: u16,
+    scheme: String,
     path: String,
     method: String,
 }
@@ -113,11 +107,19 @@ enum ShellMsg {
         reply: oneshot::Sender<Vec<String>>,
     },
     GetBoard {
-        reply: oneshot::Sender<Vec<BoardCard>>,
+        reply: oneshot::Sender<BoardSnapshot>,
     },
-    AddBoardCard {
-        card: BoardCard,
-        reply: oneshot::Sender<Vec<BoardCard>>,
+    BoardOp {
+        payload: serde_json::Value,
+        reply: oneshot::Sender<Result<BoardSnapshot>>,
+    },
+    AgentRun {
+        goal: String,
+        reply: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    WebNavigate {
+        url: String,
+        reply: oneshot::Sender<Result<serde_json::Value>>,
     },
     SetClientDiag {
         info: serde_json::Value,
@@ -228,13 +230,15 @@ struct HirselShell {
     figments_web: Option<WebViewport>,
     untrusted_web: Option<WebViewport>,
 
-    // Pure-Hirsel WM policy brain + per-domain Powerbox buffers + staged effect + Fxfs persistence
+    // Pure-Hirsel Places: WM + Figments Spatial Board + Autonomous Agent + js@1 Sandbox
     wm: WmClient,
+    board: BoardClient,
+    agent: Option<AgentClient>,
+    untrusted_origin: String,
     clipboards: HashMap<String, String>,
     next_effect_id: u64,
     pending_effect: Option<StagedHttpEffect>,
     audit_log: Vec<String>,
-    board_cards: Vec<BoardCard>,
     client_diag: serde_json::Value,
     present_credits: u32,
     scene_dirty: bool,
@@ -246,52 +250,23 @@ fn rgba_f(r: f32, g: f32, b: f32, a: f32) -> fland::ColorRgba {
     fland::ColorRgba { red: r, green: g, blue: b, alpha: a }
 }
 
-fn load_egress_secret(host: &str) -> String {
-    if let Ok(raw) = std::fs::read_to_string(SECRETS_PATH) {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
-            if let Some(v) = map.get(host) {
-                return v.clone();
-            }
-        }
-    }
-    // Initialize default sealed host-only demo credential on /data if missing
-    let mut defaults = HashMap::new();
-    defaults.insert("127.0.0.1".to_string(), "hirsel-host-sealed-demo-token-v1".to_string());
-    defaults.insert("api.github.com".to_string(), "ghp_host_sealed_placeholder".to_string());
-    if let Ok(json) = serde_json::to_string_pretty(&defaults) {
-        let _ = std::fs::write(SECRETS_PATH, json);
-    }
-    defaults.get(host).cloned().unwrap_or_else(|| "hirsel-host-sealed-token".to_string())
-}
-
-async fn execute_egress_http(
-    host: &str,
-    port: u16,
+async fn call_egress_gw(
     method: &str,
     path: &str,
     body: &str,
-) -> Result<(u16, String)> {
-    let addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        let mut iter = (host, port)
-            .to_socket_addrs()
-            .with_context(|| format!("DNS resolve {host}:{port}"))?;
-        iter.next().ok_or_else(|| anyhow::anyhow!("no IP for {host}:{port}"))?
-    };
-
+    sas_authorized: bool,
+) -> Result<(u16, serde_json::Value)> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_GW_PORT);
     let mut stream = fasync::net::TcpStream::connect(addr)
-        .with_context(|| format!("TCP connect init {addr}"))?
+        .context("egress_gw TCP connect init")?
         .await
-        .with_context(|| format!("TCP connect {addr}"))?;
-
-    let secret = load_egress_secret(host);
-    let safe_path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+        .context("egress_gw TCP connect")?;
+    let sas_hdr = if sas_authorized { "X-Hirsel-Sas-Authorized: true\r\n" } else { "" };
     let req = format!(
-        "{method} {safe_path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Hirsel-OS-EgressGW/0.1\r\nX-Hirsel-Egress-Key: {secret}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{EGRESS_GW_PORT}\r\n{sas_hdr}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(req.as_bytes()).await.context("write outbound HTTP request")?;
+    stream.write_all(req.as_bytes()).await.context("write egress_gw request")?;
     stream.flush().await.ok();
 
     let mut resp = Vec::with_capacity(4096);
@@ -301,30 +276,58 @@ async fn execute_egress_http(
             Ok(0) => break,
             Ok(n) => {
                 resp.extend_from_slice(&chunk[..n]);
-                if resp.len() >= 16384 {
+                if resp.len() >= 65536 {
                     break;
                 }
             }
             Err(_) => break,
         }
     }
-    let text = String::from_utf8_lossy(&resp).to_string();
-    let status_code = text
+    let text = String::from_utf8_lossy(&resp);
+    let status = text
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    let resp_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
-    Ok((status_code, resp_body))
+        .unwrap_or(502);
+    let resp_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+    let val = serde_json::from_str::<serde_json::Value>(resp_body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": resp_body }));
+    Ok((status, val))
+}
+
+fn extract_origin(url: &str) -> String {
+    if let Some(idx) = url.find("://") {
+        let rest = &url[idx + 3..];
+        let host = rest.split('/').next().unwrap_or(rest);
+        format!("{}://{}", &url[..idx], host)
+    } else {
+        url.to_string()
+    }
 }
 
 impl HirselShell {
     async fn new(tx: UnboundedSender<ShellMsg>, diag: Arc<Mutex<Vec<String>>>) -> Result<Self> {
-        // 1. Spawn pure-Hirsel hirsel-wm first so it owns all state & geometry from frame 0.
+        // 1. Spawn pure-Hirsel hirsel-wm + hirsel-board + hirsel-agent first (all zero-ambient Zircon Jobs!)
         let mut wm = WmClient::spawn().await.context("spawn pure-Hirsel hirsel-wm")?;
+        let board = BoardClient::spawn().await.context("spawn pure-Hirsel hirsel-board")?;
+        if let Ok(mut g) = diag.lock() {
+            g.push(format!("hirsel-board (pure-Hirsel) spawned OK ({} cards)", board.latest.cards.len()));
+        }
+        let agent = match AgentClient::spawn().await {
+            Ok(a) => {
+                if let Ok(mut g) = diag.lock() {
+                    g.push("hirsel-agent (pure-Hirsel) spawned OK".to_string());
+                }
+                Some(a)
+            }
+            Err(e) => {
+                warn!("hirsel-agent unavailable: {e:#}");
+                None
+            }
+        };
 
-        // Restore persisted Fxfs /data/hirsel_state.json (room + audit log) & /data/board.json if present
+        // Restore persisted Fxfs /data/hirsel_state.json (room + audit log) if present
         let mut audit_log = Vec::new();
         if let Ok(raw) = std::fs::read_to_string(STATE_PATH) {
             if let Ok(persisted) = serde_json::from_str::<PersistedState>(&raw) {
@@ -335,10 +338,6 @@ impl HirselShell {
                 audit_log = persisted.audit_log;
             }
         }
-        let board_cards: Vec<BoardCard> = std::fs::read_to_string(BOARD_PATH)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
 
         // 2. Spawn pure-Hirsel Figments js@1 sandbox Place (zero ambient handles!)
         let js_client = match JsSandboxClient::spawn().await {
@@ -563,11 +562,13 @@ impl HirselShell {
             figments_web: None,
             untrusted_web: None,
             wm,
+            board,
+            agent,
+            untrusted_origin: "http://127.0.0.1:7711".to_string(),
             clipboards: HashMap::new(),
             next_effect_id: 1,
             pending_effect: None,
             audit_log,
-            board_cards,
             client_diag: serde_json::json!(null),
             present_credits: 0,
             scene_dirty: true,
@@ -582,15 +583,6 @@ impl HirselShell {
 
         // First scene commit will flush as soon as OnNextFrameBegin delivers credits (immediately after initial present)
         Ok(shell)
-    }
-
-    fn persist_board(&self) {
-        use std::io::Write as _;
-        if let Ok(json) = serde_json::to_string_pretty(&self.board_cards) {
-            if let Ok(mut f) = std::fs::File::create(BOARD_PATH) {
-                let _ = f.write_all(json.as_bytes()).and_then(|_| f.sync_all());
-            }
-        }
     }
 
     fn persist_state(&self) {
@@ -1056,16 +1048,159 @@ impl HirselShell {
                 let _ = reply.send(self.audit_log.clone());
             }
             ShellMsg::GetBoard { reply } => {
-                let _ = reply.send(self.board_cards.clone());
+                let _ = reply.send(self.board.latest.clone());
             }
-            ShellMsg::AddBoardCard { card, reply } => {
-                if let Some(slot) = self.board_cards.iter_mut().find(|c| c.id == card.id) {
-                    *slot = card;
-                } else {
-                    self.board_cards.push(card);
-                }
-                self.persist_board();
-                let _ = reply.send(self.board_cards.clone());
+            ShellMsg::BoardOp { payload, reply } => {
+                let op = payload["op"].as_str().unwrap_or("put");
+                let res = match op {
+                    "move" => {
+                        let id = payload["id"].as_str().unwrap_or("");
+                        let x = payload["x"].as_u64().unwrap_or(24);
+                        let y = payload["y"].as_u64().unwrap_or(24);
+                        self.board.move_card(id, x, y).await
+                    }
+                    "delete" => {
+                        let id = payload["id"].as_str().unwrap_or("");
+                        self.board.delete_card(id).await
+                    }
+                    "link" => {
+                        let from = payload["from"].as_str().unwrap_or("");
+                        let to = payload["to"].as_str().unwrap_or("");
+                        let label = payload["label"].as_str().unwrap_or("link");
+                        self.board.link_cards(from, to, label).await
+                    }
+                    "camera" => {
+                        let cx = payload["cx"].as_u64().unwrap_or(0);
+                        let cy = payload["cy"].as_u64().unwrap_or(0);
+                        let zoom = payload["zoom_pct"].as_u64().unwrap_or(100);
+                        self.board.set_camera(cx, cy, zoom).await
+                    }
+                    _ => {
+                        let id = payload["id"].as_str().unwrap_or("card-1");
+                        let kind = payload["kind"].as_str().unwrap_or("note");
+                        let tone = payload["tone"].as_str().or_else(|| payload["color"].as_str()).unwrap_or("ochre");
+                        let title = payload["title"].as_str().unwrap_or("Figment Card");
+                        let body = payload["body"].as_str().or_else(|| payload["sub"].as_str()).unwrap_or("Persisted on Fxfs");
+                        let x = payload["x"].as_u64().unwrap_or(24);
+                        let y = payload["y"].as_u64().unwrap_or(300);
+                        let w = payload["w"].as_u64().unwrap_or(248);
+                        let h = payload["h"].as_u64().unwrap_or(98);
+                        self.board.put_card(id, kind, tone, x, y, w, h, title, body).await
+                    }
+                };
+                let _ = reply.send(res);
+            }
+            ShellMsg::AgentRun { goal, reply } => {
+                // Full autonomous pure-Hirsel Agent loop:
+                //   hirsel-agent -> hirsel-js -> Linux vm-dev -> hirsel-board -> Protected Outbox Ceremony!
+                let mut trace = Vec::<serde_json::Value>::new();
+                let run_res: Result<serde_json::Value> = async {
+                    let Some(ref mut agent) = self.agent else {
+                        return Err(anyhow::anyhow!("hirsel-agent not running"));
+                    };
+                    let step1 = agent.send(&format!("GOAL\t{}", goal.replace(['\t', '\n'], " "))).await?;
+                    trace.push(step1.clone());
+
+                    // Step 1: Run js_eval in zero-ambient hirsel-js
+                    let js_code = step1["next_tool"]["code"].as_str().unwrap_or("return 91;");
+                    let js_out = if let Some(ref mut js) = self.js_client {
+                        let v = js.eval(js_code).await?;
+                        v["value"].as_str().unwrap_or("ok").to_string()
+                    } else {
+                        "js_unavailable".to_string()
+                    };
+                    let step2 = self.agent.as_mut().unwrap().send(&format!("JS_OK\t{js_out}")).await?;
+                    trace.push(step2.clone());
+
+                    // Step 2: Run vm_exec inside real Tier-2 Linux 6.1.102 AMD-SVM MicroVM
+                    let vm_cmd = step2["next_tool"]["cmd"].as_str().unwrap_or("uname -sr && nproc");
+                    let vm_out = match self.run_dev_exec(vm_cmd.to_string()).await {
+                        Ok(r) => r.stdout.replace('\n', " "),
+                        Err(e) => format!("vm_err:{e}"),
+                    };
+                    let step3 = self.agent.as_mut().unwrap().send(&format!("VM_OK\t{vm_out}")).await?;
+                    trace.push(step3.clone());
+
+                    // Step 3: Publish verified Agent Report card onto pure-Hirsel hirsel-board (Fxfs persisted!)
+                    let card_tool = &step3["next_tool"];
+                    let cid = card_tool["id"].as_str().unwrap_or("agent-run-1");
+                    let ckind = card_tool["kind"].as_str().unwrap_or("agent");
+                    let ctone = card_tool["tone"].as_str().unwrap_or("iris");
+                    let ctitle = card_tool["title"].as_str().unwrap_or("Agent Report");
+                    let cbody = card_tool["body"].as_str().unwrap_or("done");
+                    let _ = self.board.put_card(cid, ckind, ctone, 304, 300, 248, 98, ctitle, cbody).await?;
+                    let _ = self.board.link_cards("wm", cid, "agent").await;
+                    let _ = self.board.link_cards("vmdev", cid, "inspected").await;
+
+                    let step4 = self.agent.as_mut().unwrap().send("CARD_OK").await?;
+                    trace.push(step4.clone());
+
+                    // Step 4: Stage agent's proposed external mutation into Protected Outbox Ceremony!
+                    let st_tool = &step4["next_tool"];
+                    let eff = StagedHttpEffect {
+                        host: st_tool["host"].as_str().unwrap_or("127.0.0.1").to_string(),
+                        port: st_tool["port"].as_u64().unwrap_or(7780) as u16,
+                        scheme: "http".to_string(),
+                        path: st_tool["path"].as_str().unwrap_or("/_hirsel/echo-target").to_string(),
+                        method: st_tool["method"].as_str().unwrap_or("POST").to_string(),
+                    };
+                    let cost = st_tool["cost_micros"].as_u64().unwrap_or(150_000);
+                    let summary = st_tool["summary"].as_str().unwrap_or("POST_/agent-report").replace(' ', "_");
+                    let id = self.next_effect_id;
+                    self.next_effect_id += 1;
+                    let mut digest: u64 = 0x5A17_0000u64 ^ (id * 0x9E37_79B9);
+                    for b in eff.host.bytes().chain(eff.path.bytes()) {
+                        digest = digest.wrapping_mul(33) ^ (b as u64);
+                    }
+                    let wm_st = self.wm.send(&format!("STAGE {id} {digest} {cost} {} {summary}", eff.host)).await?;
+                    if wm_st.outbox.status == "staged" {
+                        self.pending_effect = Some(eff);
+                    }
+                    let _ = self.apply_scene().await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "phase": step4["phase"],
+                        "ceremony_staged": wm_st.outbox.status == "staged",
+                        "js_result": js_out,
+                        "vm_result": vm_out,
+                        "card_id": cid,
+                        "wm_state": wm_st,
+                        "trace_steps": trace.len()
+                    }))
+                }.await;
+                let _ = reply.send(run_res);
+            }
+            ShellMsg::WebNavigate { url, reply } => {
+                // Multi-origin isolation: if origin changes, spawn a brand-new isolated fuchsia.web.Context!
+                let new_origin = extract_origin(&url);
+                let origin_changed = new_origin != self.untrusted_origin || self.untrusted_web.is_none();
+                let res: Result<serde_json::Value> = async {
+                    if !self.wm.latest.layout.web.is_some() {
+                        let _ = self.wm.send("TOGGLE_WEB").await?;
+                    }
+                    if origin_changed {
+                        // Detach old untrusted viewport cleanly before spawning fresh OS-isolated Context
+                        if let Some(ref mut old_web) = self.untrusted_web.take() {
+                            if old_web.attached {
+                                let _ = self.flatland.remove_child(&self.root_transform, &old_web.border_transform);
+                                let _ = self.flatland.remove_child(&self.root_transform, &old_web.viewport_transform);
+                            }
+                        }
+                        self.untrusted_origin = new_origin.clone();
+                        self.launch_web_context("web_untrusted", &url).await?;
+                    } else if let Some(ref web) = self.untrusted_web {
+                        let _ = web._nav.load_url(&url, fweb::LoadUrlParams::default()).await;
+                    }
+                    let _ = self.apply_scene().await;
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "url": url,
+                        "origin": new_origin,
+                        "spawned_fresh_context": origin_changed
+                    }))
+                }.await;
+                let _ = reply.send(res);
             }
             ShellMsg::SetClientDiag { info } => {
                 self.client_diag = info;
@@ -1194,32 +1329,37 @@ impl HirselShell {
                         let mut exec_info = serde_json::json!(null);
                         if plan.outbox.status == "approved" {
                             if let Some(eff) = self.pending_effect.take() {
-                                match execute_egress_http(
-                                    &eff.host,
-                                    eff.port,
-                                    &eff.method,
-                                    &eff.path,
-                                    "",
-                                )
-                                .await
-                                {
-                                    Ok((http_status, body)) => {
+                                let proxy_req = serde_json::json!({
+                                    "host": eff.host,
+                                    "port": eff.port,
+                                    "scheme": eff.scheme,
+                                    "method": eff.method,
+                                    "path": eff.path,
+                                    "body": ""
+                                })
+                                .to_string();
+                                match call_egress_gw("POST", "/proxy", &proxy_req, false).await {
+                                    Ok((gw_status, gw_val)) => {
+                                        let http_status = gw_val["http_status"].as_u64().unwrap_or(gw_status as u64);
+                                        let body = gw_val["body"].as_str().unwrap_or("").to_string();
                                         let entry = format!(
-                                            "effect#{} APPROVED & EXECUTED {} {}:{}{} -> HTTP {}",
+                                            "effect#{} APPROVED & EXECUTED via egress_gw.cm {} {}:{}{} -> HTTP {}",
                                             outbox.id, eff.method, eff.host, eff.port, eff.path, http_status
                                         );
                                         self.audit_log.push(entry);
+                                        if let Some(ref mut ag) = self.agent {
+                                            let _ = ag.send("CEREMONY_OK\t1").await;
+                                        }
                                         exec_info = serde_json::json!({
                                             "executed": true,
+                                            "gateway": "egress_gw.cm",
                                             "http_status": http_status,
+                                            "secret_injected": gw_val["secret_injected"],
                                             "body": body,
                                         });
                                     }
                                     Err(e) => {
-                                        let entry = format!(
-                                            "effect#{} APPROVED exec_err={e:#}",
-                                            outbox.id
-                                        );
+                                        let entry = format!("effect#{} APPROVED exec_err={e:#}", outbox.id);
                                         self.audit_log.push(entry);
                                         exec_info = serde_json::json!({
                                             "executed": false,
@@ -1442,6 +1582,7 @@ fn spawn_keyboard_listener(view_ref: fviews::ViewRef, tx: UnboundedSender<ShellM
                             effect: StagedHttpEffect {
                                 host: "127.0.0.1".into(),
                                 port: 7780,
+                                scheme: "http".into(),
                                 path: "/_hirsel/echo-target".into(),
                                 method: "POST".into(),
                             },
@@ -1596,25 +1737,90 @@ async fn handle_http_conn(
             let (otx, orx) = oneshot::channel();
             let _ = tx.unbounded_send(ShellMsg::GetBoard { reply: otx });
             match orx.await {
-                Ok(cards) => ("200 OK", "application/json", serde_json::json!({"cards": cards}).to_string()),
+                Ok(snap) => ("200 OK", "application/json", serde_json::to_string(&snap)?),
                 Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"board"}"#.into()),
             }
         }
         ("POST", "/_hirsel/board") => {
             let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
-            let card = BoardCard {
-                id: parsed["id"].as_str().unwrap_or("card-1").to_string(),
-                title: parsed["title"].as_str().unwrap_or("Figment Card").to_string(),
-                sub: parsed["sub"].as_str().unwrap_or("Persisted on Fxfs /data/board.json").to_string(),
-                color: parsed["color"].as_str().unwrap_or("amber").to_string(),
-                x: parsed["x"].as_i64().unwrap_or(28) as i32,
-                y: parsed["y"].as_i64().unwrap_or(300) as i32,
-            };
             let (otx, orx) = oneshot::channel();
-            let _ = tx.unbounded_send(ShellMsg::AddBoardCard { card, reply: otx });
+            let _ = tx.unbounded_send(ShellMsg::BoardOp { payload: parsed, reply: otx });
             match orx.await {
-                Ok(cards) => ("200 OK", "application/json", serde_json::json!({"cards": cards}).to_string()),
+                Ok(Ok(snap)) => ("200 OK", "application/json", serde_json::to_string(&snap)?),
+                Ok(Err(e)) => ("500 Internal Server Error", "application/json", serde_json::json!({"error": format!("{e:#}")}).to_string()),
                 Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"board"}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/agent-run") => {
+            let goal = if body.is_empty() { "Audit workstation and publish verified report".to_string() } else { body.to_string() };
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AgentRun { goal, reply: otx });
+            match orx.await {
+                Ok(Ok(val)) => ("200 OK", "application/json", val.to_string()),
+                Ok(Err(e)) => ("500 Internal Server Error", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/web-navigate") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let url = parsed
+                .as_ref()
+                .and_then(|v| v["url"].as_str())
+                .unwrap_or(if body.is_empty() { "http://127.0.0.1:7711/untrusted" } else { body })
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::WebNavigate { url, reply: otx });
+            match orx.await {
+                Ok(Ok(val)) => ("200 OK", "application/json", val.to_string()),
+                Ok(Err(e)) => ("500 Internal Server Error", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/egress-health") => {
+            match call_egress_gw("GET", "/health", "", false).await {
+                Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
+                Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
+                Err(e) => ("503 Service Unavailable", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+            }
+        }
+        ("GET", "/_hirsel/system") => {
+            let eg = call_egress_gw("GET", "/health", "", false).await.ok().map(|(_, v)| v);
+            let vulkan_present = std::path::Path::new("/svc/fuchsia.vulkan.loader.Loader").exists();
+            let audio_present = std::path::Path::new("/svc/fuchsia.media.Audio").exists();
+            let fxfs_present = std::path::Path::new("/data").exists();
+            (
+                "200 OK",
+                "application/json",
+                serde_json::json!({
+                    "os": "Hirsel-OS Desktop",
+                    "kernel": "Zircon + AMD SVM/NPT",
+                    "compositor": "Fuchsia Scenic Flatland + sysmem2",
+                    "browser": "Native Chromium 160 (HTML-in-Canvas)",
+                    "places": ["hirsel-wm", "hirsel-board", "hirsel-agent", "hirsel-js"],
+                    "microvm": { "name": "vm-dev", "guest": "Linux 6.1.102 SMP (2 vCPUs)", "net": "capability-gated virtio-net -> 10.0.3.1:7781 (egress_gw.cm)" },
+                    "hardware": { "vulkan_loader": vulkan_present, "audio_core": audio_present, "fxfs_data": fxfs_present },
+                    "egress_gw": eg
+                })
+                .to_string(),
+            )
+        }
+        ("GET", "/_hirsel/secrets") => {
+            match call_egress_gw("GET", "/secrets", "", false).await {
+                Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
+                Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
+                Err(e) => ("503 Service Unavailable", "application/json", serde_json::json!({"error": format!("{e:#}")}).to_string()),
+            }
+        }
+        ("POST", "/_hirsel/secrets") => {
+            // ONLY authorized when hirsel-wm is in SAS Trusted Chrome lockdown (capture_allowed == false)!
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetState { reply: otx });
+            let sas_ok = matches!(orx.await, Ok(st) if st.sas && !st.capture_allowed);
+            match call_egress_gw("POST", "/secrets", body, sas_ok).await {
+                Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
+                Ok((403, val)) => ("403 Forbidden", "application/json", val.to_string()),
+                Ok((_, val)) => ("400 Bad Request", "application/json", val.to_string()),
+                Err(e) => ("503 Service Unavailable", "application/json", serde_json::json!({"error": format!("{e:#}")}).to_string()),
             }
         }
         ("POST", "/_hirsel/client-diag") => {
@@ -1674,14 +1880,15 @@ async fn handle_http_conn(
         ("POST", "/_hirsel/stage") => {
             let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
             let host = parsed.as_ref().and_then(|v| v["host"].as_str()).unwrap_or("127.0.0.1").to_string();
-            let port = parsed.as_ref().and_then(|v| v["port"].as_u64()).unwrap_or(7780) as u16;
+            let scheme = parsed.as_ref().and_then(|v| v["scheme"].as_str()).unwrap_or("http").to_string();
+            let port = parsed.as_ref().and_then(|v| v["port"].as_u64()).unwrap_or(if scheme == "https" { 443 } else { 7780 }) as u16;
             let eff_path = parsed.as_ref().and_then(|v| v["path"].as_str()).unwrap_or("/_hirsel/echo-target").to_string();
             let eff_method = parsed.as_ref().and_then(|v| v["method"].as_str()).unwrap_or("POST").to_string();
             let cost = parsed.as_ref().and_then(|v| v["cost_micros"].as_u64()).unwrap_or(250_000);
             let summary = parsed.as_ref().and_then(|v| v["summary"].as_str()).unwrap_or("POST_/repos/Ascending-AI/figments/pulls").to_string();
             let (otx, orx) = oneshot::channel();
             let _ = tx.unbounded_send(ShellMsg::StageEffect {
-                effect: StagedHttpEffect { host, port, path: eff_path, method: eff_method },
+                effect: StagedHttpEffect { host, port, scheme, path: eff_path, method: eff_method },
                 cost_micros: cost,
                 summary,
                 reply: Some(otx),
@@ -1769,79 +1976,30 @@ async fn handle_http_conn(
             }
         }
         ("POST", "/_hirsel/proxy") => {
-            // Real host-side capability-gated egress-gw: enforces Caretaker + allowlist + secret injection
+            // Enforces Caretaker revocation via hirsel-wm, then forwards to isolated egress_gw.cm (TLS 1.3 + sealed vault!)
             let (otx, orx) = oneshot::channel();
             let _ = tx.unbounded_send(ShellMsg::GetState { reply: otx });
-            let allowed_hosts = ["127.0.0.1", "10.0.2.2", "example.com", "api.github.com", "api.anthropic.com", "api.openai.com"];
-            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
-            let host = parsed.as_ref().and_then(|v| v["host"].as_str()).unwrap_or(if body.is_empty() { "127.0.0.1" } else { body }).to_string();
-            let port = parsed.as_ref().and_then(|v| v["port"].as_u64()).unwrap_or(80) as u16;
-            let p_path = parsed.as_ref().and_then(|v| v["path"].as_str()).unwrap_or("/").to_string();
-            let p_method = parsed.as_ref().and_then(|v| v["method"].as_str()).unwrap_or("GET").to_string();
-
             match orx.await {
                 Ok(st) if !st.agent_conn => (
                     "403 Forbidden",
                     "application/json",
                     serde_json::json!({
                         "allowed": false,
-                        "reason": "caretaker_connection_revoked",
-                        "host": host
+                        "reason": "caretaker_connection_revoked"
                     })
                     .to_string(),
                 ),
-                Ok(_) if allowed_hosts.contains(&host.as_str()) => {
-                    if parsed.is_some() {
-                        match execute_egress_http(&host, port, &p_method, &p_path, "").await {
-                            Ok((http_status, resp_body)) => (
-                                "200 OK",
-                                "application/json",
-                                serde_json::json!({
-                                    "allowed": true,
-                                    "gateway": "hirsel-egress-gw",
-                                    "host": host,
-                                    "port": port,
-                                    "http_status": http_status,
-                                    "secret_injected": true,
-                                    "body": resp_body
-                                })
-                                .to_string(),
-                            ),
-                            Err(e) => (
-                                "502 Bad Gateway",
-                                "application/json",
-                                serde_json::json!({
-                                    "allowed": true,
-                                    "host": host,
-                                    "error": format!("{e:#}")
-                                })
-                                .to_string(),
-                            ),
-                        }
-                    } else {
-                        (
-                            "200 OK",
-                            "application/json",
-                            serde_json::json!({
-                                "allowed": true,
-                                "gateway": "hirsel-egress-gw",
-                                "host": host,
-                                "secret_injected": true
-                            })
-                            .to_string(),
-                        )
-                    }
-                }
-                _ => (
-                    "403 Forbidden",
-                    "application/json",
-                    serde_json::json!({
-                        "allowed": false,
-                        "reason": "host_not_in_capability_allowlist",
-                        "host": host
-                    })
-                    .to_string(),
-                ),
+                Ok(_) => match call_egress_gw("POST", "/proxy", body, false).await {
+                    Ok((200, val)) => ("200 OK", "application/json", val.to_string()),
+                    Ok((403, val)) => ("403 Forbidden", "application/json", val.to_string()),
+                    Ok((_, val)) => ("502 Bad Gateway", "application/json", val.to_string()),
+                    Err(e) => (
+                        "503 Service Unavailable",
+                        "application/json",
+                        serde_json::json!({"allowed": false, "error": format!("{e:#}")}).to_string(),
+                    ),
+                },
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"wm"}"#.into()),
             }
         }
         _ => ("404 Not Found", "text/plain", "Not Found".to_string()),

@@ -1,0 +1,115 @@
+// Exhaustive formal model checking (std.model.explore) for pure-Hirsel hirsel-board.
+
+type BoardAct = ActInit
+    | ActPutA
+    | ActPutB
+    | ActMoveA
+    | ActLinkAB
+    | ActLinkSelf
+    | ActDeleteA
+    | ActZoomLow
+    | ActZoomHigh
+
+fn model_actions(s: board.BoardState, mut out: List[BoardAct]) {
+    let _ = s.rev
+    list.push(mut out, ActPutA)
+    list.push(mut out, ActPutB)
+    list.push(mut out, ActMoveA)
+    list.push(mut out, ActLinkAB)
+    list.push(mut out, ActLinkSelf)
+    list.push(mut out, ActDeleteA)
+    list.push(mut out, ActZoomLow)
+    list.push(mut out, ActZoomHigh)
+}
+
+fn model_step(s: board.BoardState, a: BoardAct) -> board.BoardState {
+    let cur = board.clone_state(s)
+    match a {
+        ActInit => take cur,
+        ActPutA => board.apply(take cur, PutCard(id: "note-a", kind: "note", title: "Idea", body: "Spatial note", tone: "ochre", x: 40u64, y: 300u64, w: 220u64, h: 96u64)),
+        ActPutB => board.apply(take cur, PutCard(id: "note-b", kind: "agent", title: "Agent", body: "Verified", tone: "iris", x: 300u64, y: 300u64, w: 220u64, h: 96u64)),
+        ActMoveA => board.apply(take cur, MoveCard(id: "note-a", x: 120u64, y: 340u64)),
+        ActLinkAB => board.apply(take cur, LinkCards(from_id: "note-a", to_id: "note-b", label: "derived")),
+        ActLinkSelf => board.apply(take cur, LinkCards(from_id: "note-a", to_id: "note-a", label: "self")),
+        ActDeleteA => board.apply(take cur, DeleteCard(id: "note-a")),
+        ActZoomLow => board.apply(take cur, SetCamera(cx: 10u64, cy: 20u64, zoom_pct: 10u64)),
+        ActZoomHigh => board.apply(take cur, SetCamera(cx: 10u64, cy: 20u64, zoom_pct: 999u64)),
+    }
+}
+
+fn model_done(s: board.BoardState) -> bool {
+    let _ = s.rev
+    false
+}
+
+fn model_show(a: BoardAct, mut out: String) {
+    match a {
+        ActInit => string.push(mut out, "init"),
+        ActPutA => string.push(mut out, "put_a"),
+        ActPutB => string.push(mut out, "put_b"),
+        ActMoveA => string.push(mut out, "move_a"),
+        ActLinkAB => string.push(mut out, "link_ab"),
+        ActLinkSelf => string.push(mut out, "link_self"),
+        ActDeleteA => string.push(mut out, "del_a"),
+        ActZoomLow => string.push(mut out, "zoom_low"),
+        ActZoomHigh => string.push(mut out, "zoom_high"),
+    }
+}
+
+fn law_board_sound(prev: board.BoardState, a: BoardAct, next: board.BoardState) -> bool {
+    let _ = a
+    board.invariants_hold(next) && next.rev >= prev.rev
+}
+
+fn witness_linked(s: board.BoardState) -> bool {
+    board.has_edge(s, "note-a", "note-b")
+}
+
+fn witness_zoom_clamped(s: board.BoardState) -> bool {
+    s.camera.zoom_pct == 50u64
+}
+
+@test
+fn board_invariants_hold() -> Result[(), ()] {
+    let mut inits: List[board.BoardState] = list.new()
+    list.push(mut inits, board.initial())
+
+    let mut always: List[std.model.Always[board.BoardState, BoardAct]] = list.new()
+    list.push(mut always, std.model.Always(label: "board_sound", holds: law_board_sound))
+
+    let mut sometimes: List[std.model.Sometimes[board.BoardState]] = list.new()
+    list.push(mut sometimes, std.model.Sometimes(label: "linked", holds: witness_linked))
+    list.push(mut sometimes, std.model.Sometimes(label: "zoom_clamped", holds: witness_zoom_clamped))
+
+    let m: std.model.Model[board.BoardState, BoardAct] = std.model.Model(
+        init: take inits,
+        start: ActInit,
+        actions: model_actions,
+        step: model_step,
+        done: model_done,
+        always: take always,
+        sometimes: take sometimes,
+        show: model_show,
+    )
+    let bounds = std.model.Bounds(
+        depth: 4u64,
+        states: 2000u64,
+        step_steps: 200000u64,
+        step_bytes: 1048576u64,
+    )
+    match std.model.explore(m, bounds) {
+        Closed(_) => Ok(()),
+        ToDepth(stats, _) => {
+            if list.len(stats.witnessed) == 2u64 {
+                Ok(())
+            } else {
+                Error(())
+            }
+        },
+        Failed(f) => {
+            let mut msg = string.new()
+            std.model.report(f, mut msg)
+            fail(take msg)
+        },
+    }
+}

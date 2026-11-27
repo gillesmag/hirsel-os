@@ -1,0 +1,105 @@
+// Formal model-checking test for pure-Hirsel Autonomous Agent Place.
+
+type AgentAct = ActInit | ActGoal | ActJs | ActVm | ActCard | ActApprove | ActDeny
+
+fn model_actions(s: planner.AgentState, mut out: List[AgentAct]) {
+    let _ = s.steps
+    list.push(mut out, ActGoal)
+    list.push(mut out, ActJs)
+    list.push(mut out, ActVm)
+    list.push(mut out, ActCard)
+    list.push(mut out, ActApprove)
+    list.push(mut out, ActDeny)
+}
+
+fn model_step(s: planner.AgentState, a: AgentAct) -> planner.AgentState {
+    let cur = planner.clone_state(s)
+    match a {
+        ActInit => take cur,
+        ActGoal => planner.step(take cur, StartGoal(goal: "audit workspace")),
+        ActJs => planner.step(take cur, JsCompleted(output: "91")),
+        ActVm => planner.step(take cur, VmCompleted(output: "Linux 6.1.102")),
+        ActCard => planner.step(take cur, CardPublished),
+        ActApprove => planner.step(take cur, CeremonyFinished(approved: true)),
+        ActDeny => planner.step(take cur, CeremonyFinished(approved: false)),
+    }
+}
+
+fn model_done(s: planner.AgentState) -> bool {
+    let _ = s.steps
+    false
+}
+
+fn model_show(a: AgentAct, mut out: String) {
+    match a {
+        ActInit => string.push(mut out, "init"),
+        ActGoal => string.push(mut out, "goal"),
+        ActJs => string.push(mut out, "js"),
+        ActVm => string.push(mut out, "vm"),
+        ActCard => string.push(mut out, "card"),
+        ActApprove => string.push(mut out, "approve"),
+        ActDeny => string.push(mut out, "deny"),
+    }
+}
+
+fn law_agent_safe(prev: planner.AgentState, a: AgentAct, next: planner.AgentState) -> bool {
+    let _ = prev.steps
+    let _ = a
+    planner.invariants_hold(next)
+}
+
+fn witness_ceremony(s: planner.AgentState) -> bool {
+    s.ceremony_staged
+}
+
+fn witness_done(s: planner.AgentState) -> bool {
+    match s.phase {
+        Done => true,
+        _ => false,
+    }
+}
+
+@test
+fn agent_safety_model_holds() -> Result[(), ()] {
+    let mut inits: List[planner.AgentState] = list.new()
+    list.push(mut inits, planner.initial())
+
+    let mut always: List[std.model.Always[planner.AgentState, AgentAct]] = list.new()
+    list.push(mut always, std.model.Always(label: "agent_safe", holds: law_agent_safe))
+
+    let mut sometimes: List[std.model.Sometimes[planner.AgentState]] = list.new()
+    list.push(mut sometimes, std.model.Sometimes(label: "ceremony_staged", holds: witness_ceremony))
+    list.push(mut sometimes, std.model.Sometimes(label: "workflow_done", holds: witness_done))
+
+    let m: std.model.Model[planner.AgentState, AgentAct] = std.model.Model(
+        init: take inits,
+        start: ActInit,
+        actions: model_actions,
+        step: model_step,
+        done: model_done,
+        always: take always,
+        sometimes: take sometimes,
+        show: model_show,
+    )
+    let bounds = std.model.Bounds(
+        depth: 6u64,
+        states: 2000u64,
+        step_steps: 200000u64,
+        step_bytes: 1048576u64,
+    )
+    match std.model.explore(m, bounds) {
+        Closed(_) => Ok(()),
+        ToDepth(stats, _) => {
+            if list.len(stats.witnessed) == 2u64 {
+                Ok(())
+            } else {
+                Error(())
+            }
+        },
+        Failed(f) => {
+            let mut msg = string.new()
+            std.model.report(f, mut msg)
+            fail(take msg)
+        },
+    }
+}

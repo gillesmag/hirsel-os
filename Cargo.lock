@@ -115,6 +115,7 @@ name = "hirsel-vm-host"
 version = "0.1.0"
 dependencies = [
  "hirsel-vmm",
+ "smoltcp",
  "zx-sys",
 ]
 

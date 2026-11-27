@@ -150,6 +150,14 @@ impl VmClient {
                 ));
             }
         }
+        if let Ok(svc_dir) = fuchsia_fs::directory::open_in_namespace("/svc", fio::PERM_READABLE) {
+            if let Ok(svc_end) = svc_dir.into_client_end() {
+                actions.push(fdio::SpawnAction::add_namespace_entry(
+                    c"/svc",
+                    svc_end.into_channel().into_handle(),
+                ));
+            }
+        }
         if let Ok(utc) = fuchsia_runtime::duplicate_utc_clock_handle(zx::Rights::SAME_RIGHTS) {
             actions.push(fdio::SpawnAction::add_handle(
                 HandleInfo::new(HandleType::ClockUtc, 0),

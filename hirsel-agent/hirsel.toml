@@ -1,0 +1,22 @@
+[package]
+name = "hirsel_agent"
+major = 1
+charge = "charge-v1"
+
+[dependencies]
+std = { major = 1 }
+
+[sources]
+"planner.hirsel" = "planner"
+"main.hirsel" = "main"
+
+[program]
+module = "main"
+function = "main"
+
+[tests]
+limit = 16777216
+grants = []
+
+[tests.sources]
+"tests.hirsel" = "tests"

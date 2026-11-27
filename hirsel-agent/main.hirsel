@@ -1,0 +1,52 @@
+// Pure-Hirsel Autonomous Agent daemon (zero ambient caps: Stdin + Stdout only).
+
+fn handle_line(take s: planner.AgentState, raw: String) -> planner.AgentState {
+    let trimmed = string.from(string.trim_ascii(raw))
+    if string.byte_len(trimmed) == 0u64 || trimmed == "STATE" {
+        return take s
+    }
+    if trimmed == "CARD_OK" {
+        return planner.step(take s, CardPublished)
+    }
+    match string.split_once(trimmed, "\t") {
+        Some((op, arg)) => {
+            let op_s = string.from(op)
+            let arg_s = string.from(arg)
+            if op_s == "GOAL" {
+                return planner.step(take s, StartGoal(goal: take arg_s))
+            }
+            if op_s == "JS_OK" {
+                return planner.step(take s, JsCompleted(output: take arg_s))
+            }
+            if op_s == "VM_OK" {
+                return planner.step(take s, VmCompleted(output: take arg_s))
+            }
+            if op_s == "CEREMONY_OK" {
+                return planner.step(take s, CeremonyFinished(approved: arg_s == "1"))
+            }
+            take s
+        },
+        None => take s,
+    }
+}
+
+pub fn main(input: Stdin, out: Stdout) -> Result[(), Exit] waits {
+    let mut state = planner.initial()
+    let _ = stdout.write(out, planner.render_action_json(state))
+
+    let mut reader = std.io.lines(Stdin(input), 16384u64)
+    let mut buf = string.new()
+    loop {
+        string.clear(mut buf)
+        match std.io.read_line(mut reader, mut buf) {
+            Ok(true) => {
+                let next_state = handle_line(take state, string.from(buf))
+                state = take next_state
+                let _ = stdout.write(out, planner.render_action_json(state))
+            },
+            Ok(false) => break,
+            Error(_) => break,
+        }
+    }
+    Ok(())
+}

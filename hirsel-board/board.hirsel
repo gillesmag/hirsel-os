@@ -1,0 +1,497 @@
+// Pure-Hirsel Figments Spatial Board State Engine (zero ambient capabilities).
+// Owns cards, connectors, camera pan/zoom, monotonic revisions, and referential integrity.
+// Formally verified by `std.model.explore` in `tests.hirsel`.
+
+pub type Card: key {
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    tone: String,
+    x: u64,
+    y: u64,
+    w: u64,
+    h: u64,
+    rev: u64,
+}
+
+pub type Edge: key {
+    from_id: String,
+    to_id: String,
+    label: String,
+}
+
+pub type Camera: key {
+    cx: u64,
+    cy: u64,
+    zoom_pct: u64,
+}
+
+pub type BoardState: key {
+    rev: u64,
+    camera: Camera,
+    cards: List[Card],
+    edges: List[Edge],
+}
+
+pub type BoardCmd = PutCard(id: String, kind: String, title: String, body: String, tone: String, x: u64, y: u64, w: u64, h: u64)
+    | MoveCard(id: String, x: u64, y: u64)
+    | DeleteCard(id: String)
+    | LinkCards(from_id: String, to_id: String, label: String)
+    | SetCamera(cx: u64, cy: u64, zoom_pct: u64)
+    | ResetBoard
+
+fn clamp_u64(v: u64, lo: u64, hi: u64) -> u64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    v
+}
+
+pub fn initial() -> BoardState {
+    let mut cards: List[Card] = list.new()
+    list.push(mut cards, Card(
+        id: "zircon",
+        kind: "system",
+        title: "Zircon + AMD SVM / NPT",
+        body: "Flatland + sysmem2 + virtio-gpu | Linux 6.1.102 2-vCPU MicroVM",
+        tone: "cobalt",
+        x: 24u64,
+        y: 28u64,
+        w: 248u64,
+        h: 98u64,
+        rev: 1u64,
+    ))
+    list.push(mut cards, Card(
+        id: "wm",
+        kind: "system",
+        title: "hirsel-wm + hirsel-board + hirsel-js",
+        body: "Zero ambient caps | std.model.explore verified",
+        tone: "iris",
+        x: 304u64,
+        y: 28u64,
+        w: 248u64,
+        h: 98u64,
+        rev: 1u64,
+    ))
+    list.push(mut cards, Card(
+        id: "outbox",
+        kind: "system",
+        title: "Effect Outbox + egress-gw",
+        body: "Hash-bound compositor ceremony | Isolated TLS secret vault",
+        tone: "vermilion",
+        x: 24u64,
+        y: 164u64,
+        w: 248u64,
+        h: 98u64,
+        rev: 1u64,
+    ))
+    list.push(mut cards, Card(
+        id: "vmdev",
+        kind: "vm",
+        title: "vm-dev (Linux 6.1.102)",
+        body: "Persistent Fxfs /mnt/data + /dev/hvc0 + gated virtio-net",
+        tone: "sap",
+        x: 304u64,
+        y: 164u64,
+        w: 248u64,
+        h: 98u64,
+        rev: 1u64,
+    ))
+
+    let mut edges: List[Edge] = list.new()
+    list.push(mut edges, Edge(from_id: "zircon", to_id: "wm", label: "job"))
+    list.push(mut edges, Edge(from_id: "zircon", to_id: "outbox", label: "caps"))
+    list.push(mut edges, Edge(from_id: "wm", to_id: "outbox", label: "hash"))
+    list.push(mut edges, Edge(from_id: "wm", to_id: "vmdev", label: "powerbox"))
+    list.push(mut edges, Edge(from_id: "zircon", to_id: "vmdev", label: "svm"))
+
+    BoardState(
+        rev: 1u64,
+        camera: Camera(cx: 0u64, cy: 0u64, zoom_pct: 100u64),
+        cards: take cards,
+        edges: take edges,
+    )
+}
+
+pub fn clone_state(s: BoardState) -> BoardState {
+    let mut cards: List[Card] = list.new()
+    let cn = list.len(s.cards)
+    let mut i: u64 = 0u64
+    while i < cn {
+        let c = s.cards[i]
+        list.push(mut cards, Card(
+            id: string.from(c.id),
+            kind: string.from(c.kind),
+            title: string.from(c.title),
+            body: string.from(c.body),
+            tone: string.from(c.tone),
+            x: c.x,
+            y: c.y,
+            w: c.w,
+            h: c.h,
+            rev: c.rev,
+        ))
+        i = i + 1u64
+    }
+    let mut edges: List[Edge] = list.new()
+    let en = list.len(s.edges)
+    let mut j: u64 = 0u64
+    while j < en {
+        let e = s.edges[j]
+        list.push(mut edges, Edge(
+            from_id: string.from(e.from_id),
+            to_id: string.from(e.to_id),
+            label: string.from(e.label),
+        ))
+        j = j + 1u64
+    }
+    BoardState(
+        rev: s.rev,
+        camera: Camera(cx: s.camera.cx, cy: s.camera.cy, zoom_pct: s.camera.zoom_pct),
+        cards: take cards,
+        edges: take edges,
+    )
+}
+
+pub fn has_card(s: BoardState, id: String) -> bool {
+    let mut i: u64 = 0u64
+    let n = list.len(s.cards)
+    while i < n {
+        if s.cards[i].id == id {
+            return true
+        }
+        i = i + 1u64
+    }
+    false
+}
+
+pub fn has_edge(s: BoardState, from_id: String, to_id: String) -> bool {
+    let mut i: u64 = 0u64
+    let n = list.len(s.edges)
+    while i < n {
+        if s.edges[i].from_id == from_id && s.edges[i].to_id == to_id {
+            return true
+        }
+        i = i + 1u64
+    }
+    false
+}
+
+pub fn apply(take s: BoardState, take cmd: BoardCmd) -> BoardState {
+    let BoardState(rev: s_rev, camera: s_cam, cards: take s_cards, edges: take s_edges) = take s
+    match take cmd {
+        PutCard(id: take id, kind: take kind, title: take title, body: take body, tone: take tone, x: x, y: y, w: w, h: h) => {
+            if string.byte_len(id) == 0u64 {
+                return BoardState(rev: s_rev, camera: s_cam, cards: take s_cards, edges: take s_edges)
+            }
+            let next_rev = s_rev + 1u64
+            let cw = clamp_u64(w, 160u64, 520u64)
+            let ch = clamp_u64(h, 72u64, 360u64)
+            let mut next_cards: List[Card] = list.new()
+            let mut replaced = false
+            let mut i: u64 = 0u64
+            let n = list.len(s_cards)
+            while i < n {
+                let c = s_cards[i]
+                if c.id == id {
+                    list.push(mut next_cards, Card(
+                        id: string.from(id),
+                        kind: string.from(kind),
+                        title: string.from(title),
+                        body: string.from(body),
+                        tone: string.from(tone),
+                        x: x,
+                        y: y,
+                        w: cw,
+                        h: ch,
+                        rev: next_rev,
+                    ))
+                    replaced = true
+                } else {
+                    list.push(mut next_cards, Card(
+                        id: string.from(c.id),
+                        kind: string.from(c.kind),
+                        title: string.from(c.title),
+                        body: string.from(c.body),
+                        tone: string.from(c.tone),
+                        x: c.x,
+                        y: c.y,
+                        w: c.w,
+                        h: c.h,
+                        rev: c.rev,
+                    ))
+                }
+                i = i + 1u64
+            }
+            if !replaced {
+                list.push(mut next_cards, Card(
+                    id: take id,
+                    kind: take kind,
+                    title: take title,
+                    body: take body,
+                    tone: take tone,
+                    x: x,
+                    y: y,
+                    w: cw,
+                    h: ch,
+                    rev: next_rev,
+                ))
+            }
+            BoardState(
+                rev: next_rev,
+                camera: s_cam,
+                cards: take next_cards,
+                edges: take s_edges,
+            )
+        },
+        MoveCard(id: take id, x: x, y: y) => {
+            let mut found = false
+            let next_rev = s_rev + 1u64
+            let mut next_cards: List[Card] = list.new()
+            let mut i: u64 = 0u64
+            let n = list.len(s_cards)
+            while i < n {
+                let c = s_cards[i]
+                if c.id == id {
+                    found = true
+                    list.push(mut next_cards, Card(
+                        id: string.from(c.id),
+                        kind: string.from(c.kind),
+                        title: string.from(c.title),
+                        body: string.from(c.body),
+                        tone: string.from(c.tone),
+                        x: x,
+                        y: y,
+                        w: c.w,
+                        h: c.h,
+                        rev: next_rev,
+                    ))
+                } else {
+                    list.push(mut next_cards, Card(
+                        id: string.from(c.id),
+                        kind: string.from(c.kind),
+                        title: string.from(c.title),
+                        body: string.from(c.body),
+                        tone: string.from(c.tone),
+                        x: c.x,
+                        y: c.y,
+                        w: c.w,
+                        h: c.h,
+                        rev: c.rev,
+                    ))
+                }
+                i = i + 1u64
+            }
+            let out_rev = if found { next_rev } else { s_rev }
+            BoardState(
+                rev: out_rev,
+                camera: s_cam,
+                cards: take next_cards,
+                edges: take s_edges,
+            )
+        },
+        DeleteCard(id: take id) => {
+            let mut removed = false
+            let mut next_cards: List[Card] = list.new()
+            let mut i: u64 = 0u64
+            let n = list.len(s_cards)
+            while i < n {
+                let c = s_cards[i]
+                if c.id == id {
+                    removed = true
+                } else {
+                    list.push(mut next_cards, Card(
+                        id: string.from(c.id),
+                        kind: string.from(c.kind),
+                        title: string.from(c.title),
+                        body: string.from(c.body),
+                        tone: string.from(c.tone),
+                        x: c.x,
+                        y: c.y,
+                        w: c.w,
+                        h: c.h,
+                        rev: c.rev,
+                    ))
+                }
+                i = i + 1u64
+            }
+            let mut next_edges: List[Edge] = list.new()
+            let mut j: u64 = 0u64
+            let en = list.len(s_edges)
+            while j < en {
+                let e = s_edges[j]
+                if e.from_id != id && e.to_id != id {
+                    list.push(mut next_edges, Edge(
+                        from_id: string.from(e.from_id),
+                        to_id: string.from(e.to_id),
+                        label: string.from(e.label),
+                    ))
+                }
+                j = j + 1u64
+            }
+            let out_rev = if removed { s_rev + 1u64 } else { s_rev }
+            BoardState(
+                rev: out_rev,
+                camera: s_cam,
+                cards: take next_cards,
+                edges: take next_edges,
+            )
+        },
+        LinkCards(from_id: take from_id, to_id: take to_id, label: take label) => {
+            let cur = BoardState(rev: s_rev, camera: s_cam, cards: take s_cards, edges: take s_edges)
+            if from_id == to_id || !has_card(cur, string.from(from_id)) || !has_card(cur, string.from(to_id)) || has_edge(cur, string.from(from_id), string.from(to_id)) {
+                return take cur
+            }
+            let BoardState(rev: r2, camera: c2, cards: take cards2, edges: take edges2) = take cur
+            let mut next_edges = take edges2
+            list.push(mut next_edges, Edge(
+                from_id: take from_id,
+                to_id: take to_id,
+                label: take label,
+            ))
+            BoardState(
+                rev: r2 + 1u64,
+                camera: c2,
+                cards: take cards2,
+                edges: take next_edges,
+            )
+        },
+        SetCamera(cx: cx, cy: cy, zoom_pct: zoom_pct) => {
+            BoardState(
+                rev: s_rev + 1u64,
+                camera: Camera(cx: cx, cy: cy, zoom_pct: clamp_u64(zoom_pct, 50u64, 200u64)),
+                cards: take s_cards,
+                edges: take s_edges,
+            )
+        },
+        ResetBoard => initial(),
+    }
+}
+
+pub fn invariants_hold(s: BoardState) -> bool {
+    if s.camera.zoom_pct < 50u64 || s.camera.zoom_pct > 200u64 {
+        return false
+    }
+    let n = list.len(s.cards)
+    let mut i: u64 = 0u64
+    while i < n {
+        let ci = s.cards[i]
+        if string.byte_len(ci.id) == 0u64 {
+            return false
+        }
+        if ci.w < 160u64 || ci.w > 520u64 || ci.h < 72u64 || ci.h > 360u64 {
+            return false
+        }
+        let mut k = i + 1u64
+        while k < n {
+            if s.cards[k].id == ci.id {
+                return false
+            }
+            k = k + 1u64
+        }
+        i = i + 1u64
+    }
+    let en = list.len(s.edges)
+    let mut j: u64 = 0u64
+    while j < en {
+        let e = s.edges[j]
+        if e.from_id == e.to_id {
+            return false
+        }
+        if !has_card(s, string.from(e.from_id)) || !has_card(s, string.from(e.to_id)) {
+            return false
+        }
+        j = j + 1u64
+    }
+    true
+}
+
+fn push_escaped(mut out: String, raw: String) {
+    let raw_bytes = string.as_bytes(raw)
+    let n = list.len(raw_bytes)
+    let mut i: u64 = 0u64
+    while i < n {
+        let b = raw_bytes[i]
+        if b == 34u8 {
+            string.push(mut out, "\\\"")
+        } else if b == 92u8 {
+            string.push(mut out, "\\\\")
+        } else if b == 10u8 {
+            string.push(mut out, "\\n")
+        } else if b == 13u8 {
+            string.push(mut out, "")
+        } else {
+            let mut one: List[u8] = list.new()
+            list.push(mut one, b)
+            match string.from_utf8(take one) {
+                Ok(take ch) => string.push(mut out, ch),
+                Error(_) => {},
+            }
+        }
+        i = i + 1u64
+    }
+}
+
+pub fn render_json(s: BoardState) -> String {
+    let mut out = string.new()
+    string.push(mut out, "{\"rev\":")
+    string.push_u64(mut out, s.rev)
+    string.push(mut out, ",\"camera\":{\"cx\":")
+    string.push_u64(mut out, s.camera.cx)
+    string.push(mut out, ",\"cy\":")
+    string.push_u64(mut out, s.camera.cy)
+    string.push(mut out, ",\"zoom_pct\":")
+    string.push_u64(mut out, s.camera.zoom_pct)
+    string.push(mut out, "},\"cards\":[")
+
+    let cn = list.len(s.cards)
+    let mut i: u64 = 0u64
+    while i < cn {
+        if i > 0u64 {
+            string.push(mut out, ",")
+        }
+        let c = s.cards[i]
+        string.push(mut out, "{\"id\":\"")
+        push_escaped(mut out, string.from(c.id))
+        string.push(mut out, "\",\"kind\":\"")
+        push_escaped(mut out, string.from(c.kind))
+        string.push(mut out, "\",\"title\":\"")
+        push_escaped(mut out, string.from(c.title))
+        string.push(mut out, "\",\"body\":\"")
+        push_escaped(mut out, string.from(c.body))
+        string.push(mut out, "\",\"tone\":\"")
+        push_escaped(mut out, string.from(c.tone))
+        string.push(mut out, "\",\"x\":")
+        string.push_u64(mut out, c.x)
+        string.push(mut out, ",\"y\":")
+        string.push_u64(mut out, c.y)
+        string.push(mut out, ",\"w\":")
+        string.push_u64(mut out, c.w)
+        string.push(mut out, ",\"h\":")
+        string.push_u64(mut out, c.h)
+        string.push(mut out, ",\"rev\":")
+        string.push_u64(mut out, c.rev)
+        string.push(mut out, "}")
+        i = i + 1u64
+    }
+
+    string.push(mut out, "],\"edges\":[")
+    let en = list.len(s.edges)
+    let mut j: u64 = 0u64
+    while j < en {
+        if j > 0u64 {
+            string.push(mut out, ",")
+        }
+        let e = s.edges[j]
+        string.push(mut out, "{\"from\":\"")
+        push_escaped(mut out, string.from(e.from_id))
+        string.push(mut out, "\",\"to\":\"")
+        push_escaped(mut out, string.from(e.to_id))
+        string.push(mut out, "\",\"label\":\"")
+        push_escaped(mut out, string.from(e.label))
+        string.push(mut out, "\"}")
+        j = j + 1u64
+    }
+    string.push(mut out, "]}\n")
+    take out
+}

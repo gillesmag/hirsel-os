@@ -1,0 +1,102 @@
+// Pure-Hirsel Figments Spatial Board daemon (zero ambient caps: Stdin + Stdout only).
+
+fn parse_u64_or(s: String, fallback: u64) -> u64 {
+    match int.parse_uint(s, 10u32) {
+        Ok(n) => n,
+        Error(_) => fallback,
+    }
+}
+
+fn split_tabs(line: String) -> List[String] {
+    let mut parts: List[String] = list.new()
+    let mut cur = string.from(line)
+    loop {
+        let mut next_cur: Option[String] = None
+        match string.split_once(cur, "\t") {
+            Some((head, tail)) => {
+                list.push(mut parts, string.from(head))
+                next_cur = Some(string.from(tail))
+            },
+            None => {},
+        }
+        match take next_cur {
+            Some(take t) => { cur = take t },
+            None => {
+                list.push(mut parts, take cur)
+                break
+            },
+        }
+    }
+    take parts
+}
+
+fn handle_line(take s: board.BoardState, raw: String) -> board.BoardState {
+    let trimmed = string.from(string.trim_ascii(raw))
+    if string.byte_len(trimmed) == 0u64 || trimmed == "STATE" {
+        return take s
+    }
+    let parts = split_tabs(take trimmed)
+    if list.len(parts) == 0u64 {
+        return take s
+    }
+    let op = string.from(parts[0u64])
+    if op == "RESET" {
+        return board.apply(take s, ResetBoard)
+    }
+    if op == "PUT" && list.len(parts) >= 10u64 {
+        let id = string.from(parts[1u64])
+        let kind = string.from(parts[2u64])
+        let tone = string.from(parts[3u64])
+        let x = parse_u64_or(string.from(parts[4u64]), 24u64)
+        let y = parse_u64_or(string.from(parts[5u64]), 300u64)
+        let w = parse_u64_or(string.from(parts[6u64]), 248u64)
+        let h = parse_u64_or(string.from(parts[7u64]), 98u64)
+        let title = string.from(parts[8u64])
+        let body = string.from(parts[9u64])
+        return board.apply(take s, PutCard(id: take id, kind: take kind, title: take title, body: take body, tone: take tone, x: x, y: y, w: w, h: h))
+    }
+    if op == "MOVE" && list.len(parts) >= 4u64 {
+        let id = string.from(parts[1u64])
+        let x = parse_u64_or(string.from(parts[2u64]), 0u64)
+        let y = parse_u64_or(string.from(parts[3u64]), 0u64)
+        return board.apply(take s, MoveCard(id: take id, x: x, y: y))
+    }
+    if op == "DEL" && list.len(parts) >= 2u64 {
+        let id = string.from(parts[1u64])
+        return board.apply(take s, DeleteCard(id: take id))
+    }
+    if op == "EDGE" && list.len(parts) >= 4u64 {
+        let f = string.from(parts[1u64])
+        let t = string.from(parts[2u64])
+        let lbl = string.from(parts[3u64])
+        return board.apply(take s, LinkCards(from_id: take f, to_id: take t, label: take lbl))
+    }
+    if op == "CAM" && list.len(parts) >= 4u64 {
+        let cx = parse_u64_or(string.from(parts[1u64]), 0u64)
+        let cy = parse_u64_or(string.from(parts[2u64]), 0u64)
+        let z = parse_u64_or(string.from(parts[3u64]), 100u64)
+        return board.apply(take s, SetCamera(cx: cx, cy: cy, zoom_pct: z))
+    }
+    take s
+}
+
+pub fn main(input: Stdin, out: Stdout) -> Result[(), Exit] waits {
+    let mut state = board.initial()
+    let _ = stdout.write(out, board.render_json(state))
+
+    let mut reader = std.io.lines(Stdin(input), 32768u64)
+    let mut buf = string.new()
+    loop {
+        string.clear(mut buf)
+        match std.io.read_line(mut reader, mut buf) {
+            Ok(true) => {
+                let next_state = handle_line(take state, string.from(buf))
+                state = take next_state
+                let _ = stdout.write(out, board.render_json(state))
+            },
+            Ok(false) => break,
+            Error(_) => break,
+        }
+    }
+    Ok(())
+}

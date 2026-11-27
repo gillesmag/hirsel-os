@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 hirsel-vmm = { path = "../hirsel-vmm" }
 zx-sys = { path = "../zx-sys" }
+smoltcp = { version = "0.13.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "auto-icmp-echo-reply"] }
