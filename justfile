@@ -157,14 +157,14 @@ build-linux-initrd:
     PY
     ls -lh "{{out_dir}}/linux/initramfs.cpio"
 
-# Fetch and statically compile Dropbear SSH server for Linux MicroVM initramfs
+# Fetch and statically compile Dropbear SSH server & client (dropbear, dbclient/ssh, scp, dropbearkey, dropbearconvert)
 build-dropbear:
     #!/usr/bin/env bash
     set -euo pipefail
     OUT="{{out_dir}}/linux"
     mkdir -p "$OUT"
-    if [[ -x "$OUT/dropbear" && -x "$OUT/dropbearkey" ]]; then
-      ls -lh "$OUT/dropbear" "$OUT/dropbearkey"
+    if [[ -x "$OUT/dropbear" && -x "$OUT/dropbearkey" && -x "$OUT/dbclient" && -x "$OUT/scp" && -x "$OUT/dropbearconvert" ]]; then
+      ls -lh "$OUT/dropbear" "$OUT/dbclient" "$OUT/scp" "$OUT/dropbearkey"
       exit 0
     fi
     VER="2025.89"
@@ -190,13 +190,13 @@ build-dropbear:
         --disable-pam \
         LDFLAGS="-static" \
         CFLAGS="-Os"
-      make -j"$(nproc)" PROGRAMS="dropbear dropbearkey" STATIC=1
-      cp dropbear dropbearkey "$OUT/"
+      make -j"$(nproc)" PROGRAMS="dropbear dropbearkey dbclient scp dropbearconvert" STATIC=1
+      cp dropbear dropbearkey dbclient scp dropbearconvert "$OUT/"
     )
-    strip "$OUT/dropbear" "$OUT/dropbearkey" || true
-    ls -lh "$OUT/dropbear" "$OUT/dropbearkey"
+    strip "$OUT/dropbear" "$OUT/dropbearkey" "$OUT/dbclient" "$OUT/scp" "$OUT/dropbearconvert" || true
+    ls -lh "$OUT/dropbear" "$OUT/dbclient" "$OUT/scp" "$OUT/dropbearkey"
 
-# Build SSH-enabled BusyBox + Dropbear Linux MicroVM initramfs (out/linux/initramfs-ssh.cpio)
+# Build SSH-enabled BusyBox + Dropbear (server + ssh/scp client) Linux MicroVM initramfs
 build-linux-ssh-initrd: build-dropbear
     #!/usr/bin/env bash
     set -euo pipefail
@@ -221,6 +221,10 @@ build-linux-ssh-initrd: build-dropbear
       "{{root}}/examples/linux-vm/init.sh" \
       "/usr/bin/busybox" \
       "$OUT/dropbear" \
+      "$OUT/dbclient" \
+      "$OUT/scp" \
+      "$OUT/dropbearkey" \
+      "$OUT/dropbearconvert" \
       "$OUT/dropbear_ed25519_host_key" \
       "$AUTH_KEYS" \
       "$OUT/initramfs-ssh.cpio" <<'PY'
@@ -229,9 +233,13 @@ build-linux-ssh-initrd: build-dropbear
     init_sh = open(sys.argv[1], "rb").read()
     busybox = open(sys.argv[2], "rb").read()
     dropbear = open(sys.argv[3], "rb").read()
-    host_key = open(sys.argv[4], "rb").read()
-    auth_keys = open(sys.argv[5], "rb").read()
-    out_path = sys.argv[6]
+    dbclient = open(sys.argv[4], "rb").read()
+    scp_bin = open(sys.argv[5], "rb").read()
+    dropbearkey = open(sys.argv[6], "rb").read()
+    dropbearconvert = open(sys.argv[7], "rb").read()
+    host_key = open(sys.argv[8], "rb").read()
+    auth_keys = open(sys.argv[9], "rb").read()
+    out_path = sys.argv[10]
 
     applets = subprocess.check_output([sys.argv[2], "--list"], text=True).split()
     out = bytearray()
@@ -270,6 +278,11 @@ build-linux-ssh-initrd: build-dropbear
             continue
         entry(f"bin/{app}", stat.S_IFLNK | 0o777, data=b"busybox")
     entry("sbin/dropbear", stat.S_IFREG | 0o755, data=dropbear)
+    entry("usr/bin/dbclient", stat.S_IFREG | 0o755, data=dbclient)
+    entry("usr/bin/ssh", stat.S_IFLNK | 0o777, data=b"dbclient")
+    entry("usr/bin/scp", stat.S_IFREG | 0o755, data=scp_bin)
+    entry("usr/bin/dropbearkey", stat.S_IFREG | 0o755, data=dropbearkey)
+    entry("usr/bin/dropbearconvert", stat.S_IFREG | 0o755, data=dropbearconvert)
     entry("etc/dropbear/dropbear_ed25519_host_key", stat.S_IFREG | 0o600, data=host_key)
     entry("etc/passwd", stat.S_IFREG | 0o644, data=b"root:x:0:0:root:/root:/bin/sh\n")
     entry("etc/group", stat.S_IFREG | 0o644, data=b"root:x:0:\n")
@@ -277,6 +290,7 @@ build-linux-ssh-initrd: build-dropbear
     entry("etc/shells", stat.S_IFREG | 0o644, data=b"/bin/sh\n/bin/ash\n")
     entry("etc/nsswitch.conf", stat.S_IFREG | 0o644, data=b"passwd: files\ngroup: files\nhosts: files\n")
     entry("etc/hosts", stat.S_IFREG | 0o644, data=b"127.0.0.1 localhost\n")
+    entry("etc/resolv.conf", stat.S_IFREG | 0o644, data=b"nameserver 10.0.2.3\n")
     entry("root/.ssh/authorized_keys", stat.S_IFREG | 0o600, data=auth_keys)
     entry("TRAILER!!!", 0)
     while len(out) % 512: out.append(0)
@@ -827,12 +841,17 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     truncate -s 64M "$DISK"
 
     QEMU_PID=""
+    HOST_DB_PID=""
     stop_qemu() {
+      if [[ -n "$HOST_DB_PID" ]]; then
+        kill "$HOST_DB_PID" 2>/dev/null || true
+      fi
       if [[ -n "$QEMU_PID" ]]; then
         kill "$QEMU_PID" 2>/dev/null || true
       fi
       pkill -f "hostfwd=tcp:127.0.0.1:${CTL_PORT}-:4444" 2>/dev/null || true
       QEMU_PID=""
+      HOST_DB_PID=""
       sleep 0.2
     }
     trap stop_qemu EXIT
@@ -907,12 +926,36 @@ test-vm-ssh: build-os fetch-linux-kernel build-linux-ssh-initrd
     grep -q "10.0.3.2/24" <<<"$SSH_OUT"
     grep -q "2 packets received" <<<"$SSH_OUT"
 
-    echo "=== 5. Verify live network packet counters & stop/remove VM cleanly ==="
+    echo "=== 5. REAL OUTBOUND SSH & ICMP from inside Linux 6.1.102 VM through Hirsel-OS NAT! ==="
+    # Verify outbound TCP+ICMP NAT: SSH from INSIDE dev-1 (`10.0.3.2`) -> NAT (`10.0.2.15`) ->
+    # QEMU SLIRP host (`10.0.2.2:12222`, which loops right back to dev-1's SSH server, or any external host!).
+    OUT_KEY_B64="$(base64 -w0 "{{out_dir}}/linux/id_ed25519")"
+    OUTBOUND_OUT="$(
+      ssh \
+        -i "{{out_dir}}/linux/id_ed25519" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        -o LogLevel=ERROR \
+        -p "${SSH_PORT}" \
+        root@127.0.0.1 \
+        "echo '${OUT_KEY_B64}' | base64 -d > /tmp/id_openssh && \
+         chmod 600 /tmp/id_openssh && \
+         dropbearconvert openssh dropbear /tmp/id_openssh /tmp/id_dropbear && \
+         ping -c 2 -W 2 10.0.2.2 && \
+         ssh -y -i /tmp/id_dropbear -p ${SSH_PORT} root@10.0.2.2 'echo OUTBOUND_SSH_OK && uname -r && hostname'"
+    )"
+    printf '%s\n' "$OUTBOUND_OUT"
+    grep -q "2 packets received" <<<"$OUTBOUND_OUT"
+    grep -q "OUTBOUND_SSH_OK" <<<"$OUTBOUND_OUT"
+    grep -q "6.1.102" <<<"$OUTBOUND_OUT"
+
+    echo "=== 6. Verify live network packet counters & stop/remove VM cleanly ==="
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm inspect dev-1
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm stop dev-1
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm rm dev-1
     "$CTL" --addr "127.0.0.1:${CTL_PORT}" vm ls
-    echo "=== PASS: Managed persistent Linux 6.1.102 VM + virtio-net + real SSH verified end-to-end! ==="
+    echo "=== PASS: Managed persistent Linux 6.1.102 VM + inbound & outbound SSH over NAT verified end-to-end! ==="
 
 # Run host Rust unit tests (zbi, zx-sys, hirsel-proto, hirsel-vmm, hirsel-virtio)
 test:

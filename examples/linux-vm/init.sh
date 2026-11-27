@@ -13,18 +13,21 @@ mount -t tmpfs tmpfs /run 2>/dev/null || true
 
 VM_IP="10.0.3.2/24"
 VM_GW="10.0.3.1"
+VM_DNS="10.0.2.3"
 VM_NAME="hirsel-vm"
 
 for tok in $(cat /proc/cmdline); do
   case "$tok" in
     hirsel.ip=*)   VM_IP="${tok#hirsel.ip=}" ;;
     hirsel.gw=*)   VM_GW="${tok#hirsel.gw=}" ;;
+    hirsel.dns=*)  VM_DNS="${tok#hirsel.dns=}" ;;
     hirsel.name=*) VM_NAME="${tok#hirsel.name=}" ;;
   esac
 done
 
 hostname "$VM_NAME"
 echo "127.0.0.1 localhost $VM_NAME" > /etc/hosts
+echo "nameserver $VM_DNS" > /etc/resolv.conf
 
 ip link set lo up 2>/dev/null || true
 ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true

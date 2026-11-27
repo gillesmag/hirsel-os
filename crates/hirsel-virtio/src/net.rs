@@ -120,6 +120,45 @@ impl VirtioNet {
             self.tx_in_use[slot] = false;
         }
     }
+
+    /// Transmits a raw L2 Ethernet frame directly on the Virtio-Net TX queue
+    /// (used by Hirsel-OS's outbound NAT masquerade router for guest MicroVMs).
+    pub fn send_raw_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.is_empty() || VIRTIO_NET_HDR_LEN + frame.len() > SLOT_BYTES {
+            return false;
+        }
+        let Some(slot) = self.alloc_tx_slot() else {
+            return false;
+        };
+        let base = slot * SLOT_BYTES;
+        let buf = self.tx_buf.as_mut_slice();
+        buf[base..base + VIRTIO_NET_HDR_LEN].fill(0);
+        buf[base + VIRTIO_NET_HDR_LEN..base + VIRTIO_NET_HDR_LEN + frame.len()]
+            .copy_from_slice(frame);
+        self.send_tx_slot(slot, frame.len());
+        true
+    }
+
+    /// Pops one raw L2 Ethernet frame from the Virtio-Net RX queue, re-posting the RX slot.
+    pub fn recv_raw_frame(&mut self) -> Option<Vec<u8>> {
+        while let Some((done_id, used_len)) = self.rx_q.pop_used() {
+            let rx_slot = self.rx_desc_to_slot[done_id as usize] as usize;
+            self.rx_q.free_chain(done_id);
+            let total = (used_len as usize).min(SLOT_BYTES);
+            let frame = if total > VIRTIO_NET_HDR_LEN {
+                let start = rx_slot * SLOT_BYTES + VIRTIO_NET_HDR_LEN;
+                Some(self.rx_buf.as_slice()[start..start + (total - VIRTIO_NET_HDR_LEN)].to_vec())
+            } else {
+                None
+            };
+            self.post_rx_slot(rx_slot);
+            self.transport.notify_queue(0, self.rx_q.notify_off);
+            if frame.is_some() {
+                return frame;
+            }
+        }
+        None
+    }
 }
 
 pub struct VirtioRxToken<'a> {

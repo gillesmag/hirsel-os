@@ -4,14 +4,16 @@
 
 use crate::runner::BootContext;
 use hirsel_proto::{PortForward, VmNetSpec, VmSpec, VmStatus, VmSummary};
+use hirsel_virtio::net::VirtioNet;
 use hirsel_vmm::ManagedVmControl;
+use hirsel_vmm::nat::NatEngine;
 use hirsel_vmm::virtio_net_mmio::{GPA_VIRTIO_NET_MMIO, VIRTIO_NET_IRQ, VirtioNetChannel};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use zx_sys::*;
@@ -352,9 +354,11 @@ fn summarize_record(r: &ManagedVmRecord) -> VmSummary {
     }
 }
 
-/// `smoltcp::phy::Device` implementation bridged directly to a guest's `VirtioNetChannel`.
+/// `smoltcp::phy::Device` implementation bridged directly to a guest's `VirtioNetChannel`
+/// for local gateway traffic (ARP, gateway ICMP, and inbound TCP port-forwards).
 pub struct VmNetDevice {
     channel: Arc<VirtioNetChannel>,
+    local_rx: VecDeque<Vec<u8>>,
 }
 
 pub struct VmNetRxToken(Vec<u8>);
@@ -389,7 +393,7 @@ impl Device for VmNetDevice {
     type TxToken<'a> = VmNetTxToken where Self: 'a;
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let frame = self.channel.host_pop_rx()?;
+        let frame = self.local_rx.pop_front()?;
         Some((
             VmNetRxToken(frame),
             VmNetTxToken {
@@ -413,6 +417,95 @@ impl Device for VmNetDevice {
     }
 }
 
+/// Wraps Hirsel-OS's outer `VirtioNet` PCI NIC so incoming NAT replies for managed VMs
+/// are intercepted and routed straight to their originating VM before reaching outer `smoltcp`.
+pub struct NatVirtioNet {
+    inner: VirtioNet,
+    local_rx: VecDeque<Vec<u8>>,
+}
+
+pub struct NatOuterTxToken<'a> {
+    inner: &'a mut VirtioNet,
+}
+
+impl phy::TxToken for NatOuterTxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = vec![0u8; len];
+        let r = f(&mut buf);
+        let _ = self.inner.send_raw_frame(&buf);
+        r
+    }
+}
+
+impl NatVirtioNet {
+    pub fn new(inner: VirtioNet) -> Self {
+        Self {
+            inner,
+            local_rx: VecDeque::with_capacity(64),
+        }
+    }
+
+    pub fn mac(&self) -> [u8; 6] {
+        self.inner.mac
+    }
+
+    pub fn send_raw(&mut self, frame: &[u8]) -> bool {
+        self.inner.send_raw_frame(frame)
+    }
+
+    /// Drains RX frames from the physical/PCI `virtio-net` NIC, forwarding NAT replies
+    /// directly to their guest VM and queueing local host frames for outer `smoltcp`.
+    pub fn pump_rx(
+        &mut self,
+        nat: &mut NatEngine,
+        vm_gateways: &HashMap<String, ActiveVmGateway>,
+    ) -> bool {
+        let mut active = false;
+        while let Some(frame) = self.inner.recv_raw_frame() {
+            active = true;
+            if let Some((vm_id, guest_frame)) = nat.inbound(&frame) {
+                if let Some(gw) = vm_gateways.get(&vm_id) {
+                    gw.deliver_nat_inbound(guest_frame);
+                }
+            } else {
+                if self.local_rx.len() >= 128 {
+                    self.local_rx.pop_front();
+                }
+                self.local_rx.push_back(frame);
+            }
+        }
+        active
+    }
+}
+
+impl Device for NatVirtioNet {
+    type RxToken<'a> = VmNetRxToken where Self: 'a;
+    type TxToken<'a> = NatOuterTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let frame = self.local_rx.pop_front()?;
+        Some((
+            VmNetRxToken(frame),
+            NatOuterTxToken {
+                inner: &mut self.inner,
+            },
+        ))
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(NatOuterTxToken {
+            inner: &mut self.inner,
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TunnelState {
     Listening,
@@ -427,8 +520,11 @@ struct PortTunnel {
     state: TunnelState,
 }
 
-/// Per-VM virtual Ethernet gateway (`10.0.3.1/24`) + L4 TCP port forwarder.
+/// Per-VM virtual Ethernet gateway (`10.0.3.1/24`), inbound L4 TCP port forwarder,
+/// and outbound NAT tap.
 pub struct ActiveVmGateway {
+    vm_id: String,
+    gw_ip: [u8; 4],
     dev: VmNetDevice,
     inner_iface: Interface,
     inner_sockets: SocketSet<'static>,
@@ -445,6 +541,7 @@ impl ActiveVmGateway {
     ) -> Self {
         let mut dev = VmNetDevice {
             channel: Arc::clone(&att.channel),
+            local_rx: VecDeque::with_capacity(64),
         };
         let gw_mac = EthernetAddress([0x02, 0x48, 0x52, 0x53, 0x00, 0x01]);
         let mut cfg = IfaceConfig::new(HardwareAddress::Ethernet(gw_mac));
@@ -490,7 +587,7 @@ impl ActiveVmGateway {
                 });
             }
             println!(
-                "[hirsel-netd] forwarding node :{} -> VM `{}` {}.{}.{}.{}:{}",
+                "[hirsel-netd] forwarding node :{} -> VM `{}` {}.{}.{}.{}:{} (outbound NAT enabled)",
                 pf.host_port,
                 att.vm_id,
                 att.net.guest_ip[0],
@@ -503,6 +600,8 @@ impl ActiveVmGateway {
 
         let g = att.net.guest_ip;
         Self {
+            vm_id: att.vm_id.clone(),
+            gw_ip: gw,
             dev,
             inner_iface,
             inner_sockets,
@@ -512,6 +611,10 @@ impl ActiveVmGateway {
         }
     }
 
+    pub fn deliver_nat_inbound(&self, frame: Vec<u8>) {
+        self.dev.channel.host_push_tx(frame);
+    }
+
     /// Removes this gateway's outer listening sockets when the VM stops.
     pub fn teardown(self, outer_sockets: &mut SocketSet<'static>) {
         for t in self.tunnels {
@@ -519,14 +622,39 @@ impl ActiveVmGateway {
         }
     }
 
-    /// Polls the VM's virtual L2 link (ARP/ICMP/TCP) and pumps active port-forward tunnels.
-    /// Returns `true` if any network activity occurred.
-    pub fn poll(&mut self, outer_sockets: &mut SocketSet<'static>, now: SmolInstant) -> bool {
-        let mut active = !matches!(
+    /// Polls the VM's virtual L2 link (ARP/ICMP/TCP), intercepts external outbound traffic
+    /// for NAT masquerading, and pumps active inbound port-forward tunnels.
+    pub fn poll(
+        &mut self,
+        outer_sockets: &mut SocketSet<'static>,
+        nat: &mut NatEngine,
+        outbound_nat_frames: &mut Vec<Vec<u8>>,
+        now: SmolInstant,
+    ) -> bool {
+        let mut active = false;
+
+        // Partition guest TX frames: external IPv4 -> outbound NAT; local/ARP -> inner smoltcp.
+        while let Some(frame) = self.dev.channel.host_pop_rx() {
+            active = true;
+            if NatEngine::should_nat_outbound(&frame, self.gw_ip) {
+                if let Some(rewritten) = nat.outbound(&self.vm_id, self.gw_ip, &frame) {
+                    outbound_nat_frames.push(rewritten);
+                }
+            } else {
+                if self.dev.local_rx.len() >= 128 {
+                    self.dev.local_rx.pop_front();
+                }
+                self.dev.local_rx.push_back(frame);
+            }
+        }
+
+        if !matches!(
             self.inner_iface
                 .poll(now, &mut self.dev, &mut self.inner_sockets),
             smoltcp::iface::PollResult::None
-        );
+        ) {
+            active = true;
+        }
 
         for t in &mut self.tunnels {
             let outer = outer_sockets.get_mut::<tcp::Socket>(t.outer_handle);

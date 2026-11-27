@@ -11,6 +11,7 @@
 
 pub mod linux_boot;
 pub mod mmio;
+pub mod nat;
 pub mod virtio_net_mmio;
 
 use core::mem::size_of;

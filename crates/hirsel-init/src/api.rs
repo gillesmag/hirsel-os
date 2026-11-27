@@ -11,7 +11,8 @@
 
 use crate::caps::DirBackend;
 use crate::runner::{BootContext, Tier1LaunchOpts};
-use crate::vm_manager::{ActiveVmGateway, VmManager};
+use crate::vm_manager::{ActiveVmGateway, NatVirtioNet, VmManager};
+use hirsel_vmm::nat::NatEngine;
 use core::arch::asm;
 use hirsel_proto::crypto::{
     DEFAULT_DEV_KEY_STR, SessionCipher, compute_client_auth_mac, compute_server_auth_mac, ct_eq,
@@ -463,21 +464,25 @@ fn try_pop_frame(buf: &mut Vec<u8>) -> Option<Result<RawFrame, String>> {
 fn serve_tcp_control_plane(
     ctx: Arc<BootContext>,
     state: Arc<Mutex<NodeState>>,
-    mut net: VirtioNet,
+    net: VirtioNet,
 ) {
-    let hw_addr = HardwareAddress::Ethernet(EthernetAddress(net.mac));
+    let mut nat_net = NatVirtioNet::new(net);
+    let outer_mac = nat_net.mac();
+    let hw_addr = HardwareAddress::Ethernet(EthernetAddress(outer_mac));
     let mut cfg = IfaceConfig::new(hw_addr);
     let mut seed_bytes = [0u8; 8];
     unsafe { zx_cprng_draw(seed_bytes.as_mut_ptr(), seed_bytes.len()) };
     cfg.random_seed = u64::from_le_bytes(seed_bytes);
 
-    let mut iface = Interface::new(cfg, &mut net, smol_now());
+    let mut iface = Interface::new(cfg, &mut nat_net, smol_now());
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
     });
     let _ = iface
         .routes_mut()
         .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+
+    let mut nat = NatEngine::new([10, 0, 2, 15], outer_mac, [0x02, 0x48, 0x52, 0x53, 0x00, 0x01]);
 
     struct ConnSlot {
         handle: smoltcp::iface::SocketHandle,
@@ -513,6 +518,7 @@ fn serve_tcp_control_plane(
 
     let mut scratch = [0u8; 16 * 1024];
     let mut vm_gateways: HashMap<String, ActiveVmGateway> = HashMap::new();
+    let mut outbound_nat_frames: Vec<Vec<u8>> = Vec::with_capacity(32);
 
     loop {
         let now = smol_now();
@@ -532,6 +538,7 @@ fn serve_tcp_control_plane(
         for id in stale_ids {
             if let Some(gw) = vm_gateways.remove(&id) {
                 gw.teardown(&mut sockets);
+                nat.remove_vm(&id);
             }
         }
         for att in &active_atts {
@@ -541,11 +548,22 @@ fn serve_tcp_control_plane(
             }
         }
 
-        let poll_res = iface.poll(now, &mut net, &mut sockets);
-        let mut active = !matches!(poll_res, smoltcp::iface::PollResult::None);
+        // Pump physical/PCI virtio-net RX: deliver NAT replies to VMs & queue local frames.
+        let mut active = nat_net.pump_rx(&mut nat, &vm_gateways);
 
+        let poll_res = iface.poll(now, &mut nat_net, &mut sockets);
+        if !matches!(poll_res, smoltcp::iface::PollResult::None) {
+            active = true;
+        }
+
+        outbound_nat_frames.clear();
         for gw in vm_gateways.values_mut() {
-            if gw.poll(&mut sockets, now) {
+            if gw.poll(&mut sockets, &mut nat, &mut outbound_nat_frames, now) {
+                active = true;
+            }
+        }
+        for frame in outbound_nat_frames.drain(..) {
+            if nat_net.send_raw(&frame) {
                 active = true;
             }
         }
@@ -624,7 +642,7 @@ fn serve_tcp_control_plane(
             }
         }
 
-        let _ = iface.poll(smol_now(), &mut net, &mut sockets);
+        let _ = iface.poll(smol_now(), &mut nat_net, &mut sockets);
 
         if !active {
             let next = unsafe { zx_clock_get_monotonic() }.saturating_add(250_000);
