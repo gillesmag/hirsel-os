@@ -104,15 +104,104 @@ index 96d932c4dec..50fa5d9f9d7 100644
                  "fuchsia.kernel.Stats",
                  "fuchsia.kernel.VmexResource",
                  "fuchsia.lightsensor.Sensor",
-diff --git a/src/session/bin/session_manager/meta/session_manager.core_shard.cml b/src/session/bin/session_manager/meta/session_manager.core_shard.cml
-index 88c26797b9a..a21c7627a7c 100644
---- a/src/session/bin/session_manager/meta/session_manager.core_shard.cml
-+++ b/src/session/bin/session_manager/meta/session_manager.core_shard.cml
-@@ -255,6 +255,7 @@
-                 "fuchsia.device.NameProvider",
-                 "fuchsia.hardware.power.statecontrol.Admin",
-                 "fuchsia.hardware.power.statecontrol.ShutdownWatcherRegister",
-+                "fuchsia.kernel.HypervisorResource",
-                 "fuchsia.kernel.Stats",
-                 "fuchsia.kernel.VmexResource",
-                 "fuchsia.power.button.Monitor",
+diff --git a/src/ui/lib/scene_management/src/scene_manager.rs b/src/ui/lib/scene_management/src/scene_manager.rs
+index b03c6b146cd..ef974f463f6 100644
+--- a/src/ui/lib/scene_management/src/scene_manager.rs
++++ b/src/ui/lib/scene_management/src/scene_manager.rs
+@@ -54,8 +54,8 @@ pub type PresentationSender = UnboundedSender<PresentationMessage>;
+ /// Unbounded receiver used for presentation messages.
+ pub type PresentationReceiver = UnboundedReceiver<PresentationMessage>;
+ 
+-const _CURSOR_SIZE: (u32, u32) = (18, 29);
+-const CURSOR_HOTSPOT: (u32, u32) = (2, 4);
++const _CURSOR_SIZE: (u32, u32) = (12, 18);
++const CURSOR_HOTSPOT: (u32, u32) = (0, 0);
+ 
+ // TODO(https://fxbug.dev/42158302): Remove hardcoded scale when Flatland provides
+ // what is needed to determine the cursor scale factor.
+@@ -664,6 +664,76 @@ impl SceneManager {
+             )?;
+         }
+ 
++        // Create a compositor-owned Flatland pointer cursor above all views (hotspot at (0, 0)).
++        let cursor_transform_id = {
++            let flatland = &root_flatland.flatland;
++            let tid = id_generator.next_transform_id();
++            flatland.create_transform(&tid)?;
++            flatland.set_hit_regions(&tid, &[])?;
++            const CURSOR_RECTS: &[(i32, i32, u32, bool)] = &[
++                // Dark 1px outline silhouette
++                (0, 0, 1, false),
++                (0, 1, 2, false),
++                (0, 2, 3, false),
++                (0, 3, 4, false),
++                (0, 4, 5, false),
++                (0, 5, 6, false),
++                (0, 6, 7, false),
++                (0, 7, 8, false),
++                (0, 8, 9, false),
++                (0, 9, 10, false),
++                (0, 10, 11, false),
++                (0, 11, 12, false),
++                (0, 12, 8, false),
++                (0, 13, 4, false), (5, 13, 4, false),
++                (0, 14, 3, false), (5, 14, 4, false),
++                (0, 15, 2, false), (6, 15, 4, false),
++                (6, 16, 4, false),
++                (7, 17, 3, false),
++                // Crisp white inner fill
++                (1, 2, 1, true),
++                (1, 3, 2, true),
++                (1, 4, 3, true),
++                (1, 5, 4, true),
++                (1, 6, 5, true),
++                (1, 7, 6, true),
++                (1, 8, 7, true),
++                (1, 9, 8, true),
++                (1, 10, 9, true),
++                (1, 11, 5, true),
++                (1, 12, 3, true), (5, 12, 2, true),
++                (1, 13, 2, true), (6, 13, 2, true),
++                (1, 14, 1, true), (6, 14, 2, true),
++                (7, 15, 2, true),
++                (7, 16, 2, true),
++            ];
++            let border_rgba = ui_comp::ColorRgba { red: 0.06, green: 0.05, blue: 0.04, alpha: 1.0 };
++            let fill_rgba = ui_comp::ColorRgba { red: 0.99, green: 0.99, blue: 0.98, alpha: 1.0 };
++            for &(rx, ry, rw, is_white) in CURSOR_RECTS {
++                let rt = id_generator.next_transform_id();
++                let rc = id_generator.next_content_id();
++                flatland.create_transform(&rt)?;
++                flatland.create_filled_rect(&rc)?;
++                flatland.set_solid_fill(
++                    &rc,
++                    if is_white { &fill_rgba } else { &border_rgba },
++                    &fmath::SizeU { width: rw, height: 1 },
++                )?;
++                flatland.set_content(&rt, &rc)?;
++                flatland.set_translation(&rt, &fmath::Vec_ { x: rx, y: ry })?;
++                flatland.add_child(&tid, &rt)?;
++            }
++            flatland.set_translation(
++                &tid,
++                &fmath::Vec_ {
++                    x: (client_viewport_size.width / 2) as i32,
++                    y: (client_viewport_size.height / 2) as i32,
++                },
++            )?;
++            flatland.add_child(&root_flatland.root_transform_id, &tid)?;
++            tid
++        };
++
+         let mut a11y_view_watcher: Option<ui_comp::ChildViewWatcherProxy> = None;
+         match a11y_view_provider {
+             Some(a11y_view_provider) => {
+@@ -771,7 +841,7 @@ impl SceneManager {
+             id_generator: RefCell::new(id_generator),
+             viewport_hanging_get,
+             _viewport_publisher: viewport_publisher,
+-            cursor_transform_id: None,
++            cursor_transform_id: Some(cursor_transform_id),
+             cursor_visibility: Cell::new(true),
+             display_metrics,
+             device_pixel_ratio,
