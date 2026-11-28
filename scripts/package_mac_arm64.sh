@@ -63,35 +63,44 @@ fi
 
 ENTROPY="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import os; print(os.urandom(32).hex())')"
 DISPLAY_ARGS=(-display cocoa,show-cursor=on)
-LOWMEM=0
+HIGHMEM=0
+GIC_VER="3"
+FORCE_TCG=0
 for arg in "$@"; do
   case "$arg" in
-    --vnc)    DISPLAY_ARGS=(-vnc 127.0.0.1:0) ;;
-    --lowmem) LOWMEM=1 ;;
+    --vnc)     DISPLAY_ARGS=(-vnc 127.0.0.1:0) ;;
+    --lowmem)  HIGHMEM=0 ;;
+    --highmem) HIGHMEM=1 ;;
+    --gic2)    GIC_VER="2" ;;
+    --tcg)     FORCE_TCG=1 ;;
     -h|--help)
-      echo "Usage: $0 [--vnc] [--lowmem]"
-      echo "  --vnc     Run headless with VNC on 127.0.0.1:5900"
-      echo "  --lowmem  Disable >4GiB QEMU highmem (uses 3072M RAM; fallback for older QEMU/HVF)"
+      echo "Usage: $0 [--vnc] [--highmem] [--gic2] [--tcg]"
+      echo "  --vnc      Run headless with VNC on 127.0.0.1:5900"
+      echo "  --highmem  Enable >4GiB QEMU highmem (uses 4096M RAM; macOS HVF defaults to highmem=off + 3072M)"
+      echo "  --gic2     Use GICv2 instead of GICv3"
+      echo "  --tcg      Force software TCG instead of HVF"
       exit 0
       ;;
   esac
 done
 
-MEM="${HIRSEL_MEM:-4096M}"
 EXTRA_KARGS=""
-if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
-  if [[ "$LOWMEM" == "1" ]]; then
-    MACHINE_ARGS=(-machine virt,gic-version=3,highmem=off,highmem-ecam=off)
-    MEM="${HIRSEL_MEM:-3072M}"
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" && "$FORCE_TCG" == "0" ]]; then
+  if [[ "$HIGHMEM" == "1" ]]; then
+    MACHINE_ARGS=(-machine "virt,gic-version=${GIC_VER},highmem-ecam=off")
+    MEM="${HIRSEL_MEM:-4096M}"
   else
-    MACHINE_ARGS=(-machine virt,gic-version=3,highmem-ecam=off)
+    # Upstream Fuchsia requires highmem=off on macOS HVF (caps RAM at 3072M).
+    MACHINE_ARGS=(-machine "virt,gic-version=${GIC_VER},highmem=off,highmem-ecam=off")
+    MEM="${HIRSEL_MEM:-3072M}"
   fi
   ACCEL_ARGS=(-accel hvf -cpu host)
   EXTRA_KARGS="kernel.page-scanner.page-table-eviction-policy=never"
 else
-  MACHINE_ARGS=(-machine virt,virtualization=true,gic-version=3,highmem-ecam=off)
+  MACHINE_ARGS=(-machine "virt,virtualization=true,gic-version=${GIC_VER},highmem-ecam=off")
   ACCEL_ARGS=(-accel tcg,thread=single -cpu max)
-  if [[ "${DISPLAY_ARGS[0]}" == "-display" ]]; then
+  MEM="${HIRSEL_MEM:-4096M}"
+  if [[ "$(uname -s)" != "Darwin" && "${DISPLAY_ARGS[0]}" == "-display" ]]; then
     DISPLAY_ARGS=(-display gtk,show-cursor=on)
   fi
 fi
