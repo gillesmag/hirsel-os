@@ -52,6 +52,10 @@ const INK_PATH: &str = "/data/ink.json";
 const SETTINGS_PATH: &str = "/data/settings.json";
 const SAS_HOSTS: &[&str] = &["api.anthropic.com", "api.openai.com", "api.github.com", "example.com"];
 
+fn default_ui_scale_pct() -> u32 {
+    125
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WorkstationSettings {
     wifi_enabled: bool,
@@ -62,6 +66,12 @@ struct WorkstationSettings {
     net_mode: String,
     dns_primary: String,
     dns_secondary: String,
+    #[serde(default = "default_ui_scale_pct")]
+    ui_scale_pct: u32,
+    #[serde(skip)]
+    phys_w: u32,
+    #[serde(skip)]
+    phys_h: u32,
     #[serde(skip)]
     settings_open_seq: u64,
 }
@@ -77,6 +87,9 @@ impl Default for WorkstationSettings {
             net_mode: "dhcp".to_string(),
             dns_primary: "1.1.1.1".to_string(),
             dns_secondary: "9.9.9.9".to_string(),
+            ui_scale_pct: default_ui_scale_pct(),
+            phys_w: 1600,
+            phys_h: 1000,
             settings_open_seq: 0,
         }
     }
@@ -273,7 +286,10 @@ struct HirselShell {
     id_gen: IdGen,
     view_focuser: fviews::FocuserProxy,
     root_view_ref: fviews::ViewRef,
-    root_transform: fland::TransformId,
+    _root_transform: fland::TransformId,
+    ui_root_transform: fland::TransformId,
+    phys_w: u32,
+    phys_h: u32,
 
     // Background solid fill
     _bg_transform: fland::TransformId,
@@ -639,6 +655,10 @@ impl HirselShell {
         flatland.create_transform(&root_transform)?;
         flatland.set_root_transform(&root_transform)?;
 
+        let ui_root_transform = id_gen.next_transform_id();
+        flatland.create_transform(&ui_root_transform)?;
+        flatland.add_child(&root_transform, &ui_root_transform)?;
+
         let (parent_watcher, parent_watcher_req) =
             create_proxy::<fland::ParentViewportWatcherMarker>();
         let (view_focuser, view_focuser_req) = create_proxy::<fviews::FocuserMarker>();
@@ -687,8 +707,20 @@ impl HirselShell {
         spawn_keyboard_listener(root_view_ref_for_kb, tx.clone());
         spawn_mouse_listener(mouse_source, tx.clone());
 
-        // Sync initial display dimensions into pure-Hirsel hirsel-wm
-        let _ = wm.send(&format!("RESIZE {width} {height}")).await?;
+        let mut settings = std::fs::read_to_string(SETTINGS_PATH)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<WorkstationSettings>(&raw).ok())
+            .unwrap_or_default();
+        settings.ui_scale_pct = settings.ui_scale_pct.clamp(100, 200);
+        settings.phys_w = width;
+        settings.phys_h = height;
+        let scale = (settings.ui_scale_pct as f32) / 100.0;
+        let logical_w = ((width as f32) / scale).round().max(480.0) as u32;
+        let logical_h = ((height as f32) / scale).round().max(360.0) as u32;
+        flatland.set_scale(&ui_root_transform, &fmath::VecF { x: scale, y: scale })?;
+
+        // Sync initial scaled display dimensions into pure-Hirsel hirsel-wm
+        let _ = wm.send(&format!("RESIZE {logical_w} {logical_h}")).await?;
 
         // Background solid rect
         let bg_transform = id_gen.next_transform_id();
@@ -696,7 +728,7 @@ impl HirselShell {
         flatland.create_transform(&bg_transform)?;
         flatland.create_filled_rect(&bg_content)?;
         flatland.set_content(&bg_transform, &bg_content)?;
-        flatland.add_child(&root_transform, &bg_transform)?;
+        flatland.add_child(&ui_root_transform, &bg_transform)?;
 
         // Top 36px compositor-owned trust bar
         let top_bar_transform = id_gen.next_transform_id();
@@ -704,7 +736,7 @@ impl HirselShell {
         flatland.create_transform(&top_bar_transform)?;
         let top_bar_surface = painter::CpuSurface::new(
             "hirsel-top-bar",
-            width,
+            logical_w,
             TOP_BAR_H,
             &flatland,
             top_bar_content,
@@ -763,7 +795,10 @@ impl HirselShell {
             id_gen,
             view_focuser,
             root_view_ref,
-            root_transform,
+            _root_transform: root_transform,
+            ui_root_transform,
+            phys_w: width,
+            phys_h: height,
             _bg_transform: bg_transform,
             bg_content,
             top_bar_transform,
@@ -785,10 +820,7 @@ impl HirselShell {
             powerbox_toast: String::new(),
             ink_strokes,
             active_theme,
-            settings: std::fs::read_to_string(SETTINGS_PATH)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<WorkstationSettings>(&raw).ok())
-                .unwrap_or_default(),
+            settings,
             js_client,
             dim_transform,
             dim_content,
@@ -1055,35 +1087,35 @@ impl HirselShell {
 
         // Detach dynamic layers cleanly before re-attaching in exact security Z-order
         if self.top_bar_attached {
-            let _ = self.flatland.remove_child(&self.root_transform, &self.top_bar_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.top_bar_transform);
             self.top_bar_attached = false;
         }
         if self.web_bar_attached {
-            let _ = self.flatland.remove_child(&self.root_transform, &self.web_bar_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.web_bar_transform);
             self.web_bar_attached = false;
         }
         if let Some(ref mut fig) = self.figments_web {
             if fig.attached {
-                let _ = self.flatland.remove_child(&self.root_transform, &fig.border_transform);
-                let _ = self.flatland.remove_child(&self.root_transform, &fig.viewport_transform);
+                let _ = self.flatland.remove_child(&self.ui_root_transform, &fig.border_transform);
+                let _ = self.flatland.remove_child(&self.ui_root_transform, &fig.viewport_transform);
                 fig.attached = false;
             }
         }
         if self.dev_attached {
-            let _ = self.flatland.remove_child(&self.root_transform, &self.dev_border_transform);
-            let _ = self.flatland.remove_child(&self.root_transform, &self.dev_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.dev_border_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.dev_transform);
             self.dev_attached = false;
         }
         if let Some(ref mut web) = self.untrusted_web {
             if web.attached {
-                let _ = self.flatland.remove_child(&self.root_transform, &web.border_transform);
-                let _ = self.flatland.remove_child(&self.root_transform, &web.viewport_transform);
+                let _ = self.flatland.remove_child(&self.ui_root_transform, &web.border_transform);
+                let _ = self.flatland.remove_child(&self.ui_root_transform, &web.viewport_transform);
                 web.attached = false;
             }
         }
         if self.ceremony_attached {
-            let _ = self.flatland.remove_child(&self.root_transform, &self.dim_transform);
-            let _ = self.flatland.remove_child(&self.root_transform, &self.ceremony_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.dim_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.ceremony_transform);
             self.ceremony_attached = false;
         }
 
@@ -1110,8 +1142,8 @@ impl HirselShell {
                 r,
                 col,
             )?;
-            self.flatland.add_child(&self.root_transform, &fig.border_transform)?;
-            self.flatland.add_child(&self.root_transform, &fig.viewport_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &fig.border_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &fig.viewport_transform)?;
             fig.attached = true;
         }
 
@@ -1159,8 +1191,8 @@ impl HirselShell {
                 r,
                 col,
             )?;
-            self.flatland.add_child(&self.root_transform, &self.dev_border_transform)?;
-            self.flatland.add_child(&self.root_transform, &self.dev_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.dev_border_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.dev_transform)?;
             self.dev_attached = true;
         }
 
@@ -1220,15 +1252,15 @@ impl HirselShell {
                 &web.viewport_transform,
                 &fmath::Vec_ { x: r.x as i32, y: r.y as i32 + WEB_BAR_H as i32 },
             )?;
-            self.flatland.add_child(&self.root_transform, &web.border_transform)?;
-            self.flatland.add_child(&self.root_transform, &self.web_bar_transform)?;
-            self.flatland.add_child(&self.root_transform, &web.viewport_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &web.border_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.web_bar_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &web.viewport_transform)?;
             self.web_bar_attached = true;
             web.attached = true;
         }
 
         // Layer 4: Compositor-owned Top Trust Bar (above all viewports)
-        self.flatland.add_child(&self.root_transform, &self.top_bar_transform)?;
+        self.flatland.add_child(&self.ui_root_transform, &self.top_bar_transform)?;
         self.top_bar_attached = true;
 
         // Layer 5 (TOPMOST): Protected Approval Ceremony / SAS Lockdown overlay (rounded SrcOver card!)
@@ -1271,8 +1303,8 @@ impl HirselShell {
                 &self.ceremony_transform,
                 &fmath::Vec_ { x: cr.x as i32, y: cr.y as i32 },
             )?;
-            self.flatland.add_child(&self.root_transform, &self.dim_transform)?;
-            self.flatland.add_child(&self.root_transform, &self.ceremony_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.dim_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.ceremony_transform)?;
             self.ceremony_attached = true;
         }
 
@@ -1414,7 +1446,26 @@ impl HirselShell {
                         self.settings.dns_secondary = d2.trim().to_string();
                     }
                 }
+                let mut scale_changed = false;
+                if let Some(pct) = payload["ui_scale_pct"].as_u64() {
+                    let clamped = (pct as u32).clamp(100, 200);
+                    if clamped != self.settings.ui_scale_pct {
+                        self.settings.ui_scale_pct = clamped;
+                        scale_changed = true;
+                    }
+                }
+                self.settings.phys_w = self.phys_w;
+                self.settings.phys_h = self.phys_h;
                 self.persist_settings();
+                if scale_changed {
+                    let scale = (self.settings.ui_scale_pct as f32) / 100.0;
+                    let lw = ((self.phys_w as f32) / scale).round().max(480.0) as u32;
+                    let lh = ((self.phys_h as f32) / scale).round().max(360.0) as u32;
+                    let _ = self.flatland.set_scale(&self.ui_root_transform, &fmath::VecF { x: scale, y: scale });
+                    if self.wm.send(&format!("RESIZE {lw} {lh}")).await.is_ok() {
+                        let _ = self.apply_scene().await;
+                    }
+                }
                 let _ = reply.send(self.settings.clone());
             }
             ShellMsg::ToggleSettingsUi => {
@@ -1668,8 +1719,8 @@ impl HirselShell {
                         // Detach old untrusted viewport cleanly before spawning fresh OS-isolated Context
                         if let Some(ref mut old_web) = self.untrusted_web.take() {
                             if old_web.attached {
-                                let _ = self.flatland.remove_child(&self.root_transform, &old_web.border_transform);
-                                let _ = self.flatland.remove_child(&self.root_transform, &old_web.viewport_transform);
+                                let _ = self.flatland.remove_child(&self.ui_root_transform, &old_web.border_transform);
+                                let _ = self.flatland.remove_child(&self.ui_root_transform, &old_web.viewport_transform);
                             }
                         }
                         self.untrusted_origin = new_origin.clone();
@@ -1876,6 +1927,9 @@ impl HirselShell {
                 }
             }
             ShellMsg::MouseClick { x, y } => {
+                let scale = (self.settings.ui_scale_pct as f32) / 100.0;
+                let x = x / scale;
+                let y = y / scale;
                 let plan = self.wm.latest.clone();
                 // 1. If ceremony is active, handle clicks inside Approve / Deny buttons ONLY!
                 if let Some(ref cr) = plan.layout.ceremony {
@@ -2012,7 +2066,15 @@ impl HirselShell {
                 }
             }
             ShellMsg::Relayout { width, height } => {
-                if self.wm.send(&format!("RESIZE {width} {height}")).await.is_ok() {
+                self.phys_w = width;
+                self.phys_h = height;
+                self.settings.phys_w = width;
+                self.settings.phys_h = height;
+                let scale = (self.settings.ui_scale_pct as f32) / 100.0;
+                let lw = ((width as f32) / scale).round().max(480.0) as u32;
+                let lh = ((height as f32) / scale).round().max(360.0) as u32;
+                let _ = self.flatland.set_scale(&self.ui_root_transform, &fmath::VecF { x: scale, y: scale });
+                if self.wm.send(&format!("RESIZE {lw} {lh}")).await.is_ok() {
                     let _ = self.apply_scene().await;
                 }
             }
@@ -2335,6 +2397,9 @@ async fn handle_http_conn(
                         "net_mode": st.net_mode,
                         "dns_primary": st.dns_primary,
                         "dns_secondary": st.dns_secondary,
+                        "ui_scale_pct": st.ui_scale_pct,
+                        "phys_w": st.phys_w,
+                        "phys_h": st.phys_h,
                         "settings_open_seq": st.settings_open_seq,
                     })
                     .to_string(),
@@ -2360,6 +2425,9 @@ async fn handle_http_conn(
                         "net_mode": st.net_mode,
                         "dns_primary": st.dns_primary,
                         "dns_secondary": st.dns_secondary,
+                        "ui_scale_pct": st.ui_scale_pct,
+                        "phys_w": st.phys_w,
+                        "phys_h": st.phys_h,
                     })
                     .to_string(),
                 ),

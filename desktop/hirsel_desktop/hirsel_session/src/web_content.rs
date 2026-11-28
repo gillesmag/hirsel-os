@@ -793,8 +793,22 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
         </div>
       </div>
 
-      <!-- 6 Curated OKLCH Rooms Tab -->
+      <!-- 6 Curated OKLCH Rooms & Display Scale Tab -->
       <div class="tab-pane" id="tab-rooms">
+        <div class="panel">
+          <div class="panel-row">
+            <h3>Display &amp; UI Scale</h3>
+            <code id="scale-readout" style="font-size:10.5px;color:var(--ink-2)">125%</code>
+          </div>
+          <div class="muted-note">Rescales the entire Flatland compositor, Top Bar, and Chromium UI live (persisted on Fxfs).</div>
+          <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:5px">
+            <button class="btn sm scale-opt" data-scale="100" onclick="setUiScale(100)">100%</button>
+            <button class="btn sm scale-opt" data-scale="125" onclick="setUiScale(125)">125%</button>
+            <button class="btn sm scale-opt" data-scale="150" onclick="setUiScale(150)">150%</button>
+            <button class="btn sm scale-opt" data-scale="175" onclick="setUiScale(175)">175%</button>
+            <button class="btn sm scale-opt" data-scale="200" onclick="setUiScale(200)">200%</button>
+          </div>
+        </div>
         <div class="panel">
           <h3>Curated Rooms (Whole-OS Sync)</h3>
           <div class="muted-note">Updates Flatland compositor, top bar islands, vm-dev terminal, and Figments together.</div>
@@ -976,6 +990,7 @@ async function refreshSettingsData() {
 
     wifiEnabled = st.wifi_enabled !== false;
     document.getElementById('wifi-toggle').setAttribute('aria-checked', String(wifiEnabled));
+    applyScaleButtons(st.ui_scale_pct || 125, st.phys_w, st.phys_h);
     if (document.activeElement !== document.getElementById('wifi-ssid') && st.wifi_ssid) {
       document.getElementById('wifi-ssid').value = st.wifi_ssid;
     }
@@ -1044,6 +1059,28 @@ function applyThemeLocal(room) {
   document.querySelectorAll('.room-opt, .room-card').forEach((btn) => {
     btn.setAttribute('aria-checked', String(btn.dataset.room === room));
   });
+}
+
+function applyScaleButtons(pct, pw, ph) {
+  const cur = Number(pct) || 125;
+  const el = document.getElementById('scale-readout');
+  if (el) {
+    const lw = pw ? Math.round(pw * 100 / cur) : 0;
+    const lh = ph ? Math.round(ph * 100 / cur) : 0;
+    el.textContent = pw && ph ? `${cur}% · ${pw}x${ph} (${lw}x${lh})` : `${cur}%`;
+  }
+  document.querySelectorAll('.scale-opt').forEach((btn) => {
+    const active = Number(btn.dataset.scale) === cur;
+    btn.className = active ? 'btn sm primary scale-opt' : 'btn sm scale-opt';
+  });
+}
+
+async function setUiScale(pct) {
+  applyScaleButtons(pct);
+  const r = await apiPost('/_hirsel/settings', JSON.stringify({ ui_scale_pct: pct }));
+  if (r.ok && r.ui_scale_pct) {
+    applyScaleButtons(r.ui_scale_pct, r.phys_w, r.phys_h);
+  }
 }
 
 async function setThemeRoom(room) {

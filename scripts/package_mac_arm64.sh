@@ -62,23 +62,37 @@ if [[ ! -f "${DISK}" || "${DIR}/fxfs.sparse.blk" -nt "${DISK}" ]]; then
 fi
 
 ENTROPY="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import os; print(os.urandom(32).hex())')"
-DISPLAY_ARGS=(-display cocoa,show-cursor=on)
+DISPLAY_ARGS=(-display cocoa,show-cursor=on,zoom-to-fit=on)
 GIC_VER="3"
 FORCE_TCG=0
-for arg in "$@"; do
-  case "$arg" in
-    --vnc)  DISPLAY_ARGS=(-vnc 127.0.0.1:0) ;;
-    --gic2) GIC_VER="2" ;;
-    --tcg)  FORCE_TCG=1 ;;
+RES="${HIRSEL_RES:-1600x1000}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vnc)        DISPLAY_ARGS=(-vnc 127.0.0.1:0); shift ;;
+    --fullscreen) DISPLAY_ARGS=(-display cocoa,show-cursor=on,zoom-to-fit=on,full-screen=on); shift ;;
+    --res)        RES="${2:?--res requires WxH (e.g. 1920x1200)}"; shift 2 ;;
+    --res=*)      RES="${1#--res=}"; shift ;;
+    --gic2)       GIC_VER="2"; shift ;;
+    --tcg)        FORCE_TCG=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--vnc] [--gic2] [--tcg]"
-      echo "  --vnc   Run headless with VNC on 127.0.0.1:5900"
-      echo "  --gic2  Use GICv2 instead of GICv3"
-      echo "  --tcg   Force software TCG instead of HVF"
+      echo "Usage: $0 [--res WxH] [--fullscreen] [--vnc] [--gic2] [--tcg]"
+      echo "  --res WxH     Guest display resolution (default: 1600x1000; e.g. 1920x1200, 2560x1600)"
+      echo "  --fullscreen  Start QEMU Cocoa window in fullscreen"
+      echo "  --vnc         Run headless with VNC on 127.0.0.1:5900"
+      echo "  --gic2        Use GICv2 instead of GICv3"
+      echo "  --tcg         Force software TCG instead of HVF"
       exit 0
       ;;
+    *) shift ;;
   esac
 done
+
+XRES="${RES%x*}"
+YRES="${RES#*x}"
+if [[ -z "$XRES" || -z "$YRES" || "$XRES" == "$RES" ]]; then
+  echo "Invalid --res '${RES}'. Expected WxH (e.g. 1600x1000 or 1920x1200)." >&2
+  exit 1
+fi
 
 MEM="${HIRSEL_MEM:-4096M}"
 EXTRA_KARGS=""
@@ -90,13 +104,15 @@ else
   MACHINE_ARGS=(-machine "virt,virtualization=true,gic-version=${GIC_VER},highmem-ecam=off")
   ACCEL_ARGS=(-accel tcg,thread=single -cpu max)
   if [[ "$(uname -s)" != "Darwin" && "${DISPLAY_ARGS[0]}" == "-display" ]]; then
-    DISPLAY_ARGS=(-display gtk,show-cursor=on)
+    DISPLAY_ARGS=(-display gtk,show-cursor=on,zoom-to-fit=on)
   fi
 fi
 
-echo "=== Booting Hirsel-OS Desktop (ARM64) ==="
+echo "=== Booting Hirsel-OS Desktop (ARM64, ${XRES}x${YRES}) ==="
 echo "  Control API : http://127.0.0.1:7780/_hirsel/state"
 echo "  Figments UI : http://127.0.0.1:7711/"
+echo "  UI Scale    : Top-right Settings -> Rooms -> UI Scale (100% - 200%)"
+echo "  Mouse Grab  : Click window to capture; Ctrl+Option+G to release"
 echo "  Hotkeys     : F1 Figments | F2 vm-dev | F3 Web | F4 Room | F5 Outbox | F6 SAS | , Settings"
 
 exec qemu-system-aarch64 \
@@ -109,7 +125,7 @@ exec qemu-system-aarch64 \
   -device virtio-blk-pci,drive=vdisk,iothread=iothread0 \
   -netdev "type=user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:7780-:7780,hostfwd=tcp:127.0.0.1:7711-:7711,hostfwd=tcp:127.0.0.1:7712-:7712" \
   -device "virtio-net-pci,vectors=8,romfile=,netdev=net0,mac=52:54:00:63:5e:7a,addr=0x4" \
-  -device virtio-gpu-pci,xres=1280,yres=800 \
+  -device "virtio-gpu-pci,xres=${XRES},yres=${YRES}" \
   -device virtio-keyboard-pci \
   -device virtio-mouse-pci \
   -device virtio-rng-pci \
