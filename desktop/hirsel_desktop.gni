@@ -3,3 +3,8 @@
 bazel_product_bundle_prefix = "//products/hirsel_desktop:hirsel_desktop"
 
 fxfs_blob = true
+
+# Use the C++ virtio-gpu-display driver which supports automatic MSI-X -> Legacy INTx
+# fallback (the Rust port hardcodes MSI-X and fails on Apple Silicon HVF where PCI MSI-X
+# is unavailable).
+virtio_gpu_display_flavor = "cpp"
