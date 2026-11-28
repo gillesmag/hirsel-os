@@ -6,8 +6,9 @@
 
 fn parse_domain(s: String) -> Option[wm.Domain] {
     if s == "figments" { return Some(Figments) }
-    if s == "vm_dev" { return Some(VmDev) }
-    if s == "web_untrusted" { return Some(WebUntrusted) }
+    if s == "vm_dev" || s == "shell" { return Some(VmDev) }
+    if s == "activity" { return Some(Activity) }
+    if s == "web_untrusted" || s == "web" { return Some(WebUntrusted) }
     if s == "trusted_chrome" { return Some(TrustedChrome) }
     None
 }
@@ -62,7 +63,8 @@ fn parse_event(raw: String) -> Option[wm.Event] {
         let h = parse_u64_or(string.from(parts[2u64]), 800u64)
         return Some(Resize(w: w, h: h))
     }
-    if cmd == "TOGGLE_DEV" { return Some(ToggleDev) }
+    if cmd == "TOGGLE_DEV" || cmd == "TOGGLE_SHELL" { return Some(ToggleDev) }
+    if cmd == "TOGGLE_ACTIVITY" { return Some(ToggleActivity) }
     if cmd == "TOGGLE_WEB" { return Some(ToggleWeb) }
     if cmd == "TOGGLE_SAS" { return Some(ToggleSas) }
     if cmd == "TOGGLE_ROOM" { return Some(ToggleRoom) }

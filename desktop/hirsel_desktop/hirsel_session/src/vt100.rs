@@ -5,6 +5,7 @@
 //   - Full SGR ANSI 16-color + bright colors + reset (CSI ... m)
 //   - Carriage return (\r), newline (\n), backspace (\x08), tab (\t), scrolling history
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct VtCell {
     pub ch: u8,

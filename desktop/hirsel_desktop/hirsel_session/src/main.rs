@@ -5,19 +5,28 @@
 // Policy & layout geometry live strictly inside the zero-ambient pure-Hirsel
 // child process `/pkg/bin/hirsel-wm` (wm_client.rs).
 
+mod activity;
 mod agent_client;
+mod apps;
 mod board_client;
+mod eval_client;
 mod js_client;
 mod painter;
+mod script;
+mod shell;
 mod ui_fonts;
 mod vm_client;
 mod vt100;
 mod web_content;
 mod wm_client;
 
+use activity::{ActivityMonitor, ActivitySnapshot, ProcessHandleRef};
 use agent_client::AgentClient;
 use anyhow::{Context, Result};
+use apps::{ActivityAlert, AppRegistry};
 use board_client::{BoardClient, BoardSnapshot};
+use eval_client::EvalClient;
+use shell::{ShellBuiltin, ShellExecResponse, ShellState};
 use fidl::endpoints::{Proxy, create_proxy};
 use fidl_fuchsia_input as finput;
 use fidl_fuchsia_io as fio;
@@ -257,7 +266,56 @@ enum ShellMsg {
     DevKeyChar(char),
     DevKeyBackspace,
     DevKeyEnter,
+    KeyUp,
+    KeyDown,
     SasCycleHost,
+    GetActivity {
+        reply: oneshot::Sender<ActivitySnapshot>,
+    },
+    ActivityTick,
+    ActivityRestart {
+        name: String,
+        reply: Option<oneshot::Sender<Result<serde_json::Value>>>,
+    },
+    ShellGet {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    ShellExec {
+        cmd: String,
+        reply: Option<oneshot::Sender<ShellExecResponse>>,
+    },
+    GetOsTree {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    HirselEval {
+        source: String,
+        check_only: bool,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    AppsList {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    AppGet {
+        name: String,
+        reply: oneshot::Sender<Option<serde_json::Value>>,
+    },
+    AppUpdate {
+        name: String,
+        source: String,
+        note: String,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    AppRollback {
+        name: String,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    AppRun {
+        name: String,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    SetFigmentsUiTree {
+        tree: serde_json::Value,
+    },
     ChildViewRef {
         domain: &'static str,
         view_ref: fviews::ViewRef,
@@ -300,17 +358,30 @@ struct HirselShell {
     top_bar_surface: painter::CpuSurface,
     top_bar_attached: bool,
 
-    // Split vm-dev surface + border + live AMD-SVM Linux 6.1.102 MicroVM (VT100 cell grid)
+    // Split System Shell (`hirsel-sh` + optional Linux 6.1.102 AMD-SVM MicroVM)
     dev_border_transform: fland::TransformId,
     dev_border_content: fland::ContentId,
     dev_transform: fland::TransformId,
     dev_surface: Option<painter::CpuSurface>,
     dev_attached: bool,
     dev_vt: vt100::Vt100Screen,
-    dev_input: String,
+    shell_state: ShellState,
     vm_client: Option<Arc<VmClient>>,
     extra_vms: HashMap<String, Arc<VmClient>>,
     vm_ready: bool,
+
+    // Compositor-owned Activity Manager split pane (real Zircon telemetry + live Hirsel view)
+    activity_border_transform: fland::TransformId,
+    activity_border_content: fland::ContentId,
+    activity_transform: fland::TransformId,
+    activity_surface: Option<painter::CpuSurface>,
+    activity_attached: bool,
+    activity: ActivityMonitor,
+
+    // OS-resident Hirsel compiler/evaluator + Unified Live App Internals Registry
+    eval_client: Option<EvalClient>,
+    app_registry: AppRegistry,
+    figments_ui_tree: serde_json::Value,
 
     // Compositor-owned unforgeable Origin/URL Bar above Web #2
     web_bar_transform: fland::TransformId,
@@ -510,7 +581,7 @@ impl HirselShell {
             }
         }
 
-        // 2. Spawn pure-Hirsel Figments js@1 sandbox Place (zero ambient handles!)
+        // 2. Spawn pure-Hirsel Figments js@1 sandbox Place + OS-resident Hirsel compiler/evaluator (hirsel-eval)
         let js_client = match JsSandboxClient::spawn().await {
             Ok(j) => {
                 if let Ok(mut g) = diag.lock() {
@@ -525,6 +596,29 @@ impl HirselShell {
                 }
                 None
             }
+        };
+
+        let eval_client = if std::path::Path::new("/pkg/bin/hirsel-eval").exists() {
+            match EvalClient::spawn().await {
+                Ok(ev) => {
+                    if let Ok(mut g) = diag.lock() {
+                        g.push(format!("hirsel-eval (OS Hirsel compiler/runtime) spawned OK: {}", ev.banner));
+                    }
+                    Some(ev)
+                }
+                Err(e) => {
+                    warn!("hirsel-eval unavailable: {e:#}");
+                    if let Ok(mut g) = diag.lock() {
+                        g.push(format!("hirsel-eval unavailable: {e:#}"));
+                    }
+                    None
+                }
+            }
+        } else {
+            if let Ok(mut g) = diag.lock() {
+                g.push("hirsel-eval binary not bundled".to_string());
+            }
+            None
         };
 
         // 3. Spawn real Tier-2 Linux 6.1.102 AMD-SVM MicroVM host in background!
@@ -757,6 +851,32 @@ impl HirselShell {
         let dev_transform = id_gen.next_transform_id();
         flatland.create_transform(&dev_transform)?;
 
+        // Activity Manager split pane transforms (attached lazily when show_activity=true)
+        let activity_border_transform = id_gen.next_transform_id();
+        let activity_border_content = id_gen.next_content_id();
+        flatland.create_transform(&activity_border_transform)?;
+        flatland.create_filled_rect(&activity_border_content)?;
+        flatland.set_content(&activity_border_transform, &activity_border_content)?;
+
+        let activity_transform = id_gen.next_transform_id();
+        flatland.create_transform(&activity_transform)?;
+
+        let activity = ActivityMonitor::new();
+        let shell_state = ShellState::load();
+        let app_registry = AppRegistry::load();
+
+        // Background 1.5s refresh tick (only refreshes/repaints when Activity Manager pane is visible!)
+        let tick_tx = tx.clone();
+        fasync::Task::local(async move {
+            loop {
+                fasync::Timer::new(std::time::Duration::from_millis(1500)).await;
+                if tick_tx.unbounded_send(ShellMsg::ActivityTick).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let web_bar_transform = id_gen.next_transform_id();
         flatland.create_transform(&web_bar_transform)?;
 
@@ -810,10 +930,19 @@ impl HirselShell {
             dev_surface: None,
             dev_attached: false,
             dev_vt,
-            dev_input: String::new(),
+            shell_state,
             vm_client,
             extra_vms: HashMap::new(),
             vm_ready: false,
+            activity_border_transform,
+            activity_border_content,
+            activity_transform,
+            activity_surface: None,
+            activity_attached: false,
+            activity,
+            eval_client,
+            app_registry,
+            figments_ui_tree: serde_json::json!({}),
             web_bar_transform,
             web_bar_surface: None,
             web_bar_attached: false,
@@ -855,6 +984,14 @@ impl HirselShell {
             error!("Failed to launch Figments Chromium context: {e:?}");
         }
 
+        // Prime real Zircon Activity telemetry + run live-editable Hirsel apps once at boot!
+        let _ = shell.collect_activity().await;
+        if shell.eval_client.is_some() {
+            let _ = shell.run_live_app("shell").await;
+            let _ = shell.run_live_app("activity").await;
+            let _ = shell.run_live_app("applet_monitor").await;
+        }
+
         // First scene commit will flush as soon as OnNextFrameBegin delivers credits (immediately after initial present)
         Ok(shell)
     }
@@ -893,6 +1030,7 @@ impl HirselShell {
                 continue;
             }
             self.dev_vt.push_line(trimmed);
+            self.shell_state.push_output(trimmed);
         }
     }
 
@@ -1106,6 +1244,11 @@ impl HirselShell {
             let _ = self.flatland.remove_child(&self.ui_root_transform, &self.dev_transform);
             self.dev_attached = false;
         }
+        if self.activity_attached {
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.activity_border_transform);
+            let _ = self.flatland.remove_child(&self.ui_root_transform, &self.activity_transform);
+            self.activity_attached = false;
+        }
         if let Some(ref mut web) = self.untrusted_web {
             if web.attached {
                 let _ = self.flatland.remove_child(&self.ui_root_transform, &web.border_transform);
@@ -1147,7 +1290,7 @@ impl HirselShell {
             fig.attached = true;
         }
 
-        // Layer 2: vm-dev split console backed by REAL Linux 6.1.102 AMD-SVM MicroVM
+        // Layer 2: Structured System Shell (`hirsel-sh` + optional x64 Linux 6.1.102 AMD-SVM MicroVM)
         if let Some(ref r) = plan.layout.vm_dev {
             let rw = r.w.max(64) as u32;
             let rh = r.h.max(64) as u32;
@@ -1159,7 +1302,7 @@ impl HirselShell {
             if need_alloc {
                 let cid = self.id_gen.next_content_id();
                 let surf = painter::CpuSurface::new(
-                    "hirsel-vm-dev",
+                    "hirsel-shell-pane",
                     rw,
                     rh,
                     &self.flatland,
@@ -1175,7 +1318,7 @@ impl HirselShell {
             self.dev_vt.resize(cols, rows);
             if let Some(ref surf) = self.dev_surface {
                 surf.paint_with(|c| {
-                    painter::paint_dev_pane(c, &plan, &theme, &self.dev_vt, &self.dev_input, self.vm_ready)
+                    painter::paint_shell_pane(c, &plan, &theme, &self.shell_state, self.vm_ready)
                 });
             }
             let col = if plan.focused == "vm_dev" {
@@ -1194,6 +1337,58 @@ impl HirselShell {
             self.flatland.add_child(&self.ui_root_transform, &self.dev_border_transform)?;
             self.flatland.add_child(&self.ui_root_transform, &self.dev_transform)?;
             self.dev_attached = true;
+        }
+
+        // Layer 2b: Activity Manager split pane (real Zircon kernel & process telemetry + live Hirsel view)
+        if let Some(ref r) = plan.layout.activity {
+            let rw = r.w.max(64) as u32;
+            let rh = r.h.max(64) as u32;
+            let need_alloc = self
+                .activity_surface
+                .as_ref()
+                .map(|s| s.width != rw || s.height != rh)
+                .unwrap_or(true);
+            if need_alloc {
+                let cid = self.id_gen.next_content_id();
+                let surf = painter::CpuSurface::new(
+                    "hirsel-activity",
+                    rw,
+                    rh,
+                    &self.flatland,
+                    cid,
+                    fland::BlendMode::Src,
+                )
+                .await?;
+                self.flatland.set_content(&self.activity_transform, &surf.content_id)?;
+                self.activity_surface = Some(surf);
+            }
+            if let Some(ref surf) = self.activity_surface {
+                surf.paint_with(|c| {
+                    painter::paint_activity_pane(
+                        c,
+                        &plan,
+                        &theme,
+                        &self.activity.latest,
+                        &self.app_registry.activity_view,
+                    )
+                });
+            }
+            let col = if plan.focused == "activity" {
+                painter::rgba_to_f(pal.cobalt)
+            } else {
+                painter::rgba_to_f(pal.line_strong)
+            };
+            Self::place_border_and_inner(
+                &self.flatland,
+                &self.activity_border_transform,
+                &self.activity_border_content,
+                &self.activity_transform,
+                r,
+                col,
+            )?;
+            self.flatland.add_child(&self.ui_root_transform, &self.activity_border_transform)?;
+            self.flatland.add_child(&self.ui_root_transform, &self.activity_transform)?;
+            self.activity_attached = true;
         }
 
         // Layer 3: Isolated Untrusted Chromium Viewport #2 + 28px Compositor-Owned Origin Bar (Ochre accent)
@@ -1322,7 +1517,7 @@ impl HirselShell {
 
     fn apply_focus(&self, plan: &ScenePlan) {
         let target_ref: Option<&fviews::ViewRef> = match plan.focused.as_str() {
-            "trusted_chrome" | "vm_dev" => Some(&self.root_view_ref),
+            "trusted_chrome" | "vm_dev" | "activity" => Some(&self.root_view_ref),
             "figments" => self
                 .figments_web
                 .as_ref()
@@ -1360,6 +1555,941 @@ impl HirselShell {
             let _ = self.apply_scene().await;
         }
         Ok(res)
+    }
+
+    async fn collect_activity(&mut self) -> ActivitySnapshot {
+        let self_proc = fuchsia_runtime::process_self();
+        let mut refs: Vec<ProcessHandleRef<'_>> = vec![
+            ProcessHandleRef {
+                name: "hirsel_shell",
+                role: "Flatland Compositor & Session Host",
+                tier: "host",
+                restartable: false,
+                process: &self_proc,
+            },
+            ProcessHandleRef {
+                name: "hirsel-wm",
+                role: "Pure-Hirsel Window Manager & Policy",
+                tier: "place",
+                restartable: false,
+                process: self.wm.process(),
+            },
+            ProcessHandleRef {
+                name: "hirsel-board",
+                role: "Pure-Hirsel Spatial Board State",
+                tier: "place",
+                restartable: true,
+                process: self.board.process(),
+            },
+        ];
+        if let Some(ref a) = self.agent {
+            refs.push(ProcessHandleRef {
+                name: "hirsel-agent",
+                role: "Pure-Hirsel Autonomous Agent",
+                tier: "place",
+                restartable: true,
+                process: a.process(),
+            });
+        }
+        if let Some(ref j) = self.js_client {
+            refs.push(ProcessHandleRef {
+                name: "hirsel-js",
+                role: "Pure-Hirsel js@1 Sandbox",
+                tier: "place",
+                restartable: true,
+                process: j.process(),
+            });
+        }
+        if let Some(ref ev) = self.eval_client {
+            refs.push(ProcessHandleRef {
+                name: "hirsel-eval",
+                role: "OS Hirsel Compiler & Evaluator",
+                tier: "runtime",
+                restartable: true,
+                process: ev.process(),
+            });
+        }
+        if let Some(ref vm) = self.vm_client {
+            refs.push(ProcessHandleRef {
+                name: "hirsel-vm-host",
+                role: "Tier-2 Linux 6.1.102 MicroVM",
+                tier: "microvm",
+                restartable: false,
+                process: vm.process(),
+            });
+        }
+        let extra_names: Vec<String> = self.extra_vms.keys().cloned().collect();
+        for n in &extra_names {
+            if let Some(v) = self.extra_vms.get(n) {
+                refs.push(ProcessHandleRef {
+                    name: n.as_str(),
+                    role: "Extra Linux MicroVM",
+                    tier: "microvm",
+                    restartable: false,
+                    process: v.process(),
+                });
+            }
+        }
+        let egress_ok = egress_health(&self.egress).await.is_ok();
+        let fig_up = self.figments_web.is_some();
+        let web_up = self.untrusted_web.is_some();
+        self.activity.refresh(&refs, egress_ok, fig_up, web_up).await
+    }
+
+    async fn restart_place(&mut self, name: &str) -> Result<serde_json::Value> {
+        let new_koid = match name {
+            "hirsel-board" => {
+                let fresh = BoardClient::spawn().await?;
+                let k = fresh.process().koid().map(|x| x.raw_koid()).unwrap_or(0);
+                self.board = fresh;
+                k
+            }
+            "hirsel-agent" => {
+                let fresh = AgentClient::spawn().await?;
+                let k = fresh.process().koid().map(|x| x.raw_koid()).unwrap_or(0);
+                self.agent = Some(fresh);
+                k
+            }
+            "hirsel-js" => {
+                let fresh = JsSandboxClient::spawn().await?;
+                let k = fresh.process().koid().map(|x| x.raw_koid()).unwrap_or(0);
+                self.js_client = Some(fresh);
+                k
+            }
+            "hirsel-eval" => {
+                let fresh = EvalClient::spawn().await?;
+                let k = fresh.process().koid().map(|x| x.raw_koid()).unwrap_or(0);
+                self.eval_client = Some(fresh);
+                k
+            }
+            "hirsel_shell" | "hirsel-wm" => {
+                return Err(anyhow::anyhow!(
+                    "`{name}` is a critical trusted compositor/WM process and cannot be killed from Activity Manager"
+                ));
+            }
+            other => {
+                return Err(anyhow::anyhow!("`{other}` is not a restartable Place"));
+            }
+        };
+        self.audit_log.push(format!("activity RESTART {name} -> koid={new_koid}"));
+        self.persist_state();
+        let snap = self.collect_activity().await;
+        if self.activity_attached {
+            let _ = self.apply_scene().await;
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "restarted": name,
+            "new_koid": new_koid,
+            "processes": snap.processes.len(),
+        }))
+    }
+
+    fn settings_public_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "wifi_enabled": self.settings.wifi_enabled,
+            "wifi_ssid": self.settings.wifi_ssid,
+            "wifi_security": self.settings.wifi_security,
+            "wifi_saved": self.settings.wifi_saved,
+            "net_mode": self.settings.net_mode,
+            "dns_primary": self.settings.dns_primary,
+            "dns_secondary": self.settings.dns_secondary,
+            "ui_scale_pct": self.settings.ui_scale_pct,
+            "phys_w": self.phys_w,
+            "phys_h": self.phys_h,
+        })
+    }
+
+    fn build_tree_and_stdin(&self) -> (serde_json::Value, String) {
+        let inp = script::TreeInputs {
+            plan: &self.wm.latest,
+            phys_w: self.phys_w,
+            phys_h: self.phys_h,
+            ui_scale_pct: self.settings.ui_scale_pct,
+            active_theme: &self.active_theme,
+            activity: &self.activity.latest,
+            shell: &self.shell_state,
+            board: &self.board.latest,
+            app_registry: &self.app_registry,
+            ink_count: self.ink_strokes.len(),
+            audit_log: &self.audit_log,
+            figments_ui: &self.figments_ui_tree,
+            vm_ready: self.vm_ready,
+            untrusted_origin: &self.untrusted_origin,
+            powerbox_toast: &self.powerbox_toast,
+            settings_json: self.settings_public_json(),
+        };
+        let tree = script::build_os_tree(&inp);
+        let stdin = script::encode_hirsel_stdin(&inp, &tree);
+        (tree, stdin)
+    }
+
+    async fn apply_ui_scale(&mut self, pct: u32) {
+        let clamped = pct.clamp(100, 200);
+        if clamped != self.settings.ui_scale_pct {
+            self.settings.ui_scale_pct = clamped;
+            self.settings.phys_w = self.phys_w;
+            self.settings.phys_h = self.phys_h;
+            self.persist_settings();
+            let scale = (self.settings.ui_scale_pct as f32) / 100.0;
+            let lw = ((self.phys_w as f32) / scale).round().max(480.0) as u32;
+            let lh = ((self.phys_h as f32) / scale).round().max(360.0) as u32;
+            let _ = self.flatland.set_scale(&self.ui_root_transform, &fmath::VecF { x: scale, y: scale });
+            if self.wm.send(&format!("RESIZE {lw} {lh}")).await.is_ok() {
+                let _ = self.apply_scene().await;
+            }
+        }
+    }
+
+    async fn apply_theme_room(&mut self, theme: &str) -> bool {
+        let valid = matches!(
+            theme,
+            "darkroom" | "paper" | "folio" | "gallery" | "blueprint" | "conservatory"
+        );
+        if !valid {
+            return false;
+        }
+        self.active_theme = theme.to_string();
+        let want_daylight = matches!(theme, "paper" | "folio" | "gallery");
+        if (want_daylight && self.wm.latest.room != "daylight")
+            || (!want_daylight && self.wm.latest.room == "daylight")
+        {
+            let _ = self.wm.send("TOGGLE_ROOM").await;
+        }
+        self.persist_state();
+        let _ = self.apply_scene().await;
+        true
+    }
+
+    async fn apply_wm_open_close(&mut self, app: &str, mode: &str) -> serde_json::Value {
+        let norm = app.trim().to_ascii_lowercase();
+        let (toggle_cmd, is_open, domain) = match norm.as_str() {
+            "shell" | "vm_dev" | "vm-dev" | "terminal" => {
+                ("TOGGLE_DEV", self.wm.latest.layout.vm_dev.is_some(), "vm_dev")
+            }
+            "activity" | "tasks" | "monitor" => {
+                ("TOGGLE_ACTIVITY", self.wm.latest.layout.activity.is_some(), "activity")
+            }
+            "web" | "web_untrusted" | "browser" => {
+                ("TOGGLE_WEB", self.wm.latest.layout.web.is_some(), "web_untrusted")
+            }
+            "figments" | "canvas" => {
+                let _ = self.wm.send("FOCUS figments").await;
+                let _ = self.apply_scene().await;
+                return serde_json::json!({ "ok": true, "app": "figments", "focused": self.wm.latest.focused });
+            }
+            "settings" => {
+                self.settings.settings_open_seq = self.settings.settings_open_seq.wrapping_add(1);
+                return serde_json::json!({ "ok": true, "app": "settings", "settings_open_seq": self.settings.settings_open_seq });
+            }
+            other => {
+                return serde_json::json!({ "ok": false, "error": format!("unknown app `{other}`") });
+            }
+        };
+
+        let should_toggle = match mode {
+            "open" => !is_open,
+            "close" => is_open,
+            "toggle" => true,
+            _ => false,
+        };
+        if should_toggle {
+            let _ = self.wm.send(toggle_cmd).await;
+            if domain == "activity" && self.wm.latest.layout.activity.is_some() {
+                let _ = self.collect_activity().await;
+            }
+        }
+        if mode == "open" || mode == "focus" {
+            let _ = self.wm.send(&format!("FOCUS {domain}")).await;
+        }
+        let _ = self.apply_scene().await;
+        serde_json::json!({
+            "ok": true,
+            "app": norm,
+            "mode": mode,
+            "focused": self.wm.latest.focused,
+        })
+    }
+
+    async fn apply_hirsel_ops(
+        &mut self,
+        ops: &[serde_json::Value],
+        source_app: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let locked = !self.wm.latest.capture_allowed;
+        let mut results = Vec::new();
+        let mut scene_needed = false;
+        let mut mutated = false;
+
+        for op_val in ops {
+            let op = op_val["op"].as_str().unwrap_or("");
+            if locked && !matches!(op, "emit_banner" | "emit_alert") {
+                results.push(serde_json::json!({
+                    "op": op,
+                    "ok": false,
+                    "error": "blocked during F6 SAS / Ceremony lockdown",
+                }));
+                continue;
+            }
+            match op {
+                "emit_banner" => {
+                    let text = op_val["text"].as_str().unwrap_or("").to_string();
+                    self.app_registry.activity_view.banner = text.clone();
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": true, "banner": text }));
+                }
+                "emit_alert" => {
+                    let alert = ActivityAlert {
+                        level: op_val["level"].as_str().unwrap_or("info").to_string(),
+                        target: op_val["target"].as_str().unwrap_or("").to_string(),
+                        message: op_val["message"].as_str().unwrap_or("").to_string(),
+                    };
+                    self.app_registry.activity_view.alerts.push(alert.clone());
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": true, "alert": alert }));
+                }
+                "emit_card_view" => {
+                    let card_id = format!("live-{}", source_app.unwrap_or("applet"));
+                    let title = op_val["title"].as_str().unwrap_or("Live Hirsel Applet");
+                    let body = op_val["body"].as_str().unwrap_or("");
+                    let tone = op_val["tone"].as_str().unwrap_or("sap");
+                    let res = self.board.put_card(&card_id, "applet", tone, 24, 420, 268, 98, title, body).await;
+                    results.push(serde_json::json!({ "op": op, "ok": res.is_ok(), "card_id": card_id }));
+                }
+                "wm_open" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("");
+                    results.push(self.apply_wm_open_close(app, "open").await);
+                }
+                "wm_close" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("");
+                    results.push(self.apply_wm_open_close(app, "close").await);
+                }
+                "wm_toggle" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("");
+                    results.push(self.apply_wm_open_close(app, "toggle").await);
+                }
+                "wm_focus" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("");
+                    results.push(self.apply_wm_open_close(app, "focus").await);
+                }
+                "click" => {
+                    mutated = true;
+                    let label = op_val["label"].as_str().unwrap_or("").to_ascii_lowercase();
+                    let pills = script::top_bar_left_pills();
+                    if let Some(p) = pills.iter().find(|p| p.label.to_ascii_lowercase().contains(&label) || p.id.contains(&label)) {
+                        let _ = self.wm.send(p.action).await;
+                        if p.id == "pill-activity" && self.wm.latest.layout.activity.is_some() {
+                            let _ = self.collect_activity().await;
+                        }
+                        scene_needed = true;
+                        results.push(serde_json::json!({ "op": op, "ok": true, "clicked": p.label }));
+                    } else if label.contains("setting") || label == "sys" {
+                        self.settings.settings_open_seq = self.settings.settings_open_seq.wrapping_add(1);
+                        results.push(serde_json::json!({ "op": op, "ok": true, "clicked": "Settings" }));
+                    } else {
+                        results.push(serde_json::json!({ "op": op, "ok": false, "error": format!("no element matching `{label}`") }));
+                    }
+                }
+                "activity_sort" => {
+                    mutated = true;
+                    let by = op_val["by"].as_str().unwrap_or("rss");
+                    let ok = self.activity.set_sort(by);
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": ok, "sort_by": self.activity.sort_by }));
+                }
+                "activity_restart" => {
+                    mutated = true;
+                    let place = op_val["place"].as_str().unwrap_or("");
+                    match self.restart_place(place).await {
+                        Ok(v) => results.push(v),
+                        Err(e) => results.push(serde_json::json!({ "op": op, "ok": false, "error": format!("{e:#}") })),
+                    }
+                }
+                "shell_def" => {
+                    let name = op_val["name"].as_str().unwrap_or("").trim().to_string();
+                    let body = op_val["body"].as_str().unwrap_or("").trim().to_string();
+                    if !name.is_empty() && !body.is_empty() {
+                        self.shell_state.defs.insert(name.clone(), body);
+                        self.shell_state.persist();
+                        scene_needed = true;
+                        results.push(serde_json::json!({ "op": op, "ok": true, "name": name }));
+                    } else {
+                        results.push(serde_json::json!({ "op": op, "ok": false, "error": "empty def" }));
+                    }
+                }
+                "shell_undef" => {
+                    let name = op_val["name"].as_str().unwrap_or("").trim();
+                    let removed = self.shell_state.defs.remove(name).is_some();
+                    self.shell_state.persist();
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": removed, "name": name }));
+                }
+                "shell_clear" => {
+                    self.shell_state.clear_output();
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": true }));
+                }
+                "shell_run" => {
+                    mutated = true;
+                    let cmd = op_val["cmd"].as_str().unwrap_or("").to_string();
+                    let r = Box::pin(self.exec_shell_cmd(&cmd)).await;
+                    results.push(serde_json::json!({ "op": op, "ok": r.ok, "value": r.value, "table": r.table }));
+                }
+                "add_card" => {
+                    mutated = true;
+                    let title = op_val["title"].as_str().unwrap_or("Hirsel Card");
+                    let body = op_val["body"].as_str().unwrap_or("");
+                    let tone = op_val["tone"].as_str().unwrap_or("cobalt");
+                    let id = format!("hirsel-{}", self.board.latest.cards.len() + 1);
+                    let res = self.board.put_card(&id, "note", tone, 304, 420, 248, 98, title, body).await;
+                    results.push(serde_json::json!({ "op": op, "ok": res.is_ok(), "id": id }));
+                }
+                "delete_card" => {
+                    mutated = true;
+                    let id = op_val["id"].as_str().unwrap_or("");
+                    let res = self.board.delete_card(id).await;
+                    results.push(serde_json::json!({ "op": op, "ok": res.is_ok(), "id": id }));
+                }
+                "set_zoom" => {
+                    mutated = true;
+                    let pct = op_val["pct"].as_u64().unwrap_or(100).clamp(50, 200);
+                    let cx = self.board.latest.camera.cx;
+                    let cy = self.board.latest.camera.cy;
+                    let res = self.board.set_camera(cx, cy, pct).await;
+                    results.push(serde_json::json!({ "op": op, "ok": res.is_ok(), "zoom_pct": pct }));
+                }
+                "set_scale" => {
+                    mutated = true;
+                    let pct = op_val["pct"].as_u64().unwrap_or(125) as u32;
+                    self.apply_ui_scale(pct).await;
+                    results.push(serde_json::json!({ "op": op, "ok": true, "ui_scale_pct": self.settings.ui_scale_pct }));
+                }
+                "set_theme" => {
+                    mutated = true;
+                    let theme = op_val["theme"].as_str().unwrap_or("darkroom");
+                    let ok = self.apply_theme_room(theme).await;
+                    results.push(serde_json::json!({ "op": op, "ok": ok, "theme": self.active_theme }));
+                }
+                "web_navigate" => {
+                    mutated = true;
+                    let url = op_val["url"].as_str().unwrap_or("http://127.0.0.1:7712/untrusted").to_string();
+                    let new_origin = extract_origin(&url);
+                    let origin_changed = new_origin != self.untrusted_origin || self.untrusted_web.is_none();
+                    if self.wm.latest.layout.web.is_none() {
+                        let _ = self.wm.send("TOGGLE_WEB").await;
+                    }
+                    if origin_changed {
+                        if let Some(ref mut old_web) = self.untrusted_web.take() {
+                            if old_web.attached {
+                                let _ = self.flatland.remove_child(&self.ui_root_transform, &old_web.border_transform);
+                                let _ = self.flatland.remove_child(&self.ui_root_transform, &old_web.viewport_transform);
+                            }
+                        }
+                        self.untrusted_origin = new_origin.clone();
+                        let _ = self.launch_web_context("web_untrusted", &url).await;
+                    } else if let Some(ref web) = self.untrusted_web {
+                        let _ = web._nav.load_url(&url, fweb::LoadUrlParams::default()).await;
+                    }
+                    scene_needed = true;
+                    results.push(serde_json::json!({ "op": op, "ok": true, "origin": new_origin }));
+                }
+                "app_update" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("").to_string();
+                    let src = op_val["source"].as_str().unwrap_or("").to_string();
+                    let r = Box::pin(self.update_live_app(&app, src, "from hirsel script")).await;
+                    results.push(r);
+                }
+                "app_rollback" => {
+                    mutated = true;
+                    let app = op_val["app"].as_str().unwrap_or("").to_string();
+                    let r = Box::pin(self.rollback_live_app(&app)).await;
+                    results.push(r);
+                }
+                "app_run" => {
+                    let app = op_val["app"].as_str().unwrap_or("").to_string();
+                    let r = Box::pin(self.run_live_app(&app)).await;
+                    results.push(r);
+                }
+                other => {
+                    results.push(serde_json::json!({ "op": other, "ok": false, "error": "unknown os@1 op" }));
+                }
+            }
+        }
+
+        if mutated {
+            let names: Vec<&str> = ops.iter().filter_map(|v| v["op"].as_str()).collect();
+            self.audit_log.push(format!("hirsel-eval ops: {}", names.join(", ")));
+            self.persist_state();
+        }
+        if scene_needed {
+            let _ = self.apply_scene().await;
+        }
+        results
+    }
+
+    async fn run_hirsel(
+        &mut self,
+        source: &str,
+        check_only: bool,
+        source_app: Option<&str>,
+    ) -> serde_json::Value {
+        let _ = self.collect_activity().await;
+        let (_tree, stdin) = self.build_tree_and_stdin();
+        let Some(ref mut ev) = self.eval_client else {
+            return serde_json::json!({
+                "ok": false,
+                "diagnostics": ["hirsel-eval runtime is not running"],
+            });
+        };
+        let eval_res = if check_only {
+            ev.check(source).await
+        } else {
+            ev.eval(source, &stdin, 16 * 1024 * 1024).await
+        };
+        match eval_res {
+            Ok(res) => {
+                let op_results = if res.ok && !check_only && !res.ops.is_empty() {
+                    self.apply_hirsel_ops(&res.ops, source_app).await
+                } else {
+                    Vec::new()
+                };
+                serde_json::json!({
+                    "ok": res.ok,
+                    "diagnostics": res.diagnostics,
+                    "logs": res.logs,
+                    "ops_emitted": res.ops.len(),
+                    "op_results": op_results,
+                    "used_bytes": res.used_bytes,
+                    "compile_ms": res.compile_ms,
+                    "run_ms": res.run_ms,
+                })
+            }
+            Err(e) => serde_json::json!({
+                "ok": false,
+                "diagnostics": [format!("hirsel-eval IPC error: {e:#}")],
+            }),
+        }
+    }
+
+    async fn run_live_app(&mut self, name: &str) -> serde_json::Value {
+        let Some(rec) = self.app_registry.get(name).cloned() else {
+            return serde_json::json!({ "ok": false, "error": format!("app `{name}` not found") });
+        };
+        if !rec.editable {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("`{name}` is a compiled system module (read-only source inspection)")
+            });
+        }
+        if name == "activity" {
+            self.app_registry.activity_view.alerts.clear();
+        }
+        let res = self.run_hirsel(&rec.source, false, Some(name)).await;
+        let ok = res["ok"].as_bool().unwrap_or(false);
+        if name == "activity" && ok {
+            self.app_registry.activity_view.last_compile_ms = res["compile_ms"].as_u64().unwrap_or(0);
+            self.app_registry.activity_view.last_run_ms = res["run_ms"].as_u64().unwrap_or(0);
+        }
+        if let Some(entry) = self.app_registry.apps.get_mut(name) {
+            entry.last_logs = res["logs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            entry.last_error = if ok {
+                None
+            } else {
+                Some(
+                    res["diagnostics"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; "))
+                        .unwrap_or_else(|| "eval failed".to_string()),
+                )
+            };
+        }
+        if self.activity_attached && name == "activity" {
+            let _ = self.apply_scene().await;
+        }
+        res
+    }
+
+    async fn update_live_app(&mut self, name: &str, new_source: String, note: &str) -> serde_json::Value {
+        if !self.wm.latest.capture_allowed {
+            return serde_json::json!({
+                "ok": false,
+                "error": "live code updates are blocked during F6 SAS / Ceremony lockdown",
+            });
+        }
+        if !self.app_registry.is_editable(name) {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("`{name}` is a protected verified system module (read-only)"),
+            });
+        }
+        // Step 1: Transactional type-check & ownership-check BEFORE touching the running app!
+        let chk = self.run_hirsel(&new_source, true, Some(name)).await;
+        if chk["ok"].as_bool() != Some(true) {
+            return serde_json::json!({
+                "ok": false,
+                "stage": "typecheck",
+                "diagnostics": chk["diagnostics"],
+                "compile_ms": chk["compile_ms"],
+                "note": "Running app was NOT modified because Hirsel type-checking refused the edit.",
+            });
+        }
+        // Step 2: Persist new Fxfs revision and swap live source
+        match self.app_registry.commit_update(name, new_source, note) {
+            Ok(rec) => {
+                self.audit_log.push(format!("app HOT-SWAP {name} -> rev {} ({note})", rec.rev));
+                self.persist_state();
+                let run_res = self.run_live_app(name).await;
+                serde_json::json!({
+                    "ok": true,
+                    "name": rec.name,
+                    "rev": rec.rev,
+                    "revisions": rec.revisions.len(),
+                    "run": run_res,
+                })
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+        }
+    }
+
+    async fn rollback_live_app(&mut self, name: &str) -> serde_json::Value {
+        if !self.wm.latest.capture_allowed {
+            return serde_json::json!({ "ok": false, "error": "blocked during SAS lockdown" });
+        }
+        match self.app_registry.rollback(name) {
+            Ok(rec) => {
+                self.audit_log.push(format!("app ROLLBACK {name} -> rev {}", rec.rev));
+                self.persist_state();
+                let run_res = self.run_live_app(name).await;
+                serde_json::json!({
+                    "ok": true,
+                    "name": rec.name,
+                    "rev": rec.rev,
+                    "run": run_res,
+                })
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+        }
+    }
+
+    async fn exec_shell_cmd(&mut self, raw: &str) -> ShellExecResponse {
+        let trimmed = raw.trim();
+        self.shell_state.record_history(trimmed);
+        self.shell_state.push_output(&format!("› {trimmed}"));
+
+        let parsed = shell::parse_line(trimmed, &self.shell_state.defs);
+        let mut ok = true;
+        let base_val: serde_json::Value = match parsed.builtin {
+            ShellBuiltin::Help => shell::help_value(),
+            ShellBuiltin::Clear => {
+                self.shell_state.clear_output();
+                serde_json::json!({ "cleared": true })
+            }
+            ShellBuiltin::Defs => {
+                let rows: Vec<serde_json::Value> = self
+                    .shell_state
+                    .defs
+                    .iter()
+                    .map(|(k, v)| serde_json::json!({ "name": k, "body": v }))
+                    .collect();
+                serde_json::Value::Array(rows)
+            }
+            ShellBuiltin::Def { name, body } => {
+                if name.is_empty() || body.is_empty() {
+                    ok = false;
+                    serde_json::json!({ "error": "usage: def <name> = <pipeline>" })
+                } else {
+                    self.shell_state.defs.insert(name.clone(), body.clone());
+                    self.shell_state.persist();
+                    serde_json::json!({ "defined": name, "body": body, "persisted": "/data/shell.json" })
+                }
+            }
+            ShellBuiltin::Undef { name } => {
+                let existed = self.shell_state.defs.remove(&name).is_some();
+                self.shell_state.persist();
+                serde_json::json!({ "removed": name, "existed": existed })
+            }
+            ShellBuiltin::History => {
+                let rows: Vec<serde_json::Value> = self
+                    .shell_state
+                    .history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| serde_json::json!({ "idx": i + 1, "cmd": c }))
+                    .collect();
+                serde_json::Value::Array(rows)
+            }
+            ShellBuiltin::Ps => {
+                let snap = self.collect_activity().await;
+                serde_json::to_value(&snap.processes).unwrap_or_default()
+            }
+            ShellBuiltin::Mem => {
+                let snap = self.collect_activity().await;
+                serde_json::to_value(&snap.memory).unwrap_or_default()
+            }
+            ShellBuiltin::Cpu => {
+                let snap = self.collect_activity().await;
+                serde_json::to_value(&snap.cpus).unwrap_or_default()
+            }
+            ShellBuiltin::FsLs { path } => match shell::sanitize_fs_path(&path, false) {
+                Ok(safe) => match std::fs::read_dir(&safe) {
+                    Ok(rd) => {
+                        let mut rows = Vec::new();
+                        for ent in rd.flatten() {
+                            let name = ent.file_name().to_string_lossy().to_string();
+                            let meta = ent.metadata().ok();
+                            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                            let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                            rows.push(serde_json::json!({
+                                "name": name,
+                                "kind": if is_dir { "dir" } else { "file" },
+                                "bytes": bytes,
+                            }));
+                        }
+                        rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                        serde_json::Value::Array(rows)
+                    }
+                    Err(e) => {
+                        ok = false;
+                        serde_json::json!({ "error": format!("ls {safe}: {e}") })
+                    }
+                },
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": e })
+                }
+            },
+            ShellBuiltin::FsCat { path } => match shell::sanitize_fs_path(&path, false) {
+                Ok(safe) => match std::fs::read_to_string(&safe) {
+                    Ok(txt) => serde_json::Value::String(txt),
+                    Err(e) => {
+                        ok = false;
+                        serde_json::json!({ "error": format!("cat {safe}: {e}") })
+                    }
+                },
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": e })
+                }
+            },
+            ShellBuiltin::FsWrite { path, content } => match shell::sanitize_fs_path(&path, true) {
+                Ok(safe) => {
+                    use std::io::Write as _;
+                    match std::fs::File::create(&safe).and_then(|mut f| {
+                        f.write_all(content.as_bytes())?;
+                        f.sync_all()
+                    }) {
+                        Ok(()) => serde_json::json!({ "wrote": safe, "bytes": content.len() }),
+                        Err(e) => {
+                            ok = false;
+                            serde_json::json!({ "error": format!("write {safe}: {e}") })
+                        }
+                    }
+                }
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": e })
+                }
+            },
+            ShellBuiltin::FsRm { path } => match shell::sanitize_fs_path(&path, true) {
+                Ok(safe) => match std::fs::remove_file(&safe) {
+                    Ok(()) => serde_json::json!({ "removed": safe }),
+                    Err(e) => {
+                        ok = false;
+                        serde_json::json!({ "error": format!("rm {safe}: {e}") })
+                    }
+                },
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": e })
+                }
+            },
+            ShellBuiltin::Net => {
+                let eg = egress_health(&self.egress).await.ok();
+                serde_json::json!({
+                    "mode": self.settings.net_mode,
+                    "dns_primary": self.settings.dns_primary,
+                    "dns_secondary": self.settings.dns_secondary,
+                    "wifi_enabled": self.settings.wifi_enabled,
+                    "wifi_ssid": self.settings.wifi_ssid,
+                    "egress_active": self.wm.latest.agent_conn,
+                    "tls_roots": eg.as_ref().and_then(|v| v["tls_roots"].as_u64()).unwrap_or(0),
+                })
+            }
+            ShellBuiltin::Rooms { set } => {
+                if let Some(r) = set {
+                    if !self.apply_theme_room(&r).await {
+                        ok = false;
+                        serde_json::json!({ "error": format!("unknown room `{r}` (darkroom|paper|folio|gallery|blueprint|conservatory)") })
+                    } else {
+                        serde_json::json!({ "active": self.active_theme, "room": self.wm.latest.room })
+                    }
+                } else {
+                    serde_json::json!({
+                        "active": self.active_theme,
+                        "available": ["darkroom", "paper", "folio", "gallery", "blueprint", "conservatory"]
+                    })
+                }
+            }
+            ShellBuiltin::Scale { pct } => {
+                if let Some(p) = pct {
+                    self.apply_ui_scale(p).await;
+                }
+                serde_json::json!({
+                    "ui_scale_pct": self.settings.ui_scale_pct,
+                    "phys": format!("{}x{}", self.phys_w, self.phys_h),
+                    "logical": format!("{}x{}", self.wm.latest.w, self.wm.latest.h),
+                })
+            }
+            ShellBuiltin::Board => {
+                serde_json::to_value(&self.board.latest.cards).unwrap_or_default()
+            }
+            ShellBuiltin::Tree => {
+                let _ = self.collect_activity().await;
+                let (tree, _) = self.build_tree_and_stdin();
+                tree
+            }
+            ShellBuiltin::Apps => {
+                serde_json::Value::Array(self.app_registry.summary_list())
+            }
+            ShellBuiltin::AppRun { name } => {
+                let res = self.run_live_app(&name).await;
+                ok = res["ok"].as_bool().unwrap_or(false);
+                res
+            }
+            ShellBuiltin::AppSource { name } => match self.app_registry.get(&name) {
+                Some(rec) => serde_json::Value::String(rec.source.clone()),
+                None => {
+                    ok = false;
+                    serde_json::json!({ "error": format!("app `{name}` not found") })
+                }
+            },
+            ShellBuiltin::AppRollback { name } => {
+                let res = self.rollback_live_app(&name).await;
+                ok = res["ok"].as_bool().unwrap_or(false);
+                res
+            }
+            ShellBuiltin::Audit => {
+                let rows: Vec<serde_json::Value> = self
+                    .audit_log
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| serde_json::json!({ "idx": i + 1, "entry": e }))
+                    .collect();
+                serde_json::Value::Array(rows)
+            }
+            ShellBuiltin::Egress => match egress_health(&self.egress).await {
+                Ok(v) => v,
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": format!("{e:#}") })
+                }
+            },
+            ShellBuiltin::System => {
+                let snap = self.collect_activity().await;
+                serde_json::json!({
+                    "os": "Hirsel-OS Desktop",
+                    "arch": snap.arch,
+                    "uptime_sec": snap.uptime_sec,
+                    "cpus": snap.num_cpus,
+                    "ram_used_mb": snap.memory.used_mb,
+                    "ram_total_mb": snap.memory.total_mb,
+                    "theme": self.active_theme,
+                    "ui_scale_pct": self.settings.ui_scale_pct,
+                    "hirsel_eval": self.eval_client.is_some(),
+                })
+            }
+            ShellBuiltin::Hirsel { code } => {
+                let res = self.run_hirsel(&code, false, None).await;
+                ok = res["ok"].as_bool().unwrap_or(false);
+                res
+            }
+            ShellBuiltin::Js { code } => match self.js_client.as_mut() {
+                Some(js) => match js.eval(&code).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ok = false;
+                        serde_json::json!({ "error": format!("{e:#}") })
+                    }
+                },
+                None => {
+                    ok = false;
+                    serde_json::json!({ "error": "hirsel-js unavailable" })
+                }
+            },
+            ShellBuiltin::Agent { goal } => {
+                serde_json::json!({ "note": format!("use Figments Agent or POST /_hirsel/agent-run for `{goal}`") })
+            }
+            ShellBuiltin::Vm { cmd } => match self.run_dev_exec(cmd).await {
+                Ok(r) => {
+                    ok = r.exit_code == 0;
+                    serde_json::json!({ "exit_code": r.exit_code, "stdout": r.stdout })
+                }
+                Err(e) => {
+                    ok = false;
+                    serde_json::json!({ "error": format!("{e:#}") })
+                }
+            },
+            ShellBuiltin::Echo { text } => serde_json::Value::String(text),
+            ShellBuiltin::Unknown { name } => {
+                // If `name` matches a live Hirsel app in `/data/apps/`, invoke it directly as a shell command!
+                if self.app_registry.get(&name).map(|a| a.editable).unwrap_or(false) {
+                    let res = self.run_live_app(&name).await;
+                    ok = res["ok"].as_bool().unwrap_or(false);
+                    res
+                } else {
+                    ok = false;
+                    serde_json::json!({
+                        "error": format!("unknown command `{name}` (type `help`, `apps`, or `hirsel <code>`)")
+                    })
+                }
+            }
+        };
+
+        let (final_val, force_json) = if ok && !parsed.pipeline.is_empty() {
+            match shell::apply_pipeline(base_val, &parsed.pipeline) {
+                Ok(v) => v,
+                Err(e) => {
+                    ok = false;
+                    (serde_json::json!({ "error": e }), false)
+                }
+            }
+        } else {
+            (base_val, false)
+        };
+
+        let table = shell::format_table(&final_val, force_json);
+        if !table.is_empty() {
+            if ok {
+                self.shell_state.push_output(&table);
+            } else {
+                self.shell_state.push_output(&format!("err: {table}"));
+            }
+        }
+        self.shell_state.last_command = parsed.raw.clone();
+        self.shell_state.last_value = final_val.clone();
+        self.shell_state.last_table = table.clone();
+        self.shell_state.last_ok = ok;
+
+        if self.dev_attached {
+            let _ = self.apply_scene().await;
+        }
+
+        ShellExecResponse {
+            ok,
+            command: parsed.raw,
+            expanded: parsed.expanded,
+            value: final_val,
+            table,
+            defs_count: self.shell_state.defs.len(),
+        }
     }
 
     async fn handle(&mut self, msg: ShellMsg) {
@@ -1773,8 +2903,25 @@ impl HirselShell {
                 }
             }
             ShellMsg::JsEval { code, reply } => {
+                // Inject read-only live OS snapshot into `hirsel-js` whenever code references `os.`!
+                let full_code = if code.contains("os.") {
+                    let _ = self.collect_activity().await;
+                    let (tree, _) = self.build_tree_and_stdin();
+                    let app_keys: Vec<String> = tree["apps"]
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let apps_arr = serde_json::to_string(&app_keys).unwrap_or_else(|_| "[]".to_string());
+                    let preamble = format!(
+                        "var __os_tree = {}; var __os_apps = {}; var os = {{ tree: function() {{ return __os_tree; }}, windows: function() {{ return __os_tree.windows; }}, elements: function() {{ return __os_tree.visible_elements; }}, apps: function() {{ return __os_apps; }}, activity: function() {{ return __os_tree.apps.activity; }}, shell: function() {{ return __os_tree.apps.shell; }}, figments: function() {{ return __os_tree.apps.figments; }}, settings: function() {{ return __os_tree.apps.settings; }}, display: function() {{ return __os_tree.display; }}, security: function() {{ return __os_tree.security; }} }}; ",
+                        tree, apps_arr
+                    );
+                    format!("{preamble}{code}")
+                } else {
+                    code
+                };
                 let res = match self.js_client.as_mut() {
-                    Some(js) => js.eval(&code).await,
+                    Some(js) => js.eval(&full_code).await,
                     None => Err(anyhow::anyhow!("hirsel-js sandbox not available")),
                 };
                 let _ = reply.send(res);
@@ -1950,24 +3097,21 @@ impl HirselShell {
                     }
                     return;
                 }
-                // 2. Floating Top Bar capsule pill clicks (y < TOP_BAR_H)
+                // 2. Floating Top Bar capsule pill clicks (y < TOP_BAR_H) — single source of truth from script.rs!
                 if y < TOP_BAR_H as f32 {
-                    if x >= 92.0 && x < 198.0 {
-                        let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
-                            cmd: "FOCUS figments".into(),
-                            reply: None,
-                        });
-                    } else if x >= 198.0 && x < 290.0 {
-                        let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
-                            cmd: "TOGGLE_DEV".into(),
-                            reply: None,
-                        });
-                    } else if x >= 290.0 && x < 378.0 {
-                        let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
-                            cmd: "TOGGLE_WEB".into(),
-                            reply: None,
-                        });
-                    } else if x >= (plan.w as f32) - 62.0 {
+                    for p in script::top_bar_left_pills() {
+                        if x >= p.x as f32 && x < (p.x + p.w) as f32 {
+                            let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
+                                cmd: p.action.to_string(),
+                                reply: None,
+                            });
+                            if p.id == "pill-activity" {
+                                let _ = self.tx.unbounded_send(ShellMsg::ActivityTick);
+                            }
+                            return;
+                        }
+                    }
+                    if x >= (plan.w as f32) - 62.0 {
                         let _ = self.tx.unbounded_send(ShellMsg::ToggleSettingsUi);
                     } else if x >= (plan.w as f32) - 180.0 && x < (plan.w as f32) - 62.0 {
                         let cmd = if plan.agent_conn { "REVOKE" } else { "RESTORE" };
@@ -1978,7 +3122,7 @@ impl HirselShell {
                     }
                     return;
                 }
-                // 3. Click inside vm_dev pane focuses vm_dev for interactive typing
+                // 3. Click inside System Shell (`vm_dev`) pane focuses it for interactive typing
                 if let Some(ref r) = plan.layout.vm_dev {
                     if x >= r.x as f32
                         && x <= (r.x + r.w) as f32
@@ -1989,6 +3133,26 @@ impl HirselShell {
                             cmd: "FOCUS vm_dev".into(),
                             reply: None,
                         });
+                        return;
+                    }
+                }
+                // 4. Click inside Activity Manager pane focuses it AND selects the clicked process row!
+                if let Some(ref r) = plan.layout.activity {
+                    if x >= r.x as f32
+                        && x <= (r.x + r.w) as f32
+                        && y >= r.y as f32
+                        && y <= (r.y + r.h) as f32
+                    {
+                        let ry = y - r.y as f32;
+                        if ry >= 132.0 {
+                            let row_idx = ((ry - 132.0) / 22.0) as usize;
+                            self.activity.select_index(row_idx);
+                        }
+                        let _ = self.tx.unbounded_send(ShellMsg::WmCommand {
+                            cmd: "FOCUS activity".into(),
+                            reply: None,
+                        });
+                        let _ = self.apply_scene().await;
                     }
                 }
             }
@@ -2005,10 +3169,30 @@ impl HirselShell {
                         self.sas_secret_input.push(ch);
                         let _ = self.apply_scene().await;
                     }
-                } else if self.wm.latest.focused == "vm_dev" && self.dev_input.len() < 120 {
-                    self.dev_input.push(ch);
+                } else if self.wm.latest.focused == "vm_dev" && self.shell_state.input.len() < 160 {
+                    self.shell_state.input.push(ch);
                     if self.dev_attached {
                         let _ = self.apply_scene().await;
+                    }
+                } else if self.wm.latest.focused == "activity" {
+                    match ch {
+                        'r' | 'R' => {
+                            let _ = self.collect_activity().await;
+                            let _ = self.run_live_app("activity").await;
+                            let _ = self.apply_scene().await;
+                        }
+                        's' | 'S' => {
+                            self.activity.cycle_sort();
+                            let _ = self.apply_scene().await;
+                        }
+                        'k' | 'K' => {
+                            if let Some(p) = self.activity.selected_process().cloned() {
+                                if p.restartable {
+                                    let _ = self.restart_place(&p.name).await;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2017,7 +3201,7 @@ impl HirselShell {
                     self.sas_secret_input.pop();
                     let _ = self.apply_scene().await;
                 } else if self.wm.latest.focused == "vm_dev" {
-                    self.dev_input.pop();
+                    self.shell_state.input.pop();
                     if self.dev_attached {
                         let _ = self.apply_scene().await;
                     }
@@ -2041,10 +3225,134 @@ impl HirselShell {
                         }
                     }
                     let _ = self.apply_scene().await;
-                } else if self.wm.latest.focused == "vm_dev" && !self.dev_input.trim().is_empty() {
-                    let cmd = std::mem::take(&mut self.dev_input);
-                    let _ = self.run_dev_exec(cmd).await;
+                } else if self.wm.latest.focused == "vm_dev" && !self.shell_state.input.trim().is_empty() {
+                    let cmd = std::mem::take(&mut self.shell_state.input);
+                    let _ = self.exec_shell_cmd(&cmd).await;
                 }
+            }
+            ShellMsg::KeyUp => {
+                if self.wm.latest.focused == "vm_dev" {
+                    self.shell_state.history_up();
+                    if self.dev_attached {
+                        let _ = self.apply_scene().await;
+                    }
+                } else if self.wm.latest.focused == "activity" {
+                    self.activity.select_delta(-1);
+                    if self.activity_attached {
+                        let _ = self.apply_scene().await;
+                    }
+                }
+            }
+            ShellMsg::KeyDown => {
+                if self.wm.latest.focused == "vm_dev" {
+                    self.shell_state.history_down();
+                    if self.dev_attached {
+                        let _ = self.apply_scene().await;
+                    }
+                } else if self.wm.latest.focused == "activity" {
+                    self.activity.select_delta(1);
+                    if self.activity_attached {
+                        let _ = self.apply_scene().await;
+                    }
+                }
+            }
+            ShellMsg::GetActivity { reply } => {
+                let snap = self.collect_activity().await;
+                let _ = reply.send(snap);
+            }
+            ShellMsg::ActivityTick => {
+                if self.activity_attached || self.wm.latest.layout.activity.is_some() {
+                    let _ = self.collect_activity().await;
+                    let _ = self.run_live_app("activity").await;
+                    let _ = self.apply_scene().await;
+                }
+            }
+            ShellMsg::ActivityRestart { name, reply } => {
+                let res = self.restart_place(&name).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(res);
+                }
+            }
+            ShellMsg::ShellGet { reply } => {
+                let _ = reply.send(serde_json::json!({
+                    "defs": self.shell_state.defs,
+                    "history": self.shell_state.history,
+                    "output_lines": self.shell_state.output_lines,
+                    "last_command": self.shell_state.last_command,
+                    "last_value": self.shell_state.last_value,
+                    "last_table": self.shell_state.last_table,
+                    "last_ok": self.shell_state.last_ok,
+                    "vm_ready": self.vm_ready,
+                }));
+            }
+            ShellMsg::ShellExec { cmd, reply } => {
+                let res = self.exec_shell_cmd(&cmd).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(res);
+                }
+            }
+            ShellMsg::GetOsTree { reply } => {
+                let _ = self.collect_activity().await;
+                let (tree, _) = self.build_tree_and_stdin();
+                let _ = reply.send(tree);
+            }
+            ShellMsg::HirselEval { source, check_only, reply } => {
+                let res = self.run_hirsel(&source, check_only, None).await;
+                let _ = reply.send(res);
+            }
+            ShellMsg::AppsList { reply } => {
+                let _ = reply.send(serde_json::json!({
+                    "apps": self.app_registry.summary_list(),
+                    "hirsel_eval_ready": self.eval_client.is_some(),
+                }));
+            }
+            ShellMsg::AppGet { name, reply } => {
+                let _ = self.collect_activity().await;
+                let rec_opt = self.app_registry.get(&name).cloned();
+                let resp = rec_opt.map(|rec| {
+                    let live_state = match rec.name.as_str() {
+                        "activity" => serde_json::json!({
+                            "telemetry": self.activity.latest,
+                            "live_view": self.app_registry.activity_view,
+                        }),
+                        "shell" => serde_json::json!({
+                            "defs": self.shell_state.defs,
+                            "history_len": self.shell_state.history.len(),
+                            "last_command": self.shell_state.last_command,
+                        }),
+                        "hirsel-wm" => serde_json::to_value(&self.wm.latest).unwrap_or_default(),
+                        "hirsel-board" => serde_json::to_value(&self.board.latest).unwrap_or_default(),
+                        _ => serde_json::json!({ "cards": self.board.latest.cards.len() }),
+                    };
+                    serde_json::json!({
+                        "name": rec.name,
+                        "title": rec.title,
+                        "kind": rec.kind,
+                        "editable": rec.editable,
+                        "rev": rec.rev,
+                        "source": rec.source,
+                        "revisions": rec.revisions,
+                        "last_logs": rec.last_logs,
+                        "last_error": rec.last_error,
+                        "live_state": live_state,
+                    })
+                });
+                let _ = reply.send(resp);
+            }
+            ShellMsg::AppUpdate { name, source, note, reply } => {
+                let res = self.update_live_app(&name, source, &note).await;
+                let _ = reply.send(res);
+            }
+            ShellMsg::AppRollback { name, reply } => {
+                let res = self.rollback_live_app(&name).await;
+                let _ = reply.send(res);
+            }
+            ShellMsg::AppRun { name, reply } => {
+                let res = self.run_live_app(&name).await;
+                let _ = reply.send(res);
+            }
+            ShellMsg::SetFigmentsUiTree { tree } => {
+                self.figments_ui_tree = tree;
             }
             ShellMsg::ChildViewRef { domain, view_ref } => {
                 info!("Received Flatland ChildViewRef for `{domain}`");
@@ -2185,9 +3493,25 @@ fn spawn_keyboard_listener(view_ref: fviews::ViewRef, tx: UnboundedSender<ShellM
                     }
                     Some(finput::Key::F7) => {
                         let _ = tx.unbounded_send(ShellMsg::WmCommand {
+                            cmd: "TOGGLE_ACTIVITY".into(),
+                            reply: None,
+                        });
+                        let _ = tx.unbounded_send(ShellMsg::ActivityTick);
+                        handled = finput3::KeyEventStatus::Handled;
+                    }
+                    Some(finput::Key::F8) => {
+                        let _ = tx.unbounded_send(ShellMsg::WmCommand {
                             cmd: "REVOKE".into(),
                             reply: None,
                         });
+                        handled = finput3::KeyEventStatus::Handled;
+                    }
+                    Some(finput::Key::Up) => {
+                        let _ = tx.unbounded_send(ShellMsg::KeyUp);
+                        handled = finput3::KeyEventStatus::Handled;
+                    }
+                    Some(finput::Key::Down) => {
+                        let _ = tx.unbounded_send(ShellMsg::KeyDown);
                         handled = finput3::KeyEventStatus::Handled;
                     }
                     Some(finput::Key::Enter) | Some(finput::Key::KeypadEnter) => {
@@ -2381,6 +3705,149 @@ async fn handle_http_conn(
     }
 
     let (status, content_type, payload): (&str, &str, String) = match (method, path) {
+        ("GET", "/_hirsel/tree") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetOsTree { reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"tree"}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/activity") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::GetActivity { reply: otx });
+            match orx.await {
+                Ok(snap) => ("200 OK", "application/json", serde_json::to_string(&snap)?),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"activity"}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/activity/restart") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let name = parsed
+                .as_ref()
+                .and_then(|v| v["name"].as_str())
+                .unwrap_or(body)
+                .trim()
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::ActivityRestart { name, reply: Some(otx) });
+            match orx.await {
+                Ok(Ok(v)) => ("200 OK", "application/json", v.to_string()),
+                Ok(Err(e)) => ("400 Bad Request", "application/json", serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/shell") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::ShellGet { reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"shell"}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/shell") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let cmd = parsed
+                .as_ref()
+                .and_then(|v| v["cmd"].as_str())
+                .unwrap_or(body)
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::ShellExec { cmd, reply: Some(otx) });
+            match orx.await {
+                Ok(res) => ("200 OK", "application/json", serde_json::to_string(&res)?),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/hirsel") => {
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let source = parsed
+                .as_ref()
+                .and_then(|v| v["source"].as_str())
+                .unwrap_or(body)
+                .to_string();
+            let check_only = parsed
+                .as_ref()
+                .and_then(|v| v["op"].as_str())
+                .map(|o| o == "check")
+                .unwrap_or(false);
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::HirselEval { source, check_only, reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("GET", "/_hirsel/apps") => {
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AppsList { reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"apps":[]}"#.into()),
+            }
+        }
+        ("GET", p) if p.starts_with("/_hirsel/apps/") => {
+            let name = p.trim_start_matches("/_hirsel/apps/").trim_end_matches('/').to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AppGet { name, reply: otx });
+            match orx.await {
+                Ok(Some(v)) => ("200 OK", "application/json", v.to_string()),
+                Ok(None) => ("404 Not Found", "application/json", r#"{"error":"app_not_found"}"#.into()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"error":"apps"}"#.into()),
+            }
+        }
+        ("POST", p) if p.starts_with("/_hirsel/apps/") && p.ends_with("/source") => {
+            let name = p
+                .trim_start_matches("/_hirsel/apps/")
+                .trim_end_matches("/source")
+                .to_string();
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let source = parsed
+                .as_ref()
+                .and_then(|v| v["source"].as_str())
+                .unwrap_or(body)
+                .to_string();
+            let note = parsed
+                .as_ref()
+                .and_then(|v| v["note"].as_str())
+                .unwrap_or("live update")
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AppUpdate { name, source, note, reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("POST", p) if p.starts_with("/_hirsel/apps/") && p.ends_with("/rollback") => {
+            let name = p
+                .trim_start_matches("/_hirsel/apps/")
+                .trim_end_matches("/rollback")
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AppRollback { name, reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("POST", p) if p.starts_with("/_hirsel/apps/") && p.ends_with("/run") => {
+            let name = p
+                .trim_start_matches("/_hirsel/apps/")
+                .trim_end_matches("/run")
+                .to_string();
+            let (otx, orx) = oneshot::channel();
+            let _ = tx.unbounded_send(ShellMsg::AppRun { name, reply: otx });
+            match orx.await {
+                Ok(v) => ("200 OK", "application/json", v.to_string()),
+                Err(_) => ("500 Internal Server Error", "application/json", r#"{"ok":false}"#.into()),
+            }
+        }
+        ("POST", "/_hirsel/ui-tree") => {
+            let tree = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+            let _ = tx.unbounded_send(ShellMsg::SetFigmentsUiTree { tree });
+            ("200 OK", "application/json", r#"{"ok":true}"#.to_string())
+        }
         ("GET", "/_hirsel/settings") => {
             let (otx, orx) = oneshot::channel();
             let _ = tx.unbounded_send(ShellMsg::GetSettings { reply: otx });

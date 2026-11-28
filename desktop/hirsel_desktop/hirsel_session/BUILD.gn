@@ -40,6 +40,32 @@ resource("hirsel_js_bin") {
   allow_binary_output_dir = true
 }
 
+resource("hirsel_eval_bin") {
+  sources = [ "prebuilt/${target_cpu}/hirsel-eval" ]
+  outputs = [ "bin/hirsel-eval" ]
+  allow_binary_output_dir = true
+}
+
+resource("hirsel_os_lib") {
+  sources = [ "hirsel_src/os/os.hirsel" ]
+  outputs = [ "data/hirsel/os/os.hirsel" ]
+}
+
+resource("hirsel_wm_src") {
+  sources = [ "hirsel_src/places/hirsel-wm/wm.hirsel" ]
+  outputs = [ "data/hirsel/places/hirsel-wm/wm.hirsel" ]
+}
+
+resource("hirsel_board_src") {
+  sources = [ "hirsel_src/places/hirsel-board/board.hirsel" ]
+  outputs = [ "data/hirsel/places/hirsel-board/board.hirsel" ]
+}
+
+resource("hirsel_agent_src") {
+  sources = [ "hirsel_src/places/hirsel-agent/planner.hirsel" ]
+  outputs = [ "data/hirsel/places/hirsel-agent/planner.hirsel" ]
+}
+
 if (target_cpu == "x64") {
   resource("hirsel_vm_host_bin") {
     sources = [ "prebuilt/hirsel-vm-host" ]
@@ -112,11 +138,16 @@ rustc_binary("hirsel_shell_bin") {
   edition = "2024"
   source_root = "src/main.rs"
   sources = [
+    "src/activity.rs",
     "src/agent_client.rs",
+    "src/apps.rs",
     "src/board_client.rs",
+    "src/eval_client.rs",
     "src/js_client.rs",
     "src/main.rs",
     "src/painter.rs",
+    "src/script.rs",
+    "src/shell.rs",
     "src/ui_fonts.rs",
     "src/vm_client.rs",
     "src/vt100.rs",
@@ -187,10 +218,15 @@ fuchsia_component("hirsel_shell_component") {
     ":figments_fonts_css",
     ":figments_themes_css",
     ":hirsel_agent_bin",
+    ":hirsel_agent_src",
     ":hirsel_board_bin",
+    ":hirsel_board_src",
+    ":hirsel_eval_bin",
     ":hirsel_js_bin",
+    ":hirsel_os_lib",
     ":hirsel_shell_bin",
     ":hirsel_wm_bin",
+    ":hirsel_wm_src",
   ]
   if (target_cpu == "x64") {
     deps += [

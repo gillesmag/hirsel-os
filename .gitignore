@@ -1,5 +1,6 @@
 # Build outputs
 /target/
+/crates/hirsel-eval/target/
 /out/
 *.zbi
 *.img

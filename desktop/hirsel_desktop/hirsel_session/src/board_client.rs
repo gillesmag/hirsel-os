@@ -115,6 +115,10 @@ impl BoardClient {
         Ok(client)
     }
 
+    pub fn process(&self) -> &zx::Process {
+        &self._process
+    }
+
     async fn hydrate_from_disk(&mut self) {
         let Ok(raw) = std::fs::read_to_string(BOARD_SNAPSHOT_PATH) else {
             return;

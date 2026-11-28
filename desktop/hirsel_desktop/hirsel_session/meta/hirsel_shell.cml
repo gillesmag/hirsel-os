@@ -38,6 +38,7 @@
         },
         {
             protocol: [
+                "fuchsia.kernel.Stats",
                 "fuchsia.media.Audio",
                 "fuchsia.media.AudioDeviceEnumerator",
                 "fuchsia.media.ProfileProvider",

@@ -3,6 +3,7 @@
 
 type ModelAct = ActStart
     | ActToggleDev
+    | ActToggleActivity
     | ActToggleWeb
     | ActFocusDev
     | ActClientSpoofFocus
@@ -19,6 +20,7 @@ type ModelAct = ActStart
 fn model_actions(s: wm.WmState, mut out: List[ModelAct]) {
     let _ = s.width
     list.push(mut out, ActToggleDev)
+    list.push(mut out, ActToggleActivity)
     list.push(mut out, ActToggleWeb)
     list.push(mut out, ActFocusDev)
     list.push(mut out, ActClientSpoofFocus)
@@ -39,6 +41,7 @@ fn clone_state(s: wm.WmState) -> wm.WmState {
         height: s.height,
         room: s.room,
         show_dev: s.show_dev,
+        show_activity: s.show_activity,
         show_web: s.show_web,
         focused: s.focused,
         sas_active: s.sas_active,
@@ -68,6 +71,7 @@ fn model_step(s: wm.WmState, a: ModelAct) -> wm.WmState {
     match a {
         ActStart => take cur,
         ActToggleDev => wm.step(take cur, ToggleDev),
+        ActToggleActivity => wm.step(take cur, ToggleActivity),
         ActToggleWeb => wm.step(take cur, ToggleWeb),
         ActFocusDev => wm.step(take cur, UserFocus(d: VmDev)),
         ActClientSpoofFocus => wm.step(take cur, ClientFocusRequest(d: WebUntrusted)),
@@ -92,6 +96,7 @@ fn model_show(a: ModelAct, mut out: String) {
     match a {
         ActStart => string.push(mut out, "start"),
         ActToggleDev => string.push(mut out, "toggle_dev"),
+        ActToggleActivity => string.push(mut out, "toggle_activity"),
         ActToggleWeb => string.push(mut out, "toggle_web"),
         ActFocusDev => string.push(mut out, "focus_dev"),
         ActClientSpoofFocus => string.push(mut out, "client_spoof_focus"),
@@ -153,6 +158,23 @@ fn law_revoke_kills_ceremony(prev: wm.WmState, a: ModelAct, next: wm.WmState) ->
     }
 }
 
+fn opt_rect_valid_against(opt: Option[wm.Rect], other: wm.Rect, w: u64, h: u64) -> bool {
+    match opt {
+        Some(r) => rect_in_bounds(r, w, h) && rects_disjoint(r, other),
+        None => true,
+    }
+}
+
+fn opt_rects_disjoint(a: Option[wm.Rect], b: Option[wm.Rect]) -> bool {
+    match a {
+        Some(ra) => match b {
+            Some(rb) => rects_disjoint(ra, rb),
+            None => true,
+        },
+        None => true,
+    }
+}
+
 fn law_layout_sound(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
     let _ = prev.width
     let _ = a
@@ -160,26 +182,16 @@ fn law_layout_sound(prev: wm.WmState, a: ModelAct, next: wm.WmState) -> bool {
     if !rect_in_bounds(l.figments, next.width, next.height) {
         return false
     }
-    match l.vm_dev {
-        Some(d) => {
-            if !rect_in_bounds(d, next.width, next.height) || !rects_disjoint(l.figments, d) {
-                return false
-            }
-            match l.web {
-                Some(w) => rect_in_bounds(w, next.width, next.height)
-                    && rects_disjoint(l.figments, w)
-                    && rects_disjoint(d, w),
-                None => true,
-            }
-        },
-        None => match l.web {
-            Some(w) => rect_in_bounds(w, next.width, next.height) && rects_disjoint(l.figments, w),
-            None => true,
-        },
-    }
+    opt_rect_valid_against(l.vm_dev, l.figments, next.width, next.height)
+        && opt_rect_valid_against(l.activity, l.figments, next.width, next.height)
+        && opt_rect_valid_against(l.web, l.figments, next.width, next.height)
+        && opt_rects_disjoint(l.vm_dev, l.activity)
+        && opt_rects_disjoint(l.vm_dev, l.web)
+        && opt_rects_disjoint(l.activity, l.web)
 }
 
 fn witness_split(s: wm.WmState) -> bool { s.show_dev && s.show_web }
+fn witness_activity(s: wm.WmState) -> bool { s.show_activity && s.show_dev && s.show_web }
 fn witness_ceremony(s: wm.WmState) -> bool { wm.ceremony_active(s) && !s.capture_allowed }
 fn witness_approved(s: wm.WmState) -> bool { s.approved_count > 0u64 }
 fn witness_powerbox(s: wm.WmState) -> bool { s.powerbox_transfers > 0u64 && s.clip_dev == 77u64 }
@@ -200,6 +212,7 @@ fn wm_security_model_holds() -> Result[(), ()] {
 
     let mut sometimes: List[std.model.Sometimes[wm.WmState]] = list.new()
     list.push(mut sometimes, std.model.Sometimes(label: "split_layout", holds: witness_split))
+    list.push(mut sometimes, std.model.Sometimes(label: "triple_split_activity", holds: witness_activity))
     list.push(mut sometimes, std.model.Sometimes(label: "ceremony_locks_capture", holds: witness_ceremony))
     list.push(mut sometimes, std.model.Sometimes(label: "hash_bound_approval", holds: witness_approved))
     list.push(mut sometimes, std.model.Sometimes(label: "powerbox_transfer", holds: witness_powerbox))
@@ -217,14 +230,14 @@ fn wm_security_model_holds() -> Result[(), ()] {
     )
     let bounds = std.model.Bounds(
         depth: 4u64,
-        states: 4000u64,
+        states: 6000u64,
         step_steps: 200000u64,
         step_bytes: 1048576u64,
     )
     match std.model.explore(m, bounds) {
         Closed(_) => Ok(()),
         ToDepth(stats, _) => {
-            if list.len(stats.witnessed) == 5u64 {
+            if list.len(stats.witnessed) == 6u64 {
                 Ok(())
             } else {
                 Error(())

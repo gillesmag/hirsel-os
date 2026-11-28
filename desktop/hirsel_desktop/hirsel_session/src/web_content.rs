@@ -400,7 +400,7 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
     color: var(--ink-3);
     margin-bottom: -4px;
   }
-  input, select {
+  input, select, textarea {
     width: 100%;
     height: 32px;
     padding: 0 10px;
@@ -412,7 +412,14 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
     font-size: 11px;
     outline: none;
   }
-  input:focus, select:focus { border-color: var(--cobalt); }
+  textarea {
+    height: 152px;
+    padding: 8px 10px;
+    resize: vertical;
+    line-height: 1.42;
+    tab-size: 4;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--cobalt); }
   .btn {
     appearance: none;
     display: inline-flex;
@@ -699,8 +706,11 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
         <svg viewBox="0 0 24 24"><path d="M12 3l8 4v6c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V7l8-4z"/></svg>
         <span class="lbl">Outbox</span>
       </button>
-      <button class="tool-btn" onclick="cmd('TOGGLE_DEV')" title="Toggle Linux vm-dev (F2)">
+      <button class="tool-btn" onclick="cmd('TOGGLE_DEV')" title="Toggle System Shell (F2)">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 10l3 2.5L7 15M12 15h5"/></svg>
+      </button>
+      <button class="tool-btn" onclick="cmd('TOGGLE_ACTIVITY')" title="Toggle Activity Manager (F7)">
+        <svg viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>
       </button>
       <button class="tool-btn" onclick="cmd('TOGGLE_WEB')" title="Toggle Isolated Web #2 (F3)">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
@@ -875,8 +885,34 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
         <pre id="agent-out">Idle · zero ambient capabilities.</pre>
       </div>
       <div class="panel">
+        <div class="panel-row">
+          <h3>Live App Internals (Inline Hirsel)</h3>
+          <code id="app-rev-badge" style="font-size:10px;color:var(--ink-3)">rev 1</code>
+        </div>
+        <div class="panel-row">
+          <select id="app-select" onchange="loadSelectedApp()" style="flex:1"></select>
+          <button class="btn sm" onclick="refreshAppsList()">Refresh</button>
+        </div>
+        <textarea id="app-source" spellcheck="false" placeholder="Select an app to view/edit its running Hirsel code…"></textarea>
+        <div class="panel-row">
+          <button class="btn primary sm" id="app-save-btn" style="flex:1" onclick="saveSelectedApp()">Check &amp; Hot-Swap</button>
+          <button class="btn sm" onclick="runSelectedApp()">Run</button>
+          <button class="btn sm" id="app-rollback-btn" onclick="rollbackSelectedApp()">Rollback</button>
+        </div>
+        <pre id="app-out">Ready · select `activity`, `applet_monitor`, `shell`, `os`, or `hirsel-wm`.</pre>
+      </div>
+      <div class="panel">
+        <h3>Run Hirsel Script (os@1 Library)</h3>
+        <input id="script-in" value='os.print_u64(mut ctx, "RAM MiB", os.mem_used_mb(ctx)); os.wm_open(mut ctx, "activity")' />
+        <div class="panel-row">
+          <button class="btn primary sm" style="flex:1" onclick="runHirselScript()">Compile &amp; Eval</button>
+          <button class="btn sm" onclick="inspectTree()">Inspect OS Tree</button>
+        </div>
+        <pre id="script-out">OS-resident Hirsel compiler + evaluator ready.</pre>
+      </div>
+      <div class="panel">
         <h3>js@1 Codemode Sandbox</h3>
-        <input id="js-in" value="console.log('hi from Zircon'); return [6*7, 'hirsel-js@1']" />
+        <input id="js-in" value="return [os.apps().length, os.windows().length, os.activity().processes.length]" />
         <button class="btn" onclick="runCodemode()">Evaluate in Zero-Ambient Job</button>
         <pre id="js-out">Ready.</pre>
       </div>
@@ -891,7 +927,8 @@ pub const FIGMENTS_INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <div class="kbd-row">
         <span><kbd>F1</kbd> Figments</span>
-        <span><kbd>F2</kbd> vm-dev</span>
+        <span><kbd>F2</kbd> Shell</span>
+        <span><kbd>F7</kbd> Activity</span>
         <span><kbd>F3</kbd> Web</span>
         <span><kbd>F4</kbd> Room</span>
         <span><kbd>F5</kbd> Outbox</span>
@@ -944,7 +981,10 @@ function toggleDrawer(force) {
   const dr = document.getElementById('drawer');
   const open = typeof force === 'boolean' ? (dr.classList.toggle('open', force), force) : dr.classList.toggle('open');
   document.getElementById('drawer-btn').setAttribute('aria-pressed', String(open));
-  if (open) toggleSettings(false);
+  if (open) {
+    toggleSettings(false);
+    refreshAppsList();
+  }
 }
 
 function toggleSettings(force) {
@@ -1091,7 +1131,7 @@ async function setThemeRoom(room) {
 }
 
 window.addEventListener('keydown', (e) => {
-  if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT') return;
+  if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT' || document.activeElement.tagName === 'TEXTAREA') return;
   if (e.key === '/') {
     e.preventDefault();
     toggleDrawer();
@@ -1508,6 +1548,122 @@ pollState();
 
 async function cmd(c) { await apiPost('/_hirsel/cmd', c); pollState(); }
 async function stageEffect() { await apiPost('/_hirsel/stage', ''); pollState(); }
+async function runHirselScript() {
+  const src = document.getElementById('script-in').value.replace(/;\s*/g, '\n');
+  document.getElementById('script-out').textContent = 'Compiling & evaluating Hirsel…';
+  const r = await apiPost('/_hirsel/hirsel', JSON.stringify({ source: src }));
+  document.getElementById('script-out').textContent = JSON.stringify(await r.json(), null, 2);
+  pollState();
+}
+async function refreshAppsList() {
+  try {
+    const r = await fetch('/_hirsel/apps');
+    const data = await r.json();
+    const sel = document.getElementById('app-select');
+    const prev = sel.value || 'activity';
+    const list = Array.isArray(data.apps) ? data.apps : [];
+    sel.innerHTML = list
+      .map((a) => `<option value="${escapeHtml(a.name)}">${escapeHtml(a.name)} · ${a.editable ? 'live' : 'read-only'} (r${a.rev})</option>`)
+      .join('');
+    if (list.some((a) => a.name === prev)) sel.value = prev;
+    await loadSelectedApp();
+  } catch (e) {
+    document.getElementById('app-out').textContent = 'Error loading apps: ' + e;
+  }
+}
+async function loadSelectedApp() {
+  const name = document.getElementById('app-select').value;
+  if (!name) return;
+  try {
+    const r = await fetch('/_hirsel/apps/' + encodeURIComponent(name));
+    const app = await r.json();
+    document.getElementById('app-source').value = app.source || '';
+    document.getElementById('app-source').readOnly = !app.editable;
+    document.getElementById('app-save-btn').disabled = !app.editable;
+    document.getElementById('app-rollback-btn').disabled = !app.editable;
+    document.getElementById('app-rev-badge').textContent = `rev ${app.rev} · ${app.editable ? 'editable' : 'verified read-only'}`;
+    document.getElementById('app-out').textContent = app.last_error
+      ? 'Error: ' + app.last_error
+      : (app.last_logs && app.last_logs.length ? app.last_logs.join('\n') : `${app.title} (${app.kind})`);
+  } catch (e) {
+    document.getElementById('app-out').textContent = 'Load failed: ' + e;
+  }
+}
+async function saveSelectedApp() {
+  const name = document.getElementById('app-select').value;
+  const source = document.getElementById('app-source').value;
+  document.getElementById('app-out').textContent = 'Type-checking & hot-swapping…';
+  const r = await apiPost('/_hirsel/apps/' + encodeURIComponent(name) + '/source', JSON.stringify({ source, note: 'inline edit' }));
+  const res = await r.json();
+  document.getElementById('app-out').textContent = JSON.stringify(res, null, 2);
+  if (res.ok) await refreshAppsList();
+  pollState();
+}
+async function runSelectedApp() {
+  const name = document.getElementById('app-select').value;
+  const r = await apiPost('/_hirsel/apps/' + encodeURIComponent(name) + '/run', '');
+  document.getElementById('app-out').textContent = JSON.stringify(await r.json(), null, 2);
+  pollState();
+}
+async function rollbackSelectedApp() {
+  const name = document.getElementById('app-select').value;
+  const r = await apiPost('/_hirsel/apps/' + encodeURIComponent(name) + '/rollback', '');
+  document.getElementById('app-out').textContent = JSON.stringify(await r.json(), null, 2);
+  await refreshAppsList();
+  pollState();
+}
+async function inspectTree() {
+  const r = await fetch('/_hirsel/tree');
+  const tree = await r.json();
+  document.getElementById('script-out').textContent = JSON.stringify({
+    display: tree.display,
+    security: tree.security,
+    windows: (tree.windows || []).map((w) => ({ id: w.id, focused: w.focused, bounds: w.bounds })),
+    visible_elements: (tree.visible_elements || []).length,
+    apps: Object.keys(tree.apps || {}),
+  }, null, 2);
+}
+function publishUiTree() {
+  try {
+    const els = [];
+    const pushDom = (id, selector, role, label) => {
+      const node = document.querySelector(selector);
+      if (!node) return;
+      const r = node.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      els.push({ id, role, label, x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) });
+    };
+    pushDom('figments-hud', '.hud-pill', 'button', 'Figments Studio');
+    pushDom('figments-settings-btn', '#settings-btn', 'button', 'Settings');
+    pushDom('figments-dock', '.dock', 'toolbar', 'Figments Tool Rail');
+    const settingsOpen = document.getElementById('settings-sheet').classList.contains('open');
+    const drawerOpen = document.getElementById('drawer').classList.contains('open');
+    if (settingsOpen) pushDom('figments-settings-sheet', '#settings-sheet', 'dialog', 'Settings Panel');
+    if (drawerOpen) pushDom('figments-drawer', '#drawer', 'dialog', 'Command & Inspector Drawer');
+    boardSnap.cards.forEach((c, idx) => {
+      const p = cardScreenPos(c, idx, canvas.width || 640);
+      els.push({
+        id: 'card-' + c.id,
+        role: 'card',
+        label: c.title,
+        x: Math.round(p.x),
+        y: Math.round(p.y),
+        w: Math.round(p.w),
+        h: Math.round(p.h),
+        state: { kind: c.kind, tone: c.tone, rev: c.rev },
+      });
+    });
+    apiPost('/_hirsel/ui-tree', JSON.stringify({
+      active_tool: activeTool,
+      settings_open: settingsOpen,
+      drawer_open: drawerOpen,
+      zoom_pct: boardSnap.camera.zoom_pct || 100,
+      elements: els,
+    })).catch(() => {});
+  } catch (_) {}
+}
+setInterval(publishUiTree, 1500);
+setTimeout(publishUiTree, 600);
 async function runCodemode() {
   const r = await apiPost('/_hirsel/codemode', document.getElementById('js-in').value);
   document.getElementById('js-out').textContent = JSON.stringify(await r.json(), null, 2);

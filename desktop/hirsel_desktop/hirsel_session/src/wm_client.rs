@@ -30,6 +30,8 @@ pub struct OutboxJson {
 pub struct LayoutJson {
     pub figments: RectJson,
     pub vm_dev: Option<RectJson>,
+    #[serde(default)]
+    pub activity: Option<RectJson>,
     pub web: Option<RectJson>,
     pub ceremony: Option<RectJson>,
 }
@@ -124,6 +126,10 @@ impl WmClient {
         );
 
         Ok(Self { _job: job, process, stdin, stdout, stderr: stderr_host, latest })
+    }
+
+    pub fn process(&self) -> &zx::Process {
+        &self.process
     }
 
     fn diag_child(&self) -> String {

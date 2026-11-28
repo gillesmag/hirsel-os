@@ -1,0 +1,342 @@
+// Hirsel-OS Standard OS Introspection & Automation Library (`os@1`).
+//
+// Bundled directly inside the Hirsel-OS image (`/pkg/data/hirsel/os/os.hirsel`)
+// and pre-loaded by the OS-resident Hirsel compiler/evaluator (`bin/hirsel-eval`).
+//
+// Gives every Hirsel script, Shell command, Agent workflow, and Live-Editable App:
+//   - Typed access to live OS visual & state telemetry (automatically SAS-redacted)
+//   - Transactional OS window/activity/shell/figments/settings/app operations
+//   - Live App Internals emission (`emit_banner`, `emit_alert`, `emit_card_view`)
+
+pub type OsCtx {
+    input: Stdin,
+    out: Stdout,
+    raw: String,
+}
+
+fn read_all_stdin(i: Stdin) -> String waits {
+    let mut buf: Bytes = list.new()
+    loop {
+        if list.len(buf) == list.capacity(buf) {
+            let want: u64 = if list.capacity(buf) == 0u64 {
+                4096u64
+            } else {
+                list.capacity(buf)
+            }
+            list.reserve(mut buf, want)
+        }
+        match stdin.read(i, mut buf, Never) {
+            Ok(0u64) => break,
+            Ok(_) => {},
+            Error(_) => break,
+        }
+    }
+    match string.from_utf8(take buf) {
+        Ok(take s) => take s,
+        Error(_) => string.new(),
+    }
+}
+
+pub fn open(input: Stdin, out: Stdout) -> OsCtx waits {
+    let raw = read_all_stdin(input)
+    OsCtx(input: input, out: out, raw: take raw)
+}
+
+fn byte_at(s: String, idx: u64) -> u8 {
+    let bs = string.as_bytes(s)
+    bs[idx]
+}
+
+fn starts_with_at(s: String, pos: u64, pat: String) -> bool {
+    let slen = string.byte_len(s)
+    let plen = string.byte_len(pat)
+    if pos + plen > slen {
+        return false
+    }
+    let mut i = 0u64
+    while i < plen {
+        if byte_at(s, pos + i) != byte_at(pat, i) {
+            return false
+        }
+        i += 1u64
+    }
+    true
+}
+
+fn slice_copy(s: String, lo: u64, hi: u64) -> String {
+    let mut out = string.new()
+    let mut i = lo
+    while i < hi {
+        let mut b: Bytes = list.with_capacity(1u64)
+        list.push(mut b, byte_at(s, i))
+        match string.from_utf8(take b) {
+            Ok(take ch) => string.push(mut out, ch),
+            Error(_) => {},
+        }
+        i += 1u64
+    }
+    take out
+}
+
+fn find_substr(hay: String, needle: String, start: u64) -> Option[u64] {
+    let hlen = string.byte_len(hay)
+    let nlen = string.byte_len(needle)
+    if nlen == 0u64 || start + nlen > hlen {
+        return None
+    }
+    let mut i = start
+    while i + nlen <= hlen {
+        if starts_with_at(hay, i, needle) {
+            return Some(i)
+        }
+        i += 1u64
+    }
+    None
+}
+
+fn parse_u64_digits(s: String) -> u64 {
+    let len = string.byte_len(s)
+    let mut acc = 0u64
+    let mut i = 0u64
+    while i < len {
+        let b = byte_at(s, i)
+        if b >= 48u8 && b <= 57u8 {
+            acc = acc * 10u64 + int.widen(b - 48u8)
+        } else {
+            break
+        }
+        i += 1u64
+    }
+    acc
+}
+
+/// Read a typed header field (`key=value\n`) from the live OS snapshot preamble.
+pub fn field(ctx: OsCtx, key: String) -> String {
+    let mut prefix = string.from(key)
+    string.push(mut prefix, "=")
+    let len = string.byte_len(ctx.raw)
+    let mut line_start = 0u64
+    while line_start < len {
+        // Stop at JSON separator line
+        if starts_with_at(ctx.raw, line_start, "---JSON---") {
+            return string.new()
+        }
+        let mut line_end = line_start
+        while line_end < len && byte_at(ctx.raw, line_end) != 10u8 {
+            line_end += 1u64
+        }
+        if starts_with_at(ctx.raw, line_start, prefix) {
+            let val_start = line_start + string.byte_len(prefix)
+            return slice_copy(ctx.raw, val_start, line_end)
+        }
+        line_start = line_end + 1u64
+    }
+    string.new()
+}
+
+pub fn field_u64(ctx: OsCtx, key: String) -> u64 {
+    parse_u64_digits(field(ctx, key))
+}
+
+pub fn field_bool(ctx: OsCtx, key: String) -> bool {
+    field(ctx, key) == "true"
+}
+
+/// Return the full raw live OS Visual & State Tree JSON (`hirsel.os.tree/v1`).
+pub fn tree_json(ctx: OsCtx) -> String {
+    match find_substr(ctx.raw, "---JSON---\n", 0u64) {
+        Some(pos) => slice_copy(ctx.raw, pos + 11u64, string.byte_len(ctx.raw)),
+        None => string.from(ctx.raw),
+    }
+}
+
+pub fn contains(hay: String, needle: String) -> bool {
+    match find_substr(hay, needle, 0u64) {
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Escape quotes, backslashes, and newlines for JSON string values.
+pub fn json_escape(s: String) -> String {
+    let len = string.byte_len(s)
+    let mut out = string.with_capacity(len + 8u64)
+    let mut i = 0u64
+    while i < len {
+        let b = byte_at(s, i)
+        if b == 34u8 {
+            string.push(mut out, "\\\"")
+        } else if b == 92u8 {
+            string.push(mut out, "\\\\")
+        } else if b == 10u8 {
+            string.push(mut out, "\\n")
+        } else if b == 13u8 {
+            string.push(mut out, "\\r")
+        } else if b == 9u8 {
+            string.push(mut out, "\\t")
+        } else {
+            let mut one: Bytes = list.with_capacity(1u64)
+            list.push(mut one, b)
+            match string.from_utf8(take one) {
+                Ok(take ch) => string.push(mut out, ch),
+                Error(_) => {},
+            }
+        }
+        i += 1u64
+    }
+    take out
+}
+
+// ── Live OS Introspection Accessors ───────────────────────────────────────────
+
+pub fn focused(ctx: OsCtx) -> String { field(ctx, "focused") }
+pub fn theme(ctx: OsCtx) -> String { field(ctx, "theme") }
+pub fn room(ctx: OsCtx) -> String { field(ctx, "room") }
+pub fn arch(ctx: OsCtx) -> String { field(ctx, "arch") }
+pub fn ui_scale(ctx: OsCtx) -> u64 { field_u64(ctx, "ui_scale_pct") }
+pub fn logical_w(ctx: OsCtx) -> u64 { field_u64(ctx, "logical_w") }
+pub fn logical_h(ctx: OsCtx) -> u64 { field_u64(ctx, "logical_h") }
+pub fn uptime_sec(ctx: OsCtx) -> u64 { field_u64(ctx, "uptime_sec") }
+pub fn mem_used_mb(ctx: OsCtx) -> u64 { field_u64(ctx, "mem_used_mb") }
+pub fn mem_total_mb(ctx: OsCtx) -> u64 { field_u64(ctx, "mem_total_mb") }
+pub fn mem_used_pct(ctx: OsCtx) -> u64 { field_u64(ctx, "mem_used_pct") }
+pub fn num_cpus(ctx: OsCtx) -> u64 { field_u64(ctx, "num_cpus") }
+pub fn avg_cpu_pct(ctx: OsCtx) -> u64 { field_u64(ctx, "avg_cpu_pct") }
+pub fn proc_count(ctx: OsCtx) -> u64 { field_u64(ctx, "proc_count") }
+pub fn top_proc_name(ctx: OsCtx) -> String { field(ctx, "top_proc_name") }
+pub fn top_proc_rss_mb(ctx: OsCtx) -> u64 { field_u64(ctx, "top_proc_rss_mb") }
+pub fn card_count(ctx: OsCtx) -> u64 { field_u64(ctx, "card_count") }
+pub fn window_count(ctx: OsCtx) -> u64 { field_u64(ctx, "window_count") }
+pub fn element_count(ctx: OsCtx) -> u64 { field_u64(ctx, "element_count") }
+pub fn shell_defs_count(ctx: OsCtx) -> u64 { field_u64(ctx, "shell_defs_count") }
+pub fn capture_allowed(ctx: OsCtx) -> bool { field_bool(ctx, "capture_allowed") }
+pub fn sas_active(ctx: OsCtx) -> bool { field_bool(ctx, "sas_active") }
+
+// ── Output, Live App Views, and Transactional OS Control Ops ──────────────────
+
+fn emit_raw(mut ctx: OsCtx, line: String) waits {
+    let mut payload = string.from(line)
+    string.push(mut payload, "\n")
+    let _ = stdout.write(ctx.out, payload)
+}
+
+pub fn print(mut ctx: OsCtx, msg: String) waits {
+    let mut line = string.from("@HIRSEL_LOG ")
+    string.push(mut line, msg)
+    emit_raw(mut ctx, take line)
+}
+
+pub fn print_u64(mut ctx: OsCtx, label: String, n: u64) waits {
+    let mut line = string.from("@HIRSEL_LOG ")
+    string.push(mut line, label)
+    string.push(mut line, ": ")
+    string.push_u64(mut line, n)
+    emit_raw(mut ctx, take line)
+}
+
+fn emit_op_str(mut ctx: OsCtx, op: String, key: String, val: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"")
+    string.push(mut line, json_escape(op))
+    string.push(mut line, "\",\"")
+    string.push(mut line, json_escape(key))
+    string.push(mut line, "\":\"")
+    string.push(mut line, json_escape(val))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+fn emit_op_u64(mut ctx: OsCtx, op: String, key: String, val: u64) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"")
+    string.push(mut line, json_escape(op))
+    string.push(mut line, "\",\"")
+    string.push(mut line, json_escape(key))
+    string.push(mut line, "\":")
+    string.push_u64(mut line, val)
+    string.push(mut line, "}")
+    emit_raw(mut ctx, take line)
+}
+
+// Live-editable App UI hooks (Activity Manager & Figments Applets)
+pub fn emit_banner(mut ctx: OsCtx, text: String) waits {
+    emit_op_str(mut ctx, "emit_banner", "text", text)
+}
+
+pub fn emit_alert(mut ctx: OsCtx, level: String, target: String, message: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"emit_alert\",\"level\":\"")
+    string.push(mut line, json_escape(level))
+    string.push(mut line, "\",\"target\":\"")
+    string.push(mut line, json_escape(target))
+    string.push(mut line, "\",\"message\":\"")
+    string.push(mut line, json_escape(message))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+pub fn emit_card_view(mut ctx: OsCtx, title: String, body: String, tone: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"emit_card_view\",\"title\":\"")
+    string.push(mut line, json_escape(title))
+    string.push(mut line, "\",\"body\":\"")
+    string.push(mut line, json_escape(body))
+    string.push(mut line, "\",\"tone\":\"")
+    string.push(mut line, json_escape(tone))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+// Window Manager & UI controls
+pub fn wm_open(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "wm_open", "app", app) }
+pub fn wm_close(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "wm_close", "app", app) }
+pub fn wm_toggle(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "wm_toggle", "app", app) }
+pub fn wm_focus(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "wm_focus", "app", app) }
+pub fn click(mut ctx: OsCtx, label: String) waits { emit_op_str(mut ctx, "click", "label", label) }
+
+// Activity Manager controls
+pub fn activity_sort(mut ctx: OsCtx, by: String) waits { emit_op_str(mut ctx, "activity_sort", "by", by) }
+pub fn activity_restart(mut ctx: OsCtx, place: String) waits { emit_op_str(mut ctx, "activity_restart", "place", place) }
+
+// System Shell controls
+pub fn shell_run(mut ctx: OsCtx, cmd: String) waits { emit_op_str(mut ctx, "shell_run", "cmd", cmd) }
+pub fn shell_undef(mut ctx: OsCtx, name: String) waits { emit_op_str(mut ctx, "shell_undef", "name", name) }
+pub fn shell_clear(mut ctx: OsCtx) waits { emit_raw(mut ctx, "@HIRSEL_OP {\"op\":\"shell_clear\"}") }
+
+pub fn shell_def(mut ctx: OsCtx, name: String, body: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"shell_def\",\"name\":\"")
+    string.push(mut line, json_escape(name))
+    string.push(mut line, "\",\"body\":\"")
+    string.push(mut line, json_escape(body))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+// Figments Spatial Board controls
+pub fn add_card(mut ctx: OsCtx, title: String, body: String, tone: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"add_card\",\"title\":\"")
+    string.push(mut line, json_escape(title))
+    string.push(mut line, "\",\"body\":\"")
+    string.push(mut line, json_escape(body))
+    string.push(mut line, "\",\"tone\":\"")
+    string.push(mut line, json_escape(tone))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+pub fn delete_card(mut ctx: OsCtx, id: String) waits { emit_op_str(mut ctx, "delete_card", "id", id) }
+pub fn set_zoom(mut ctx: OsCtx, pct: u64) waits { emit_op_u64(mut ctx, "set_zoom", "pct", pct) }
+
+// Settings & Web controls
+pub fn set_scale(mut ctx: OsCtx, pct: u64) waits { emit_op_u64(mut ctx, "set_scale", "pct", pct) }
+pub fn set_theme(mut ctx: OsCtx, room_name: String) waits { emit_op_str(mut ctx, "set_theme", "theme", room_name) }
+pub fn web_navigate(mut ctx: OsCtx, url: String) waits { emit_op_str(mut ctx, "web_navigate", "url", url) }
+
+// Live App Internals controls (read/update/rollback running Hirsel apps!)
+pub fn app_update(mut ctx: OsCtx, app: String, source: String) waits {
+    let mut line = string.from("@HIRSEL_OP {\"op\":\"app_update\",\"app\":\"")
+    string.push(mut line, json_escape(app))
+    string.push(mut line, "\",\"source\":\"")
+    string.push(mut line, json_escape(source))
+    string.push(mut line, "\"}")
+    emit_raw(mut ctx, take line)
+}
+
+pub fn app_rollback(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "app_rollback", "app", app) }
+pub fn app_run(mut ctx: OsCtx, app: String) waits { emit_op_str(mut ctx, "app_run", "app", app) }

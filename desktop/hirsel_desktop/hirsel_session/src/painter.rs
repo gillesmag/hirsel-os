@@ -8,8 +8,11 @@
 // `Host Grotesk` (UI/Titles) + `Fragment Mono` (Terminal/Telemetry) with exact
 // FreeType cap_height optical vertical centering across all 6 curated OKLCH rooms.
 
+use crate::activity::ActivitySnapshot;
+use crate::apps::LiveActivityView;
+use crate::script::{TOP_BAR_LEFT_ISLAND_W, top_bar_left_pills};
+use crate::shell::ShellState;
 use crate::ui_fonts::{BakedFont, FONT_MONO, FONT_TITLE, FONT_UI};
-use crate::vt100::Vt100Screen;
 use crate::wm_client::ScenePlan;
 use anyhow::{Context, Result};
 use fidl::endpoints::{Proxy, create_endpoints};
@@ -22,6 +25,7 @@ use fuchsia_component::client::connect_to_protocol;
 #[derive(Clone, Copy)]
 pub struct RoomPalette {
     pub label: &'static str,
+    #[allow(dead_code)]
     pub light: bool,
     pub ground: [u8; 4],
     pub paper: [u8; 4],
@@ -570,12 +574,8 @@ fn fmt_dollars(micros: u64) -> String {
 }
 
 /// Floating 3-island Top Bar (Waybar / Quickshell × Figments "One Sun") in real Host Grotesk + Fragment Mono.
-/// Click hitboxes (kept clean & deterministic):
-///   - `1 Figments`: x = 90..198
-///   - `2 vm-dev`:   x = 198..290
-///   - `3 Web`:      x = 290..378
-///   - `egress`:     right island middle (w - 190 .. w - 70)
-///   - `sys` (gear): far right of right island (w - 70 .. w - 10) -> toggles Top-Right Settings panel!
+/// Pill hitboxes come directly from `crate::script::top_bar_left_pills()` so painting, mouse clicks,
+/// and the OS visual tree (`GET /_hirsel/tree`) share a single source of truth.
 pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan, theme: &str, powerbox_toast: &str) {
     let pal = palette_for(theme);
     let locked = plan.sas || plan.outbox.status == "staged";
@@ -589,28 +589,31 @@ pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan, theme: &str, powerbox
 
     // ── LEFT ISLAND: Brand + Workspace / Domain pills ──
     let left_x = 10usize;
-    let left_w = 368usize;
+    let left_w = TOP_BAR_LEFT_ISLAND_W;
     c.fill_rounded_rect(left_x, bar_y, left_w, bar_h, rad, pal.paper);
     c.stroke_rounded_rect(left_x, bar_y, left_w, bar_h, rad, 1.0, pal.line_strong);
 
     let brand_dot = if locked { pal.vermilion } else { pal.cobalt };
     c.fill_circle((left_x + 16) as f32, cy_f, 3.8, brand_dot);
-    c.draw_text_cy(&FONT_UI, (left_x + 26) as i32, bar_y, bar_h, 90, "hirsel", pal.ink);
-    c.fill_rect(left_x + 76, bar_y + 7, 1, bar_h - 14, pal.line_strong);
+    c.draw_text_cy(&FONT_UI, (left_x + 26) as i32, bar_y, bar_h, 88, "hirsel", pal.ink);
+    c.fill_rect(left_x + 74, bar_y + 7, 1, bar_h - 14, pal.line_strong);
 
-    let pills: [(&str, usize, usize, bool, [u8; 4], [u8; 4]); 3] = [
-        ("1 Figments", 94, 102, plan.focused == "figments" && !locked, pal.cobalt_tint, pal.cobalt),
-        ("2 vm-dev", 200, 88, plan.layout.vm_dev.is_some(), pal.sap_tint, pal.sap),
-        ("3 Web", 292, 80, plan.layout.web.is_some(), pal.ochre_tint, pal.ochre),
-    ];
-    for (label, px, pw, active, tint, accent) in pills {
+    for p in top_bar_left_pills() {
+        let px = p.x as usize;
+        let pw = p.w as usize;
+        let (active, tint, accent) = match p.id {
+            "pill-figments" => (plan.focused == "figments" && !locked, pal.cobalt_tint, pal.cobalt),
+            "pill-shell" => (plan.layout.vm_dev.is_some(), pal.sap_tint, pal.sap),
+            "pill-activity" => (plan.layout.activity.is_some(), pal.cobalt_tint, pal.cobalt),
+            _ => (plan.layout.web.is_some(), pal.ochre_tint, pal.ochre),
+        };
         if active {
             c.fill_rounded_rect(px, bar_y + 3, pw, bar_h - 6, 11.0, tint);
-            c.fill_circle((px + 11) as f32, cy_f, 3.0, accent);
-            c.draw_text_cy(&FONT_UI, (px + 20) as i32, bar_y, bar_h, (px + pw - 6) as i32, label, pal.ink);
+            c.fill_circle((px + 10) as f32, cy_f, 3.0, accent);
+            c.draw_text_cy(&FONT_UI, (px + 19) as i32, bar_y, bar_h, (px + pw - 4) as i32, p.label, pal.ink);
         } else {
-            c.fill_circle((px + 11) as f32, cy_f, 2.4, pal.line_strong);
-            c.draw_text_cy(&FONT_UI, (px + 20) as i32, bar_y, bar_h, (px + pw - 6) as i32, label, pal.ink2);
+            c.fill_circle((px + 10) as f32, cy_f, 2.4, pal.line_strong);
+            c.draw_text_cy(&FONT_UI, (px + 19) as i32, bar_y, bar_h, (px + pw - 4) as i32, p.label, pal.ink2);
         }
     }
 
@@ -634,7 +637,8 @@ pub fn paint_top_bar(c: &mut Canvas<'_>, plan: &ScenePlan, theme: &str, powerbox
     } else {
         let focus_lbl = match plan.focused.as_str() {
             "figments" => "Figments",
-            "vm_dev" => "vm-dev",
+            "vm_dev" => "Shell",
+            "activity" => "Activity",
             "web_untrusted" => "Web #2",
             _ => "Trusted",
         };
@@ -727,13 +731,12 @@ pub fn paint_web_origin_bar(c: &mut Canvas<'_>, theme: &str, origin: &str, focus
     }
 }
 
-/// Minimal Foot / Kitty-style `vm-dev` VT100 terminal in crisp anti-aliased Fragment Mono + Host Grotesk.
-pub fn paint_dev_pane(
+/// Structured Hirsel System Shell (`hirsel-sh`) Flatland split pane with optional Linux `vm-dev` passthrough.
+pub fn paint_shell_pane(
     c: &mut Canvas<'_>,
     plan: &ScenePlan,
     theme: &str,
-    vt: &Vt100Screen,
-    input_buf: &str,
+    shell: &ShellState,
     vm_ready: bool,
 ) {
     let pal = palette_for(theme);
@@ -746,13 +749,14 @@ pub fn paint_dev_pane(
     c.fill_rect(0, 0, c.width, hdr_h, pal.raised);
     c.fill_rect(0, hdr_h - 1, c.width, 1, pal.line);
 
-    let dot_col = if vm_ready { pal.sap } else { pal.ochre };
+    let dot_col = if focused { pal.sap } else { pal.cobalt };
     c.fill_circle(16.0, (hdr_h as f32) * 0.5, 3.5, dot_col);
-    c.draw_text_cy(&FONT_UI, 27, 0, hdr_h, 160, "vm-dev", pal.ink);
+    c.draw_text_cy(&FONT_UI, 27, 0, hdr_h, 160, "System Shell", pal.ink);
 
-    let meta = format!("linux 6.1.102 · 2 vcpu · {}x{}", vt.cols, vt.rows);
+    let vm_tag = if vm_ready { "vm-dev ready" } else { std::env::consts::ARCH };
+    let meta = format!("hirsel-sh · {} defs · {vm_tag}", shell.defs.len());
     let mw = FONT_MONO.measure_width(&meta) as usize;
-    if c.width > mw + 100 {
+    if c.width > mw + 120 {
         c.draw_text_cy(
             &FONT_MONO,
             (c.width - mw - 14) as i32,
@@ -764,44 +768,35 @@ pub fn paint_dev_pane(
         );
     }
 
-    // VT100 screen cell grid rendered with anti-aliased Fragment Mono (8px cell pitch, 16px row pitch)
-    let pad_x = 16usize;
-    let pad_y = hdr_h + 12;
-    let prompt_h = 32usize;
-    let cell_w = FONT_MONO.max_advance as usize;
-    let row_h = FONT_MONO.line_height as usize;
-    let avail_h = c.height.saturating_sub(pad_y + prompt_h + 12);
-    let max_rows = avail_h / row_h;
-    let draw_rows = vt.rows.min(max_rows);
+    // Structured output scrollback rendered in anti-aliased Fragment Mono
+    let pad_x = 14usize;
+    let pad_y = hdr_h + 10;
+    let prompt_h = 36usize;
+    let row_h = (FONT_MONO.line_height as usize).max(14);
+    let avail_h = c.height.saturating_sub(pad_y + prompt_h + 8);
+    let max_rows = (avail_h / row_h).max(1);
+    let total = shell.output_lines.len();
+    let start = total.saturating_sub(max_rows);
+    let max_x = c.width.saturating_sub(pad_x) as i32;
 
-    for r in 0..draw_rows {
-        let baseline_y = (pad_y + r * row_h) as i32 + FONT_MONO.cap_height + 2;
-        for col in 0..vt.cols {
-            let px = pad_x + col * cell_w;
-            if px + cell_w > c.width.saturating_sub(pad_x) {
-                break;
-            }
-            let cell = vt.cells[r * vt.cols + col];
-            if cell.ch != b' ' {
-                let fg = if cell.fg == crate::vt100::DEFAULT_FG {
-                    pal.ink
-                } else if pal.light {
-                    [
-                        cell.fg[0].saturating_sub(55),
-                        cell.fg[1].saturating_sub(55),
-                        cell.fg[2].saturating_sub(55),
-                        255,
-                    ]
-                } else {
-                    cell.fg
-                };
-                c.draw_glyph_aa(&FONT_MONO, cell.ch as char, px as i32, baseline_y, fg);
-            }
-        }
+    for (i, line) in shell.output_lines[start..].iter().enumerate() {
+        let baseline_y = (pad_y + i * row_h) as i32 + FONT_MONO.cap_height + 2;
+        let col = if line.starts_with("› ") || line.starts_with("> ") {
+            pal.sap
+        } else if line.starts_with("err:") || line.starts_with("[err]") {
+            pal.vermilion
+        } else if line.starts_with("---") || line.starts_with("===") {
+            pal.ink3
+        } else if line.starts_with("hirsel-sh ") {
+            pal.cobalt
+        } else {
+            pal.ink
+        };
+        c.draw_text_aa(&FONT_MONO, pad_x as i32, baseline_y, max_x, line, col);
     }
 
-    // Minimal floating prompt capsule at bottom of terminal
-    let py = c.height.saturating_sub(prompt_h + 8);
+    // Floating prompt capsule at bottom of shell pane
+    let py = c.height.saturating_sub(prompt_h + 6);
     let pw = c.width.saturating_sub(24);
     c.fill_rounded_rect(12, py, pw, 28, 9.0, pal.sunk);
     c.stroke_rounded_rect(
@@ -813,10 +808,188 @@ pub fn paint_dev_pane(
         1.0,
         if focused { pal.sap } else { pal.line },
     );
-    let x_after = c.draw_text_cy(&FONT_MONO, 22, py, 28, 40, "›", pal.sap);
+    let x_after = c.draw_text_cy(&FONT_MONO, 20, py, 28, 108, "hirsel-sh ›", pal.sap);
     let cursor = if focused { "_" } else { "" };
-    let line = format!(" {input_buf}{cursor}");
+    let line = format!(" {}{cursor}", shell.input);
     c.draw_text_cy(&FONT_MONO, x_after + 2, py, 28, (12 + pw - 10) as i32, &line, pal.ink);
+}
+
+/// Real Zircon Activity Manager Flatland split pane (kernel RAM, per-CPU load, sortable process table,
+/// PLUS live-editable Hirsel banner & alert highlights from `/data/apps/activity/current.hirsel`).
+pub fn paint_activity_pane(
+    c: &mut Canvas<'_>,
+    plan: &ScenePlan,
+    theme: &str,
+    snap: &ActivitySnapshot,
+    live_view: &LiveActivityView,
+) {
+    let pal = palette_for(theme);
+    let focused = plan.focused == "activity";
+
+    c.fill_rect(0, 0, c.width, c.height, pal.paper);
+
+    // 32px Header strip
+    let hdr_h = 32usize;
+    c.fill_rect(0, 0, c.width, hdr_h, pal.raised);
+    c.fill_rect(0, hdr_h - 1, c.width, 1, pal.line);
+
+    c.fill_circle(16.0, (hdr_h as f32) * 0.5, 3.5, if focused { pal.cobalt } else { pal.sap });
+    c.draw_text_cy(&FONT_UI, 27, 0, hdr_h, 190, "Activity Manager", pal.ink);
+
+    let meta = format!("{} · up {}s · sort:{}", snap.arch, snap.uptime_sec, snap.sort_by);
+    let mw = FONT_MONO.measure_width(&meta) as usize;
+    if c.width > mw + 150 {
+        c.draw_text_cy(
+            &FONT_MONO,
+            (c.width - mw - 14) as i32,
+            0,
+            hdr_h,
+            c.width as i32 - 8,
+            &meta,
+            pal.ink3,
+        );
+    }
+
+    // Telemetry summary cards (RAM + CPU): y = 40..104
+    let pad = 12usize;
+    let gap = 10usize;
+    let card_y = hdr_h + 8;
+    let card_h = 64usize;
+    let half_w = c.width.saturating_sub(pad * 2 + gap) / 2;
+
+    // Left Card: Kernel Memory
+    c.fill_rounded_rect(pad, card_y, half_w, card_h, 10.0, pal.raised);
+    c.stroke_rounded_rect(pad, card_y, half_w, card_h, 10.0, 1.0, pal.line);
+    let mem_title = format!(
+        "RAM {:.0}/{:.0}M ({:.0}%)",
+        snap.memory.used_mb, snap.memory.total_mb, snap.memory.used_pct
+    );
+    c.draw_text_cy(&FONT_UI, (pad + 10) as i32, card_y + 4, 20, (pad + half_w - 8) as i32, &mem_title, pal.ink);
+
+    let bar_x = pad + 10;
+    let bar_y = card_y + 28;
+    let bar_w = half_w.saturating_sub(20);
+    c.fill_rounded_rect(bar_x, bar_y, bar_w, 8, 4.0, pal.sunk);
+    let mem_frac = (snap.memory.used_pct / 100.0).clamp(0.0, 1.0);
+    let fill_w = ((bar_w as f32) * mem_frac).round() as usize;
+    let mem_col = if snap.memory.used_pct > 85.0 { pal.vermilion } else { pal.cobalt };
+    if fill_w > 2 {
+        c.fill_rounded_rect(bar_x, bar_y, fill_w.min(bar_w), 8, 4.0, mem_col);
+    }
+    let vmo_mb = snap.memory.vmo_bytes as f64 / (1024.0 * 1024.0);
+    let wired_mb = snap.memory.wired_bytes as f64 / (1024.0 * 1024.0);
+    let fxfs_kb = snap.storage_total_bytes / 1024;
+    let mem_sub = format!("VMO {vmo_mb:.0}M · Wired {wired_mb:.0}M · /data {fxfs_kb}K");
+    c.draw_text_cy(&FONT_MONO, (pad + 10) as i32, card_y + 40, 20, (pad + half_w - 8) as i32, &mem_sub, pal.ink3);
+
+    // Right Card: Kernel Per-CPU Load
+    let rx = pad + half_w + gap;
+    c.fill_rounded_rect(rx, card_y, half_w, card_h, 10.0, pal.raised);
+    c.stroke_rounded_rect(rx, card_y, half_w, card_h, 10.0, 1.0, pal.line);
+    let cpu_title = format!("CPU ({}c)  {:.1}%", snap.num_cpus, snap.avg_cpu_pct);
+    c.draw_text_cy(&FONT_UI, (rx + 10) as i32, card_y + 4, 20, (rx + half_w - 8) as i32, &cpu_title, pal.ink);
+
+    let show_cpus = snap.cpus.len().min(6);
+    if show_cpus > 0 {
+        let bw = (half_w.saturating_sub(20 + (show_cpus - 1) * 5)) / show_cpus;
+        for (i, core) in snap.cpus.iter().take(show_cpus).enumerate() {
+            let bx = rx + 10 + i * (bw + 5);
+            let by = card_y + 28;
+            let bh = 24usize;
+            c.fill_rounded_rect(bx, by, bw, bh, 4.0, pal.sunk);
+            let fh = ((bh as f32) * (core.busy_pct / 100.0).clamp(0.0, 1.0)).round() as usize;
+            if fh > 1 {
+                let col = if core.busy_pct > 80.0 { pal.vermilion } else { pal.sap };
+                c.fill_rounded_rect(bx, by + bh - fh, bw, fh, 4.0, col);
+            }
+        }
+    } else {
+        c.draw_text_cy(&FONT_MONO, (rx + 10) as i32, card_y + 30, 20, (rx + half_w - 8) as i32, "sampling kernel stats...", pal.ink3);
+    }
+
+    // Process Table Header (y = 112..132)
+    let hdr_row_y = 112usize;
+    c.fill_rect(0, hdr_row_y, c.width, 20, pal.sunk);
+    c.fill_rect(0, hdr_row_y + 19, c.width, 1, pal.line);
+
+    let col_name = 16i32;
+    let col_koid = (c.width as i32 - 220).max(145);
+    let col_thr = (c.width as i32 - 156).max(200);
+    let col_rss = (c.width as i32 - 118).max(230);
+    let col_cpu = (c.width as i32 - 58).max(280);
+
+    c.draw_text_cy(&FONT_MONO, col_name, hdr_row_y, 20, col_koid - 6, "PROCESS", pal.ink3);
+    if c.width >= 320 {
+        c.draw_text_cy(&FONT_MONO, col_koid, hdr_row_y, 20, col_thr - 4, "KOID", pal.ink3);
+        c.draw_text_cy(&FONT_MONO, col_thr, hdr_row_y, 20, col_rss - 4, "THR", pal.ink3);
+        c.draw_text_cy(&FONT_MONO, col_rss, hdr_row_y, 20, col_cpu - 4, "RSS", pal.ink3);
+        c.draw_text_cy(&FONT_MONO, col_cpu, hdr_row_y, 20, c.width as i32 - 6, "CPU", pal.ink3);
+    }
+
+    // Process Rows (y = 132 + idx * 22 — kept in exact sync with script.rs!)
+    let table_y = 132usize;
+    let row_h = 22usize;
+    let footer_h = 28usize;
+    for (idx, p) in snap.processes.iter().enumerate() {
+        let ry = table_y + idx * row_h;
+        if ry + row_h > c.height.saturating_sub(footer_h + 4) {
+            break;
+        }
+        let selected = idx == snap.selected_idx;
+        let alerted = live_view.alerts.iter().any(|a| a.target == p.name);
+        if selected {
+            c.fill_rounded_rect(8, ry + 1, c.width.saturating_sub(16), row_h - 2, 6.0, pal.cobalt_tint);
+            c.fill_rect(8, ry + 4, 3, row_h - 8, pal.cobalt);
+        } else if alerted {
+            c.fill_rounded_rect(8, ry + 1, c.width.saturating_sub(16), row_h - 2, 6.0, pal.ochre_tint);
+            c.fill_rect(8, ry + 4, 3, row_h - 8, pal.ochre);
+        }
+        let dot = if p.status != "running" {
+            pal.vermilion
+        } else if alerted {
+            pal.ochre
+        } else {
+            pal.sap
+        };
+        c.fill_circle(16.0, (ry + row_h / 2) as f32, 2.8, dot);
+        c.draw_text_cy(
+            &FONT_MONO,
+            24,
+            ry,
+            row_h,
+            col_koid - 8,
+            &p.name,
+            if selected { pal.ink } else { pal.ink2 },
+        );
+        if c.width >= 320 {
+            let koid_s = if p.koid > 0 { format!("{}", p.koid) } else { p.tier.clone() };
+            let thr_s = if p.threads > 0 { format!("{}", p.threads) } else { "-".to_string() };
+            let rss_s = if p.rss_bytes > 0 { format!("{:.1}M", p.rss_mb) } else { "-".to_string() };
+            let cpu_s = if p.koid > 0 { format!("{}ms", p.cpu_ms) } else { "-".to_string() };
+            c.draw_text_cy(&FONT_MONO, col_koid, ry, row_h, col_thr - 4, &koid_s, pal.ink3);
+            c.draw_text_cy(&FONT_MONO, col_thr, ry, row_h, col_rss - 4, &thr_s, pal.ink3);
+            c.draw_text_cy(&FONT_MONO, col_rss, ry, row_h, col_cpu - 4, &rss_s, pal.ink);
+            c.draw_text_cy(&FONT_MONO, col_cpu, ry, row_h, c.width as i32 - 6, &cpu_s, pal.ink2);
+        }
+    }
+
+    // Footer strip: live Hirsel-computed banner (from `/data/apps/activity/current.hirsel`) + hotkeys
+    let fy = c.height.saturating_sub(footer_h);
+    c.fill_rect(0, fy, c.width, footer_h, pal.raised);
+    c.fill_rect(0, fy, c.width, 1, pal.line);
+    let footer_txt = if !live_view.alerts.is_empty() {
+        format!(
+            "[!] {} · {}",
+            live_view.alerts[0].message,
+            if live_view.banner.is_empty() { "[R]efresh [S]ort [K]Restart" } else { live_view.banner.as_str() }
+        )
+    } else if !live_view.banner.is_empty() {
+        format!("{} · [R]efresh [S]ort [K]Restart", live_view.banner)
+    } else {
+        "[R] Refresh   [S] Sort   [Up/Dn] Select   [K] Restart Place".to_string()
+    };
+    let fcol = if !live_view.alerts.is_empty() { pal.ochre } else { pal.ink3 };
+    c.draw_text_cy(&FONT_MONO, 14, fy, footer_h, c.width as i32 - 12, &footer_txt, fcol);
 }
 
 /// Topmost Protected Approval Ceremony / SAS Vault Modal (rounded alpha-blended obsidian card).

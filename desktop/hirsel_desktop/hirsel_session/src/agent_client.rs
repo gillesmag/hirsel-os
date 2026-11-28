@@ -69,6 +69,10 @@ impl AgentClient {
         Ok(Self { _job: job, _process: process, stdin, stdout, latest })
     }
 
+    pub fn process(&self) -> &zx::Process {
+        &self._process
+    }
+
     pub async fn send(&mut self, line_cmd: &str) -> Result<serde_json::Value> {
         let mut payload = line_cmd.replace(['\r', '\n'], " ");
         payload.push('\n');

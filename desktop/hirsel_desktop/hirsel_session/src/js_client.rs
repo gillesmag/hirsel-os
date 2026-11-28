@@ -65,6 +65,10 @@ impl JsSandboxClient {
         Ok(Self { _job: job, _process: process, stdin, stdout })
     }
 
+    pub fn process(&self) -> &zx::Process {
+        &self._process
+    }
+
     pub async fn eval(&mut self, code: &str) -> Result<serde_json::Value> {
         // Collapse embedded newlines into spaces for single-line framing
         let one_line = code.replace(['\r', '\n'], " ");

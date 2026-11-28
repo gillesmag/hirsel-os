@@ -15,7 +15,7 @@ pub const TOP_BAR_H: u64 = 44u64
 pub const BORDER_PX: u64 = 2u64
 pub const GAP_PX: u64 = 10u64
 
-pub type Domain: key = Figments | VmDev | WebUntrusted | TrustedChrome
+pub type Domain: key = Figments | VmDev | Activity | WebUntrusted | TrustedChrome
 
 pub type Room: key = Darkroom | Daylight
 
@@ -42,6 +42,7 @@ pub type WmState: key {
     height: u64,
     room: Room,
     show_dev: bool,
+    show_activity: bool,
     show_web: bool,
     focused: Domain,
     sas_active: bool,
@@ -60,6 +61,7 @@ pub type WmState: key {
 
 pub type Event = Resize(w: u64, h: u64)
     | ToggleDev
+    | ToggleActivity
     | ToggleWeb
     | UserFocus(d: Domain)
     | ClientFocusRequest(d: Domain)
@@ -76,6 +78,7 @@ pub type Event = Resize(w: u64, h: u64)
 pub type Layout {
     figments: Rect,
     vm_dev: Option[Rect],
+    activity: Option[Rect],
     web: Option[Rect],
     ceremony: Option[Rect],
 }
@@ -88,6 +91,7 @@ pub fn initial(width: u64, height: u64) -> WmState {
         height: safe_h,
         room: Darkroom,
         show_dev: false,
+        show_activity: false,
         show_web: false,
         focused: Figments,
         sas_active: false,
@@ -132,6 +136,7 @@ fn recompute_security(mut s: WmState) {
         match s.focused {
             TrustedChrome => { s.focused = Figments },
             VmDev => { if !s.show_dev { s.focused = Figments } },
+            Activity => { if !s.show_activity { s.focused = Figments } },
             WebUntrusted => { if !s.show_web { s.focused = Figments } },
             Figments => {},
         }
@@ -142,6 +147,7 @@ fn domain_visible(s: WmState, d: Domain) -> bool {
     match d {
         Figments => true,
         VmDev => s.show_dev,
+        Activity => s.show_activity,
         WebUntrusted => s.show_web,
         TrustedChrome => input_locked_to_trusted(s),
     }
@@ -151,6 +157,7 @@ fn clip_of(s: WmState, d: Domain) -> u64 {
     match d {
         Figments => s.clip_figments,
         VmDev => s.clip_dev,
+        Activity => 0u64,
         WebUntrusted => s.clip_web,
         TrustedChrome => 0u64,
     }
@@ -167,6 +174,12 @@ pub fn step(take prev: WmState, take ev: Event) -> WmState {
             s.show_dev = !s.show_dev
             if s.show_dev && !input_locked_to_trusted(s) {
                 s.focused = VmDev
+            }
+        },
+        ToggleActivity => {
+            s.show_activity = !s.show_activity
+            if s.show_activity && !input_locked_to_trusted(s) {
+                s.focused = Activity
             }
         },
         ToggleWeb => {
@@ -254,6 +267,7 @@ pub fn step(take prev: WmState, take ev: Event) -> WmState {
                 match d {
                     Figments => { s.clip_figments = tag },
                     VmDev => { s.clip_dev = tag },
+                    Activity => {},
                     WebUntrusted => { s.clip_web = tag },
                     TrustedChrome => {},
                 }
@@ -267,6 +281,7 @@ pub fn step(take prev: WmState, take ev: Event) -> WmState {
                 match to {
                     Figments => { s.clip_figments = payload },
                     VmDev => { s.clip_dev = payload },
+                    Activity => {},
                     WebUntrusted => { s.clip_web = payload },
                     TrustedChrome => {},
                 }
@@ -294,53 +309,73 @@ pub fn compute_layout(s: WmState) -> Layout {
         None
     }
 
-    if !s.show_dev && !s.show_web {
+    let mut side_count = 0u64
+    if s.show_dev { side_count += 1u64 }
+    if s.show_activity { side_count += 1u64 }
+    if s.show_web { side_count += 1u64 }
+
+    if side_count == 0u64 {
         return Layout(
             figments: Rect(x: work_x, y: work_y, w: work_w, h: work_h),
             vm_dev: None,
+            activity: None,
             web: None,
             ceremony: ceremony_rect,
         )
     }
 
-    // Main spatial canvas gets 62% on the left; side column holds vm-dev and/or web-untrusted.
-    let left_w = (work_w * 62u64) / 100u64
+    // Main spatial canvas gets 58% on the left; side column tiles Shell, Activity Manager, and/or Web #2.
+    let left_w = (work_w * 58u64) / 100u64
     let right_x = work_x + left_w + GAP_PX
     let right_w = work_w - left_w - GAP_PX
 
     let fig_rect = Rect(x: work_x, y: work_y, w: left_w, h: work_h)
+    let total_gaps = (side_count - 1u64) * GAP_PX
+    let slot_h = (work_h - total_gaps) / side_count
+    let mut cur_y = work_y
+    let mut rem = side_count
 
-    if s.show_dev && s.show_web {
-        let top_h = (work_h - GAP_PX) / 2u64
-        let bot_y = work_y + top_h + GAP_PX
-        let bot_h = work_h - top_h - GAP_PX
-        Layout(
-            figments: fig_rect,
-            vm_dev: Some(Rect(x: right_x, y: work_y, w: right_w, h: top_h)),
-            web: Some(Rect(x: right_x, y: bot_y, w: right_w, h: bot_h)),
-            ceremony: ceremony_rect,
-        )
-    } else if s.show_dev {
-        Layout(
-            figments: fig_rect,
-            vm_dev: Some(Rect(x: right_x, y: work_y, w: right_w, h: work_h)),
-            web: None,
-            ceremony: ceremony_rect,
-        )
+    let dev_rect: Option[Rect] = if s.show_dev {
+        let h = if rem == 1u64 { (work_y + work_h) - cur_y } else { slot_h }
+        let r = Rect(x: right_x, y: cur_y, w: right_w, h: h)
+        cur_y += h + GAP_PX
+        rem -= 1u64
+        Some(r)
     } else {
-        Layout(
-            figments: fig_rect,
-            vm_dev: None,
-            web: Some(Rect(x: right_x, y: work_y, w: right_w, h: work_h)),
-            ceremony: ceremony_rect,
-        )
+        None
     }
+
+    let act_rect: Option[Rect] = if s.show_activity {
+        let h = if rem == 1u64 { (work_y + work_h) - cur_y } else { slot_h }
+        let r = Rect(x: right_x, y: cur_y, w: right_w, h: h)
+        cur_y += h + GAP_PX
+        rem -= 1u64
+        Some(r)
+    } else {
+        None
+    }
+
+    let web_rect: Option[Rect] = if s.show_web {
+        let h = (work_y + work_h) - cur_y
+        Some(Rect(x: right_x, y: cur_y, w: right_w, h: h))
+    } else {
+        None
+    }
+
+    Layout(
+        figments: fig_rect,
+        vm_dev: dev_rect,
+        activity: act_rect,
+        web: web_rect,
+        ceremony: ceremony_rect,
+    )
 }
 
 pub fn domain_name(d: Domain) -> String {
     match d {
         Figments => "figments",
         VmDev => "vm_dev",
+        Activity => "activity",
         WebUntrusted => "web_untrusted",
         TrustedChrome => "trusted_chrome",
     }
@@ -424,6 +459,8 @@ pub fn render_scene_json(s: WmState) -> String {
     push_rect_json(mut out, layout.figments)
     string.push(mut out, ",\"vm_dev\":")
     push_opt_rect_json(mut out, layout.vm_dev)
+    string.push(mut out, ",\"activity\":")
+    push_opt_rect_json(mut out, layout.activity)
     string.push(mut out, ",\"web\":")
     push_opt_rect_json(mut out, layout.web)
     string.push(mut out, ",\"ceremony\":")

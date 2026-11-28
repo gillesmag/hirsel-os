@@ -1113,6 +1113,52 @@ build-places-arm64 hirsel_dir="/workspace/hirsel": build-rt-arm64
     cp "{{out_dir}}/arm64/hirsel-js" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64/hirsel-js"
     ls -lh "{{out_dir}}/arm64/hirsel-js"
 
+# Cross-compile OS-resident Hirsel compiler/evaluator (hirsel-eval) for aarch64-unknown-fuchsia
+build-eval-arm64:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILD_DIR="{{fuchsia}}/out/hirsel-desktop.arm64"
+    SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+    RUSTC="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/rustc"
+    CARGO_BIN="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/cargo"
+    CLANG="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/clang"
+    AR="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-ar"
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}/arm64" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64"
+    RUSTC="$RUSTC" \
+    CC_aarch64_unknown_fuchsia="$CLANG" \
+    AR_aarch64_unknown_fuchsia="$AR" \
+    CFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=${SYSROOT} -ffixed-x18" \
+    CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_LINKER="$CLANG" \
+    CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_RUSTFLAGS="-Zfixed-x18 -C link-arg=--target=aarch64-unknown-fuchsia -C link-arg=--sysroot=${SYSROOT} -C link-arg=-fuse-ld=lld -C link-arg=-L${SYSROOT}/lib -C link-arg=-L${BUILD_DIR}/user.basic_arm64-shared -C link-arg=-L${BUILD_DIR}/user.libc_arm64/link_stub -C link-arg=-L${BUILD_DIR}/arm64-shared/link_stub -C link-arg=-L{{fuchsia}}/prebuilt/third_party/clang/linux-x64/lib/aarch64-unknown-fuchsia -C link-arg=-Wl,--no-as-needed -C link-arg=-lfdio -C link-arg=-Wl,--as-needed -C panic=abort" \
+      "$CARGO_BIN" build --manifest-path "{{root}}/crates/hirsel-eval/Cargo.toml" --target aarch64-unknown-fuchsia --release
+    "$STRIP" --strip-all "{{root}}/crates/hirsel-eval/target/aarch64-unknown-fuchsia/release/hirsel-eval" -o "{{out_dir}}/arm64/hirsel-eval"
+    cp "{{out_dir}}/arm64/hirsel-eval" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64/hirsel-eval"
+    ls -lh "{{out_dir}}/arm64/hirsel-eval"
+
+# Cross-compile OS-resident Hirsel compiler/evaluator (hirsel-eval) for x86_64-unknown-fuchsia
+build-eval-x64:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILD_DIR="{{fuchsia}}/$(cat "{{fuchsia}}/.fx-build-dir")"
+    SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+    RUSTC="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/rustc"
+    CARGO_BIN="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/cargo"
+    CLANG="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/clang"
+    AR="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-ar"
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64"
+    RUSTC="$RUSTC" \
+    CC_x86_64_unknown_fuchsia="$CLANG" \
+    AR_x86_64_unknown_fuchsia="$AR" \
+    CFLAGS_x86_64_unknown_fuchsia="--target=x86_64-unknown-fuchsia --sysroot=${SYSROOT}" \
+    CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_LINKER="$CLANG" \
+    CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--target=x86_64-unknown-fuchsia -C link-arg=--sysroot=${SYSROOT} -C link-arg=-fuse-ld=lld -C link-arg=-L${SYSROOT}/lib -C link-arg=-L${BUILD_DIR}/user.basic_x64-shared -C link-arg=-L${BUILD_DIR}/user.libc_x64/link_stub -C link-arg=-L${BUILD_DIR}/x64-shared/link_stub -C link-arg=-L{{fuchsia}}/prebuilt/third_party/clang/linux-x64/lib/x86_64-unknown-fuchsia -C link-arg=-Wl,--no-as-needed -C link-arg=-lfdio -C link-arg=-Wl,--as-needed -C panic=abort" \
+      "$CARGO_BIN" build --manifest-path "{{root}}/crates/hirsel-eval/Cargo.toml" --target x86_64-unknown-fuchsia --release
+    "$STRIP" --strip-all "{{root}}/crates/hirsel-eval/target/x86_64-unknown-fuchsia/release/hirsel-eval" -o "{{out_dir}}/hirsel-eval"
+    cp "{{out_dir}}/hirsel-eval" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64/hirsel-eval"
+    ls -lh "{{out_dir}}/hirsel-eval"
+
 # Cross-compile full Hirsel-OS Desktop ARM64 product bundle for Apple Silicon (HVF) / ARM64 QEMU
 build-desktop-arm64:
     #!/usr/bin/env bash
@@ -1122,6 +1168,10 @@ build-desktop-arm64:
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/os" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-wm" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-board" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-agent" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64"
     cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
@@ -1129,6 +1179,10 @@ build-desktop-arm64:
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
     cp -r "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
+    cp "{{root}}/hirsel-os-lib/os.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/os/"
+    cp "{{root}}/hirsel-wm/wm.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-wm/"
+    cp "{{root}}/hirsel-board/board.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-board/"
+    cp "{{root}}/hirsel-agent/planner.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-agent/"
     cd "{{fuchsia}}"
     if [[ ! -f "out/hirsel-desktop.arm64/args.gn" ]]; then
       ORIG_BUILD_DIR="$(cat .fx-build-dir 2>/dev/null || echo out/bringup.x64-balanced)"
@@ -1138,6 +1192,7 @@ build-desktop-arm64:
     PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.arm64 build //sdk/lib/fdio
     cd "{{root}}"
     just build-places-arm64
+    just build-eval-arm64
     cd "{{fuchsia}}"
     PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.arm64 build //products/hirsel_desktop:hirsel_desktop.arm64
     ls -lh out/hirsel-desktop.arm64/obj/products/hirsel_desktop/hirsel_desktop.arm64/product_bundle/system_a/
@@ -1190,8 +1245,8 @@ bundle-figments figments_dir="/workspace/figments-hirsel":
     cp -r "$ASSETS/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
     ls -lh "$ASSETS/" "$ASSETS/fonts/"
 
-# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + real Figments canvas + hirsel-wm + hirsel-js + Linux 6.1.102 vm-dev)
-build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ssh-initrd
+# Assemble full Hirsel-OS Desktop product bundle (Zircon AMD-SVM + Flatland + Native Chromium 160 + real Figments canvas + hirsel-wm + hirsel-js + hirsel-eval + Linux 6.1.102 vm-dev)
+build-desktop: build-wm build-js build-eval-x64 build-vm-host fetch-linux-kernel build-linux-ssh-initrd
     #!/usr/bin/env bash
     set -euo pipefail
     cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
@@ -1199,6 +1254,10 @@ build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ss
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/os" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-wm" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-board" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-agent" \
              "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm"
     cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
@@ -1206,6 +1265,10 @@ build-desktop: build-wm build-js build-vm-host fetch-linux-kernel build-linux-ss
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
     cp -r "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
     cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
+    cp "{{root}}/hirsel-os-lib/os.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/os/"
+    cp "{{root}}/hirsel-wm/wm.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-wm/"
+    cp "{{root}}/hirsel-board/board.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-board/"
+    cp "{{root}}/hirsel-agent/planner.hirsel" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/hirsel_src/places/hirsel-agent/"
     cp "{{out_dir}}/linux/vmlinux.stripped" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/vmlinux.stripped"
     cp "{{out_dir}}/linux/initramfs-ssh.cpio" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/vm/initramfs-ssh.cpio"
     cd "{{fuchsia}}"

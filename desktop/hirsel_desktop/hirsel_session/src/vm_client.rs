@@ -241,6 +241,10 @@ impl VmClient {
         })
     }
 
+    pub fn process(&self) -> &zx::Process {
+        &self._process
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.lock().map(|g| *g).unwrap_or(false)
     }
