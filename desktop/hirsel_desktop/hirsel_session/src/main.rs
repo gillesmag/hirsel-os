@@ -517,24 +517,31 @@ impl HirselShell {
         let (vm_ev_tx, mut vm_ev_rx) = unbounded::<VmEvent>();
         let agent_conn_flag = Arc::new(AtomicBool::new(wm.latest.agent_conn));
         let vm_holder: Arc<Mutex<Option<Arc<VmClient>>>> = Arc::new(Mutex::new(None));
-        let vm_client = match VmClient::spawn(vm_ev_tx).await {
-            Ok(v) => {
-                if let Ok(mut g) = diag.lock() {
-                    g.push("hirsel-vm-host (Linux 6.1.102 AMD-SVM) spawned OK".to_string());
+        let vm_client = if std::path::Path::new("/pkg/bin/hirsel-vm-host").exists() {
+            match VmClient::spawn(vm_ev_tx).await {
+                Ok(v) => {
+                    if let Ok(mut g) = diag.lock() {
+                        g.push("hirsel-vm-host (Linux 6.1.102 AMD-SVM) spawned OK".to_string());
+                    }
+                    let arc_v = Arc::new(v);
+                    if let Ok(mut h) = vm_holder.lock() {
+                        *h = Some(Arc::clone(&arc_v));
+                    }
+                    Some(arc_v)
                 }
-                let arc_v = Arc::new(v);
-                if let Ok(mut h) = vm_holder.lock() {
-                    *h = Some(Arc::clone(&arc_v));
+                Err(e) => {
+                    warn!("hirsel-vm-host unavailable: {e:#}");
+                    if let Ok(mut g) = diag.lock() {
+                        g.push(format!("hirsel-vm-host unavailable: {e:#}"));
+                    }
+                    None
                 }
-                Some(arc_v)
             }
-            Err(e) => {
-                warn!("hirsel-vm-host unavailable: {e:#}");
-                if let Ok(mut g) = diag.lock() {
-                    g.push(format!("hirsel-vm-host unavailable: {e:#}"));
-                }
-                None
+        } else {
+            if let Ok(mut g) = diag.lock() {
+                g.push("hirsel-vm-host not bundled on this arch (arm64 desktop mode)".to_string());
             }
+            None
         };
 
         let shell_tx_vm = tx.clone();

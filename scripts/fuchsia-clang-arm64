@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FUCHSIA="${ROOT}/third-party/fuchsia"
+BUILD_DIR="${FUCHSIA}/out/hirsel-desktop.arm64"
+SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+CLANG="${FUCHSIA}/prebuilt/third_party/clang/linux-x64/bin/clang"
+
+exec "$CLANG" \
+  --target=aarch64-unknown-fuchsia \
+  --sysroot="${SYSROOT}" \
+  -ffixed-x18 \
+  -fuse-ld=lld \
+  -L"${SYSROOT}/lib" \
+  -L"${BUILD_DIR}/user.basic_arm64-shared" \
+  -L"${BUILD_DIR}/user.libc_arm64/link_stub" \
+  -L"${BUILD_DIR}/arm64-shared/link_stub" \
+  -L"${FUCHSIA}/prebuilt/third_party/clang/linux-x64/lib/aarch64-unknown-fuchsia" \
+  "$@" \
+  -lfdio -lzircon

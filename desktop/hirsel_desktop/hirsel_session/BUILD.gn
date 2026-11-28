@@ -17,43 +17,45 @@ fidl("fuchsia.hirsel.egress") {
 }
 
 resource("hirsel_wm_bin") {
-  sources = [ "prebuilt/hirsel-wm" ]
+  sources = [ "prebuilt/${target_cpu}/hirsel-wm" ]
   outputs = [ "bin/hirsel-wm" ]
   allow_binary_output_dir = true
 }
 
 resource("hirsel_board_bin") {
-  sources = [ "prebuilt/hirsel-board" ]
+  sources = [ "prebuilt/${target_cpu}/hirsel-board" ]
   outputs = [ "bin/hirsel-board" ]
   allow_binary_output_dir = true
 }
 
 resource("hirsel_agent_bin") {
-  sources = [ "prebuilt/hirsel-agent" ]
+  sources = [ "prebuilt/${target_cpu}/hirsel-agent" ]
   outputs = [ "bin/hirsel-agent" ]
   allow_binary_output_dir = true
 }
 
 resource("hirsel_js_bin") {
-  sources = [ "prebuilt/hirsel-js" ]
+  sources = [ "prebuilt/${target_cpu}/hirsel-js" ]
   outputs = [ "bin/hirsel-js" ]
   allow_binary_output_dir = true
 }
 
-resource("hirsel_vm_host_bin") {
-  sources = [ "prebuilt/hirsel-vm-host" ]
-  outputs = [ "bin/hirsel-vm-host" ]
-  allow_binary_output_dir = true
-}
+if (target_cpu == "x64") {
+  resource("hirsel_vm_host_bin") {
+    sources = [ "prebuilt/hirsel-vm-host" ]
+    outputs = [ "bin/hirsel-vm-host" ]
+    allow_binary_output_dir = true
+  }
 
-resource("vm_linux_kernel") {
-  sources = [ "prebuilt/vm/vmlinux.stripped" ]
-  outputs = [ "data/vm/vmlinux.stripped" ]
-}
+  resource("vm_linux_kernel") {
+    sources = [ "prebuilt/vm/vmlinux.stripped" ]
+    outputs = [ "data/vm/vmlinux.stripped" ]
+  }
 
-resource("vm_linux_initrd") {
-  sources = [ "prebuilt/vm/initramfs-ssh.cpio" ]
-  outputs = [ "data/vm/initramfs-ssh.cpio" ]
+  resource("vm_linux_initrd") {
+    sources = [ "prebuilt/vm/initramfs-ssh.cpio" ]
+    outputs = [ "data/vm/initramfs-ssh.cpio" ]
+  }
 }
 
 resource("figments_canvas_js") {
@@ -188,11 +190,15 @@ fuchsia_component("hirsel_shell_component") {
     ":hirsel_board_bin",
     ":hirsel_js_bin",
     ":hirsel_shell_bin",
-    ":hirsel_vm_host_bin",
     ":hirsel_wm_bin",
-    ":vm_linux_initrd",
-    ":vm_linux_kernel",
   ]
+  if (target_cpu == "x64") {
+    deps += [
+      ":hirsel_vm_host_bin",
+      ":vm_linux_initrd",
+      ":vm_linux_kernel",
+    ]
+  }
 }
 
 fuchsia_package("hirsel_session") {

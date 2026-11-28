@@ -1,7 +1,7 @@
-# Hirsel-OS Desktop Bazel Product Assembly:
-#   - Patched Zircon kernel (AMD SVM + NPT + native virtio-gpu-display / sysmem / Scenic Flatland)
-#   - Native Chromium 160.0.8155.0 (//src/chromium:web_engine) directly on Zircon/Flatland
-#   - Pure-Hirsel Window Manager & Security Policy Brain (hirsel-wm) + Rust Flatland Presenter (hirsel-shell)
+# Hirsel-OS Desktop Bazel Product Assembly (x64 + arm64):
+#   - Zircon kernel (native virtio-gpu-display / sysmem / Scenic Flatland; AMD SVM + NPT on x64)
+#   - Native Chromium 160 (//src/chromium:web_engine) directly on Zircon/Flatland
+#   - Pure-Hirsel Places (hirsel-wm, hirsel-board, hirsel-agent, hirsel-js) + Rust Flatland Presenter (hirsel_shell) + FIDL egress_gw.cm
 
 load("@fuchsia_build_info//:args.bzl", "build_info_version")
 load(
@@ -50,6 +50,31 @@ fuchsia_elf_sizes(
     product = ":assembly.x64",
 )
 
+fuchsia_product_bundle(
+    name = "product_bundle.arm64",
+    default_virtual_device = ":hirsel_emu.arm64",
+    main = ":assembly.arm64",
+    product_bundle_name = "hirsel_desktop.arm64",
+    recovery = "//products/zedboot:arm64",
+    repository_keys = "//src/sys/pkg/repositories/devhost/keys",
+    update_epoch = "1",
+    virtual_devices = [
+        ":hirsel_emu.arm64",
+    ],
+)
+
+fuchsia_product(
+    name = "assembly.arm64",
+    board_config = "//boards:arm64",
+    platform_artifacts = "//build/bazel/assembly/assembly_input_bundles:platform_eng",
+    product_config = ":assembly_config",
+)
+
+fuchsia_elf_sizes(
+    name = "elf_sizes.arm64",
+    product = ":assembly.arm64",
+)
+
 fuchsia_virtual_device(
     name = "hirsel_emu",
     arch = ARCH.X64,
@@ -57,6 +82,19 @@ fuchsia_virtual_device(
     cpu_count = 4,
     description = "Hirsel-OS Desktop QEMU/KVM virtual workstation (1280x800, 4 GiB RAM)",
     device_name = "hirsel_emu",
+    input_device = "mouse",
+    memory_quantity = 4096,
+    window_height_px = 800,
+    window_width_px = 1280,
+)
+
+fuchsia_virtual_device(
+    name = "hirsel_emu.arm64",
+    arch = ARCH.ARM64,
+    audio_model = "hda",
+    cpu_count = 4,
+    description = "Hirsel-OS Desktop ARM64 QEMU/HVF virtual workstation (1280x800, 4 GiB RAM)",
+    device_name = "hirsel_emu.arm64",
     input_device = "mouse",
     memory_quantity = 4096,
     window_height_px = 800,
@@ -99,6 +137,9 @@ fuchsia_product_configuration(
             "graphics": {
                 "virtual_console": {
                     "enable": False,
+                },
+                "vulkan_icd": {
+                    "allow_lavapipe": True,
                 },
             },
             "media": {

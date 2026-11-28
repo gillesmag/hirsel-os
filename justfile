@@ -1030,7 +1030,7 @@ build-wm hirsel_dir="/workspace/hirsel":
     #!/usr/bin/env bash
     set -euo pipefail
     STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
-    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64"
     for pkg in hirsel-wm hirsel-board hirsel-agent; do
       PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
         "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/$pkg" \
@@ -1041,7 +1041,7 @@ build-wm hirsel_dir="/workspace/hirsel":
           --grant Stdin --grant Stdout --limit 67108864 \
           -o "{{out_dir}}/$pkg"
       "$STRIP" --strip-all "{{out_dir}}/$pkg"
-      cp "{{out_dir}}/$pkg" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/$pkg"
+      cp "{{out_dir}}/$pkg" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64/$pkg"
       ls -lh "{{out_dir}}/$pkg"
     done
 
@@ -1050,7 +1050,7 @@ build-js hirsel_dir="/workspace/hirsel":
     #!/usr/bin/env bash
     set -euo pipefail
     STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
-    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt"
+    mkdir -p "{{out_dir}}" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64"
     PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
       "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/hirsel-js" \
         --libraries "{{hirsel_dir}}/core" --source-core --source-std \
@@ -1060,8 +1060,91 @@ build-js hirsel_dir="/workspace/hirsel":
         --grant Stdin --grant Stdout --limit 134217728 \
         -o "{{out_dir}}/hirsel-js"
     "$STRIP" --strip-all "{{out_dir}}/hirsel-js"
-    cp "{{out_dir}}/hirsel-js" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/hirsel-js"
+    cp "{{out_dir}}/hirsel-js" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/x64/hirsel-js"
     ls -lh "{{out_dir}}/hirsel-js"
+
+# Cross-compile libhirsel_core_rt.a for aarch64-unknown-fuchsia (Apple Silicon / ARM64)
+build-rt-arm64 hirsel_dir="/workspace/hirsel":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILD_DIR="{{fuchsia}}/out/hirsel-desktop.arm64"
+    SYSROOT="${BUILD_DIR}/regenerator_outputs/fuchsia_platform_sysroot/sysroot"
+    RUSTC="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/rustc"
+    CARGO_BIN="{{fuchsia}}/prebuilt/third_party/rust/linux-x64/bin/cargo"
+    CLANG="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/clang"
+    AR="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-ar"
+    RUSTC="$RUSTC" \
+    CC_aarch64_unknown_fuchsia="$CLANG" \
+    AR_aarch64_unknown_fuchsia="$AR" \
+    CFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=${SYSROOT} -ffixed-x18" \
+    CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C panic=abort -Zfixed-x18" \
+    CARGO_TARGET_DIR="{{root}}/target/hirsel-rt-fuchsia" \
+      "$CARGO_BIN" build --manifest-path "{{hirsel_dir}}/Cargo.toml" \
+        -p hirsel-core-rt --target aarch64-unknown-fuchsia --release
+
+# Cross-compile pure-Hirsel Places (wm, board, agent, js) to native aarch64-unknown-fuchsia ELFs
+build-places-arm64 hirsel_dir="/workspace/hirsel": build-rt-arm64
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STRIP="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin/llvm-strip"
+    mkdir -p "{{out_dir}}/arm64" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64"
+    for pkg in hirsel-wm hirsel-board hirsel-agent; do
+      PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
+        "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/$pkg" \
+          --libraries "{{hirsel_dir}}/core" --source-core --source-std \
+          --release --backend llvm --target aarch64-unknown-fuchsia \
+          --cc "{{root}}/scripts/fuchsia-clang-arm64" \
+          --runtime "{{root}}/target/hirsel-rt-fuchsia/aarch64-unknown-fuchsia/release/libhirsel_core_rt.a" \
+          --grant Stdin --grant Stdout --limit 67108864 \
+          -o "{{out_dir}}/arm64/$pkg"
+      "$STRIP" --strip-all "{{out_dir}}/arm64/$pkg"
+      cp "{{out_dir}}/arm64/$pkg" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64/$pkg"
+      ls -lh "{{out_dir}}/arm64/$pkg"
+    done
+    PATH="{{fuchsia}}/prebuilt/third_party/clang/linux-x64/bin:$PATH" \
+      "{{hirsel_dir}}/target/debug/hirsel" build "{{root}}/hirsel-js" \
+        --libraries "{{hirsel_dir}}/core" --source-core --source-std \
+        --release --backend llvm --target aarch64-unknown-fuchsia \
+        --cc "{{root}}/scripts/fuchsia-clang-arm64" \
+        --runtime "{{root}}/target/hirsel-rt-fuchsia/aarch64-unknown-fuchsia/release/libhirsel_core_rt.a" \
+        --grant Stdin --grant Stdout --limit 134217728 \
+        -o "{{out_dir}}/arm64/hirsel-js"
+    "$STRIP" --strip-all "{{out_dir}}/arm64/hirsel-js"
+    cp "{{out_dir}}/arm64/hirsel-js" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64/hirsel-js"
+    ls -lh "{{out_dir}}/arm64/hirsel-js"
+
+# Cross-compile full Hirsel-OS Desktop ARM64 product bundle for Apple Silicon (HVF) / ARM64 QEMU
+build-desktop-arm64:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cp "{{root}}/desktop/hirsel_desktop.gni" "{{fuchsia}}/products/"
+    mkdir -p "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src" \
+             "{{fuchsia}}/products/hirsel_desktop/hirsel_session/prebuilt/arm64"
+    cp "{{root}}/desktop/hirsel_desktop/BUILD.gn" "{{root}}/desktop/hirsel_desktop/BUILD.bazel" "{{fuchsia}}/products/hirsel_desktop/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/BUILD.gn" "{{fuchsia}}/products/hirsel_desktop/hirsel_session/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/fidl/"*.fidl "{{fuchsia}}/products/hirsel_desktop/hirsel_session/fidl/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/meta/"*.cml "{{fuchsia}}/products/hirsel_desktop/hirsel_session/meta/"
+    cp -r "{{root}}/desktop/hirsel_desktop/hirsel_session/assets/"* "{{fuchsia}}/products/hirsel_desktop/hirsel_session/assets/"
+    cp "{{root}}/desktop/hirsel_desktop/hirsel_session/src/"*.rs "{{fuchsia}}/products/hirsel_desktop/hirsel_session/src/"
+    cd "{{fuchsia}}"
+    if [[ ! -f "out/hirsel-desktop.arm64/args.gn" ]]; then
+      ORIG_BUILD_DIR="$(cat .fx-build-dir 2>/dev/null || echo out/bringup.x64-balanced)"
+      PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.arm64 set hirsel_desktop.arm64 --rbe-mode=off
+      echo "$ORIG_BUILD_DIR" > .fx-build-dir
+    fi
+    PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.arm64 build //sdk/lib/fdio
+    cd "{{root}}"
+    just build-places-arm64
+    cd "{{fuchsia}}"
+    PATH="{{fuchsia}}/.jiri_root/bin:$PATH" fx --dir out/hirsel-desktop.arm64 build //products/hirsel_desktop:hirsel_desktop.arm64
+    ls -lh out/hirsel-desktop.arm64/obj/products/hirsel_desktop/hirsel_desktop.arm64/product_bundle/system_a/
+
+# Package self-contained Apple Silicon Mac bundle (out/hirsel-desktop-arm64-mac.tar.gz + run-mac.sh)
+package-mac-arm64:
+    bash "{{root}}/scripts/package_mac_arm64.sh"
 
 # Cross-compile Rust Tier-2 Linux 6.1.102 AMD-SVM MicroVM host (hirsel-vm-host) for x86_64-unknown-fuchsia
 build-vm-host:
